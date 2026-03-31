@@ -18,6 +18,7 @@ use orcashell_terminal_view::{
 use orcashell_ui::app_view::OrcaAppView;
 use orcashell_ui::context_menu::DismissMenu;
 use orcashell_ui::settings::{register_settings, AppSettings};
+use orcashell_ui::theme::{register_theme, update_window_appearance};
 use orcashell_ui::window_registry::WindowRegistry;
 use orcashell_ui::workspace::actions::*;
 use orcashell_ui::workspace::WorkspaceServices;
@@ -164,6 +165,7 @@ fn main() -> Result<()> {
 
         // Register AppSettings as a GPUI Global
         register_settings(cx);
+        register_theme(cx);
 
         // Register WindowRegistry as a GPUI Global
         cx.set_global(WindowRegistry::new());
@@ -554,7 +556,13 @@ fn open_orca_window(
 
     let window_handle = cx
         .open_window(window_opts, |window, cx| {
+            update_window_appearance(window.appearance(), cx);
             let app_view = cx.new(|cx| {
+                cx.observe_window_appearance(window, |_this, window, cx| {
+                    update_window_appearance(window.appearance(), cx);
+                    cx.notify();
+                })
+                .detach();
                 OrcaAppView::new(
                     window_id,
                     cx,

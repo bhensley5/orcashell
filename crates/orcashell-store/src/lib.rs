@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use rusqlite::{params, Connection};
 
-pub use settings::{config_dir, database_path, settings_path, AppSettings, CursorStyle};
+pub use settings::{
+    config_dir, database_path, settings_path, AppSettings, CursorStyle, ThemeId, ThemeMode,
+};
 
 /// A window as stored in the SQLite database.
 pub struct StoredWindow {

@@ -132,9 +132,12 @@ impl OrcaAppView {
 
         // Observe settings changes and propagate to all terminal views + save settings.json
         cx.observe_global::<AppSettings>(|this, cx| {
+            theme::sync_from_settings(cx);
             let settings = cx.global::<AppSettings>();
-            let config = WorkspaceState::build_terminal_config(settings);
+            let palette = theme::active(cx);
+            let config = WorkspaceState::build_terminal_config(settings, &palette);
             this.workspace.update(cx, |ws, cx| {
+                ws.refresh_diff_theme(cx);
                 for view in ws.terminal_views.values() {
                     view.update(cx, |v, _cx| v.apply_config(config.clone()));
                 }
@@ -150,6 +153,21 @@ impl OrcaAppView {
                     }
                 });
             }));
+        })
+        .detach();
+
+        cx.observe_global::<theme::ResolvedTheme>(|this, cx| {
+            let settings = cx.global::<AppSettings>();
+            let palette = theme::active(cx);
+            let config = WorkspaceState::build_terminal_config(settings, &palette);
+            this.workspace.update(cx, |ws, cx| {
+                ws.refresh_diff_theme(cx);
+                for view in ws.terminal_views.values() {
+                    view.update(cx, |v, _cx| v.apply_config(config.clone()));
+                }
+                cx.notify();
+            });
+            cx.notify();
         })
         .detach();
 
@@ -362,6 +380,7 @@ impl OrcaAppView {
 impl Render for OrcaAppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.prune_closed_diff_views(cx);
+        let palette = theme::active(cx);
 
         let workspace = self.workspace.clone();
         let active_drag = self.active_drag.clone();
@@ -405,7 +424,7 @@ impl Render for OrcaAppView {
         let mut container = div()
             .id("orca-app-root")
             .size_full()
-            .bg(rgb(theme::ABYSS))
+            .bg(rgb(palette.ABYSS))
             .flex()
             .flex_col()
             .track_focus(&self.focus_handle)
@@ -560,11 +579,11 @@ impl Render for OrcaAppView {
                     .w_full()
                     .px(px(8.0))
                     .py(px(2.0))
-                    .bg(rgb(theme::DEEP))
+                    .bg(rgb(palette.DEEP))
                     .flex_shrink_0()
                     .child(
                         div()
-                            .text_color(rgb(theme::FOG))
+                            .text_color(rgb(palette.FOG))
                             .text_size(px(11.0))
                             .child(err.clone()),
                     ),
@@ -578,9 +597,9 @@ impl Render for OrcaAppView {
                     .w_full()
                     .px(px(8.0))
                     .py(px(4.0))
-                    .bg(rgb(theme::DEEP))
+                    .bg(rgb(palette.DEEP))
                     .border_b_1()
-                    .border_color(rgb(theme::SURFACE))
+                    .border_color(rgb(palette.SURFACE))
                     .flex()
                     .items_center()
                     .gap(px(8.0))
@@ -588,7 +607,7 @@ impl Render for OrcaAppView {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .text_color(rgb(theme::STATUS_AMBER))
+                            .text_color(rgb(palette.STATUS_AMBER))
                             .text_size(px(11.0))
                             .child(err.to_string()),
                     )
@@ -596,7 +615,7 @@ impl Render for OrcaAppView {
                         div()
                             .id("workspace-error-close")
                             .cursor_pointer()
-                            .text_color(rgb(theme::FOG))
+                            .text_color(rgb(palette.FOG))
                             .text_size(px(11.0))
                             .child("\u{2715}")
                             .on_click(move |_event, _window, cx| {

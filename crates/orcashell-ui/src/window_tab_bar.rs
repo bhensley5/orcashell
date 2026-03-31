@@ -246,6 +246,7 @@ fn apply_windows_drag(bar: Div, cx: &mut Context<WindowTabBar>) -> Div {
 /// Each button is 46px wide x 32px tall (Windows standard caption button size).
 #[cfg(target_os = "windows")]
 fn append_window_controls(bar: Div, window: &mut Window) -> Div {
+    let palette = theme::current();
     let is_maximized = window.is_maximized();
 
     bar
@@ -255,7 +256,7 @@ fn append_window_controls(bar: Div, window: &mut Window) -> Div {
                 .h_full()
                 .w(px(1.0))
                 .flex_shrink_0()
-                .bg(rgb(theme::SURFACE)),
+                .bg(rgb(palette.SURFACE)),
         )
         // Minimize
         .child(
@@ -269,8 +270,8 @@ fn append_window_controls(bar: Div, window: &mut Window) -> Div {
                 .flex_shrink_0()
                 .cursor_pointer()
                 .text_size(px(18.0))
-                .text_color(rgb(theme::FOG))
-                .hover(|s| s.bg(rgb(theme::SURFACE)))
+                .text_color(rgb(palette.FOG))
+                .hover(|s| s.bg(rgb(palette.SURFACE)))
                 .child(div().mt(px(-4.0)).child("\u{2500}")) // ─
                 .occlude()
                 .window_control_area(WindowControlArea::Min),
@@ -287,8 +288,8 @@ fn append_window_controls(bar: Div, window: &mut Window) -> Div {
                 .flex_shrink_0()
                 .cursor_pointer()
                 .text_size(px(14.0))
-                .text_color(rgb(theme::FOG))
-                .hover(|s| s.bg(rgb(theme::SURFACE)))
+                .text_color(rgb(palette.FOG))
+                .hover(|s| s.bg(rgb(palette.SURFACE)))
                 .child(
                     div()
                         .mt(px(-2.0))
@@ -309,10 +310,10 @@ fn append_window_controls(bar: Div, window: &mut Window) -> Div {
                 .flex_shrink_0()
                 .cursor_pointer()
                 .text_size(px(12.0))
-                .text_color(rgb(theme::FOG))
+                .text_color(rgb(palette.FOG))
                 .hover(|s| {
-                    s.bg(rgb(theme::WIN_CLOSE_HOVER))
-                        .text_color(rgb(theme::WIN_CLOSE_HOVER_TEXT))
+                    s.bg(rgb(palette.WIN_CLOSE_HOVER))
+                        .text_color(rgb(palette.WIN_CLOSE_HOVER_TEXT))
                 })
                 .child("\u{2715}") // ✕
                 .occlude()
@@ -322,6 +323,7 @@ fn append_window_controls(bar: Div, window: &mut Window) -> Div {
 
 impl Render for WindowTabBar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = theme::active(cx);
         // Check rename state before taking the long-lived ws borrow
         let tab_rename_action = {
             let ws = self.workspace.read(cx);
@@ -415,9 +417,9 @@ impl Render for WindowTabBar {
                 .flex()
                 .flex_shrink_0()
                 .items_center()
-                .bg(rgb(theme::DEEP))
+                .bg(rgb(palette.DEEP))
                 .border_b_1()
-                .border_color(rgb(theme::SURFACE))
+                .border_color(rgb(palette.SURFACE))
                 .pl(px(traffic_light_pad));
 
             #[cfg(target_os = "windows")]
@@ -436,9 +438,9 @@ impl Render for WindowTabBar {
             .flex()
             .flex_shrink_0()
             .items_center()
-            .bg(rgb(theme::DEEP))
+            .bg(rgb(palette.DEEP))
             .border_b_1()
-            .border_color(rgb(theme::SURFACE))
+            .border_color(rgb(palette.SURFACE))
             .pl(px(traffic_light_pad));
 
         // Windows: attach drag handler to the bar
@@ -459,8 +461,8 @@ impl Render for WindowTabBar {
                 .flex_shrink_0()
                 .cursor_pointer()
                 .text_size(px(16.0))
-                .text_color(rgb(theme::FOG))
-                .hover(|s| s.text_color(rgb(theme::BONE)))
+                .text_color(rgb(palette.FOG))
+                .hover(|s| s.text_color(rgb(palette.BONE)))
                 .child("\u{25E7}")
                 .on_mouse_down(MouseButton::Left, |_, _, cx| {
                     cx.stop_propagation();
@@ -477,7 +479,7 @@ impl Render for WindowTabBar {
                 .h_full()
                 .w(px(1.0))
                 .flex_shrink_0()
-                .bg(rgb(theme::SURFACE)),
+                .bg(rgb(palette.SURFACE)),
         );
 
         for auxiliary_tab in &auxiliary_tabs {
@@ -506,16 +508,16 @@ impl Render for WindowTabBar {
                 .px(px(8.0))
                 .overflow_hidden()
                 .border_r_1()
-                .border_color(rgb(theme::SURFACE));
+                .border_color(rgb(palette.SURFACE));
 
             if is_active {
                 aux_tab = aux_tab
-                    .bg(rgba(theme::with_alpha(theme::ORCA_BLUE, 0x1A)))
-                    .text_color(rgb(theme::BONE));
+                    .bg(rgba(theme::with_alpha(palette.ORCA_BLUE, 0x1A)))
+                    .text_color(rgb(palette.BONE));
             } else {
                 aux_tab = aux_tab
-                    .text_color(rgb(theme::FOG))
-                    .hover(|s| s.bg(rgba(theme::with_alpha(theme::CURRENT, 0x80))));
+                    .text_color(rgb(palette.FOG))
+                    .hover(|s| s.bg(rgba(theme::with_alpha(palette.CURRENT, 0x80))));
             }
 
             aux_tab = aux_tab
@@ -549,8 +551,8 @@ impl Render for WindowTabBar {
                         .flex_shrink_0()
                         .rounded(px(3.0))
                         .text_size(px(12.0))
-                        .text_color(rgb(theme::FOG))
-                        .hover(|s| s.text_color(rgb(theme::BONE)).bg(rgb(theme::SURFACE)))
+                        .text_color(rgb(palette.FOG))
+                        .hover(|s| s.text_color(rgb(palette.BONE)).bg(rgb(palette.SURFACE)))
                         .child("\u{2715}")
                         .on_mouse_down(MouseButton::Left, |_, _, cx| {
                             cx.stop_propagation();
@@ -598,16 +600,16 @@ impl Render for WindowTabBar {
                 .px(px(8.0))
                 .overflow_hidden()
                 .border_r_1()
-                .border_color(rgb(theme::SURFACE));
+                .border_color(rgb(palette.SURFACE));
 
             if is_active {
                 tab = tab
-                    .bg(rgba(theme::with_alpha(theme::ORCA_BLUE, 0x1A)))
-                    .text_color(rgb(theme::BONE));
+                    .bg(rgba(theme::with_alpha(palette.ORCA_BLUE, 0x1A)))
+                    .text_color(rgb(palette.BONE));
             } else {
                 tab = tab
-                    .text_color(rgb(theme::FOG))
-                    .hover(|s| s.bg(rgba(theme::with_alpha(theme::CURRENT, 0x80))));
+                    .text_color(rgb(palette.FOG))
+                    .hover(|s| s.bg(rgba(theme::with_alpha(palette.CURRENT, 0x80))));
             }
 
             // Tab content: inline rename input OR label + badge + close button
@@ -628,7 +630,7 @@ impl Render for WindowTabBar {
                         .flex_1()
                         .min_w_0()
                         .h(px(20.0))
-                        .bg(rgb(theme::SURFACE))
+                        .bg(rgb(palette.SURFACE))
                         .rounded(px(3.0))
                         .px(px(4.0))
                         .flex()
@@ -677,7 +679,7 @@ impl Render for WindowTabBar {
                             div()
                                 .ml(px(4.0))
                                 .text_size(px(10.0))
-                                .text_color(rgb(theme::SLATE))
+                                .text_color(rgb(palette.SLATE))
                                 .flex_shrink_0()
                                 .child(if cfg!(target_os = "macos") {
                                     format!("\u{2318}{}", i + 1)
@@ -700,8 +702,8 @@ impl Render for WindowTabBar {
                                 .flex_shrink_0()
                                 .rounded(px(3.0))
                                 .text_size(px(12.0))
-                                .text_color(rgb(theme::FOG))
-                                .hover(|s| s.text_color(rgb(theme::BONE)).bg(rgb(theme::SURFACE)))
+                                .text_color(rgb(palette.FOG))
+                                .hover(|s| s.text_color(rgb(palette.BONE)).bg(rgb(palette.SURFACE)))
                                 .child("\u{2715}")
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| {
                                     cx.stop_propagation();
@@ -858,7 +860,7 @@ impl Render for WindowTabBar {
                 .h_full()
                 .w(px(1.0))
                 .flex_shrink_0()
-                .bg(rgb(theme::SURFACE)),
+                .bg(rgb(palette.SURFACE)),
         );
 
         // "+" new tab button
@@ -878,8 +880,8 @@ impl Render for WindowTabBar {
                 } else {
                     px(16.0)
                 })
-                .text_color(rgb(theme::FOG))
-                .hover(|s| s.text_color(rgb(theme::BONE)))
+                .text_color(rgb(palette.FOG))
+                .hover(|s| s.text_color(rgb(palette.BONE)))
                 .child(
                     div()
                         .when(cfg!(target_os = "windows"), |d| d.mt(px(-4.0)))
@@ -902,7 +904,7 @@ impl Render for WindowTabBar {
                 .h_full()
                 .w(px(1.0))
                 .flex_shrink_0()
-                .bg(rgb(theme::SURFACE)),
+                .bg(rgb(palette.SURFACE)),
         );
 
         // Settings gear button
@@ -922,8 +924,8 @@ impl Render for WindowTabBar {
                 } else {
                     px(18.0)
                 })
-                .text_color(rgb(theme::FOG))
-                .hover(|s| s.text_color(rgb(theme::BONE)))
+                .text_color(rgb(palette.FOG))
+                .hover(|s| s.text_color(rgb(palette.BONE)))
                 .child("\u{2699}")
                 .on_mouse_down(MouseButton::Left, |_, _, cx| {
                     cx.stop_propagation();

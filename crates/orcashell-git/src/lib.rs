@@ -10,6 +10,7 @@ use git2::{
 };
 
 pub use orcashell_syntax::HighlightedSpan;
+use orcashell_store::ThemeId;
 
 pub const ORCASHELL_EXCLUDE_ENTRY: &str = "/.orcashell/";
 pub const MAX_RENDERED_DIFF_LINES: usize = 10_000;
@@ -208,6 +209,7 @@ pub fn load_file_diff(
     path: &Path,
     generation: u64,
     selection: &DiffSelectionKey,
+    theme_id: ThemeId,
 ) -> Result<FileDiffDocument> {
     let discovered = discover_repo(path)?;
     let diff = match selection.section {
@@ -225,7 +227,7 @@ pub fn load_file_diff(
         let mut lines = render_diff_lines(&diff, idx, &candidate)?;
 
         if !candidate.is_binary {
-            attach_syntax_highlights(&mut lines, &selection.relative_path);
+            attach_syntax_highlights(&mut lines, &selection.relative_path, theme_id);
             attach_inline_changes(&mut lines);
         }
 
@@ -1410,10 +1412,10 @@ fn map_unborn_head(message: &'static str) -> impl FnOnce(git2::Error) -> anyhow:
 ///
 /// Context lines advance both states. Additions advance the new-file state.
 /// Deletions advance the old-file state. Headers are skipped.
-fn attach_syntax_highlights(lines: &mut [DiffLineView], relative_path: &Path) {
+fn attach_syntax_highlights(lines: &mut [DiffLineView], relative_path: &Path, theme_id: ThemeId) {
     let (mut old_hl, mut new_hl) = match (
-        orcashell_syntax::Highlighter::for_path(relative_path),
-        orcashell_syntax::Highlighter::for_path(relative_path),
+        orcashell_syntax::Highlighter::for_path(relative_path, theme_id),
+        orcashell_syntax::Highlighter::for_path(relative_path, theme_id),
     ) {
         (Some(old), Some(new)) => (old, new),
         _ => return, // plain text. Skip highlighting.
@@ -2438,7 +2440,7 @@ mod tests {
             section: DiffSectionKind::Staged,
             relative_path: PathBuf::from("a.txt"),
         };
-        let file_diff = load_file_diff(tempdir.path(), 1, &selection).unwrap();
+        let file_diff = load_file_diff(tempdir.path(), 1, &selection, ThemeId::Dark).unwrap();
         assert!(file_diff
             .lines
             .iter()
@@ -2464,7 +2466,7 @@ mod tests {
             section: DiffSectionKind::Unstaged,
             relative_path: PathBuf::from("a.txt"),
         };
-        let file_diff = load_file_diff(tempdir.path(), 1, &selection).unwrap();
+        let file_diff = load_file_diff(tempdir.path(), 1, &selection, ThemeId::Dark).unwrap();
         // Should show addition of line3 (index has line1+line2, worktree has line1+line2+line3)
         assert!(file_diff
             .lines
@@ -3026,7 +3028,7 @@ mod tests {
             section: DiffSectionKind::Unstaged,
             relative_path: PathBuf::from("asset.bin"),
         };
-        let file_diff = load_file_diff(tempdir.path(), 5, &selection).unwrap();
+        let file_diff = load_file_diff(tempdir.path(), 5, &selection, ThemeId::Dark).unwrap();
         assert_eq!(file_diff.lines, vec![binary_notice(BINARY_DIFF_MESSAGE)]);
     }
 
@@ -3052,7 +3054,7 @@ mod tests {
             section: DiffSectionKind::Unstaged,
             relative_path: PathBuf::from("script.sh"),
         };
-        let file_diff = load_file_diff(tempdir.path(), 5, &selection).unwrap();
+        let file_diff = load_file_diff(tempdir.path(), 5, &selection, ThemeId::Dark).unwrap();
         assert_eq!(file_diff.file.relative_path, PathBuf::from("script.sh"));
         assert!(!file_diff.file.is_binary);
     }
@@ -3075,7 +3077,7 @@ mod tests {
             section: DiffSectionKind::Unstaged,
             relative_path: PathBuf::from("big.txt"),
         };
-        let file_diff = load_file_diff(tempdir.path(), 9, &selection).unwrap();
+        let file_diff = load_file_diff(tempdir.path(), 9, &selection, ThemeId::Dark).unwrap();
         assert_eq!(file_diff.lines, vec![binary_notice(OVERSIZE_DIFF_MESSAGE)]);
     }
 

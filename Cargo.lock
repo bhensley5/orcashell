@@ -4007,6 +4007,7 @@ dependencies = [
  "orcashell-ipc",
  "orcashell-platform",
  "orcashell-protocol",
+ "orcashell-store",
  "parking_lot",
  "serde_json",
  "tempfile",
@@ -4021,6 +4022,7 @@ dependencies = [
  "anyhow",
  "git2",
  "imara-diff",
+ "orcashell-store",
  "orcashell-syntax",
  "tempfile",
 ]
@@ -4085,6 +4087,7 @@ dependencies = [
 name = "orcashell-syntax"
 version = "0.1.0"
 dependencies = [
+ "orcashell-store",
  "syntect",
 ]
 

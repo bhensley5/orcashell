@@ -1,7 +1,7 @@
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 
-use crate::settings::AppSettings;
+use crate::settings::{AppSettings, ThemeId, ThemeMode};
 use crate::theme;
 use crate::workspace::WorkspaceState;
 use orcashell_store::CursorStyle;
@@ -114,16 +114,17 @@ impl SettingsView {
     // ── Layout helpers ──────────────────────────────────────────────────
 
     fn section_header(title: &str) -> Div {
+        let palette = theme::current();
         div()
             .w_full()
             .pb(px(8.0))
             .mb(px(12.0))
             .border_b_1()
-            .border_color(rgb(theme::SURFACE))
+            .border_color(rgb(palette.SURFACE))
             .child(
                 div()
                     .text_size(px(14.0))
-                    .text_color(rgb(theme::PATCH))
+                    .text_color(rgb(palette.PATCH))
                     .child(title.to_string()),
             )
     }
@@ -138,15 +139,17 @@ impl SettingsView {
     }
 
     fn label(text: &str) -> Div {
+        let palette = theme::current();
         div()
             .w(px(140.0))
             .flex_shrink_0()
             .text_size(px(13.0))
-            .text_color(rgb(theme::BONE))
+            .text_color(rgb(palette.BONE))
             .child(text.to_string())
     }
 
     fn stepper_button(id: impl Into<SharedString>, label: &str) -> Stateful<Div> {
+        let palette = theme::current();
         div()
             .id(ElementId::Name(id.into()))
             .w(px(28.0))
@@ -155,15 +158,16 @@ impl SettingsView {
             .items_center()
             .justify_center()
             .rounded(px(4.0))
-            .bg(rgb(theme::SURFACE))
+            .bg(rgb(palette.SURFACE))
             .text_size(px(14.0))
-            .text_color(rgb(theme::BONE))
+            .text_color(rgb(palette.BONE))
             .cursor_pointer()
-            .hover(|s| s.bg(rgb(theme::CURRENT)))
+            .hover(|s| s.bg(rgb(palette.CURRENT)))
             .child(label.to_string())
     }
 
     fn value_display(value: String) -> Div {
+        let palette = theme::current();
         div()
             .w(px(80.0))
             .h(px(28.0))
@@ -171,15 +175,16 @@ impl SettingsView {
             .items_center()
             .justify_center()
             .rounded(px(4.0))
-            .bg(rgb(theme::DEEP))
+            .bg(rgb(palette.DEEP))
             .border_1()
-            .border_color(rgb(theme::SURFACE))
+            .border_color(rgb(palette.SURFACE))
             .text_size(px(13.0))
-            .text_color(rgb(theme::BONE))
+            .text_color(rgb(palette.BONE))
             .child(value)
     }
 
     fn radio_option(id: impl Into<SharedString>, text: &str, selected: bool) -> Stateful<Div> {
+        let palette = theme::current();
         div()
             .id(ElementId::Name(id.into()))
             .flex()
@@ -193,19 +198,19 @@ impl SettingsView {
                     .rounded(px(7.0))
                     .border_1()
                     .when(selected, |s| {
-                        s.border_color(rgb(theme::FOG)).bg(rgb(theme::FOG))
+                        s.border_color(rgb(palette.FOG)).bg(rgb(palette.FOG))
                     })
                     .when(!selected, |s| {
-                        s.border_color(rgb(theme::SLATE)).bg(rgb(theme::DEEP))
+                        s.border_color(rgb(palette.SLATE)).bg(rgb(palette.DEEP))
                     }),
             )
             .child(
                 div()
                     .text_size(px(13.0))
                     .text_color(if selected {
-                        rgb(theme::BONE)
+                        rgb(palette.BONE)
                     } else {
-                        rgb(theme::FOG)
+                        rgb(palette.FOG)
                     })
                     .child(text.to_string()),
             )
@@ -218,6 +223,7 @@ impl SettingsView {
         is_editing: bool,
         edit_buffer: &str,
     ) -> Stateful<Div> {
+        let palette = theme::current();
         let display = if is_editing {
             if edit_buffer.is_empty() {
                 "\u{258F}".to_string()
@@ -231,11 +237,11 @@ impl SettingsView {
         };
 
         let text_color = if is_editing {
-            rgb(theme::BONE)
+            rgb(palette.BONE)
         } else if current_value.is_empty() {
-            rgb(theme::SLATE)
+            rgb(palette.SLATE)
         } else {
-            rgb(theme::BONE)
+            rgb(palette.BONE)
         };
 
         div()
@@ -246,10 +252,10 @@ impl SettingsView {
             .flex()
             .items_center()
             .rounded(px(4.0))
-            .bg(rgb(theme::DEEP))
+            .bg(rgb(palette.DEEP))
             .border_1()
-            .when(is_editing, |s| s.border_color(rgb(theme::ORCA_BLUE)))
-            .when(!is_editing, |s| s.border_color(rgb(theme::SURFACE)))
+            .when(is_editing, |s| s.border_color(rgb(palette.ORCA_BLUE)))
+            .when(!is_editing, |s| s.border_color(rgb(palette.SURFACE)))
             .cursor_pointer()
             .text_size(px(13.0))
             .text_color(text_color)
@@ -260,13 +266,14 @@ impl SettingsView {
 impl Render for SettingsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let settings = cx.global::<AppSettings>().clone();
+        let palette = theme::active(cx);
         let editing = self.editing;
         let edit_buffer = self.edit_buffer.clone();
 
         let root = div()
             .id("settings-view-root")
             .size_full()
-            .bg(rgb(theme::ABYSS))
+            .bg(rgb(palette.ABYSS))
             .flex()
             .flex_col()
             .overflow_y_scroll()
@@ -402,16 +409,16 @@ impl Render for SettingsView {
                 .justify_center()
                 .cursor_pointer()
                 .when(cursor_blink, |s| {
-                    s.border_color(rgb(theme::FOG)).bg(rgb(theme::FOG))
+                    s.border_color(rgb(palette.FOG)).bg(rgb(palette.FOG))
                 })
                 .when(!cursor_blink, |s| {
-                    s.border_color(rgb(theme::SLATE)).bg(rgb(theme::DEEP))
+                    s.border_color(rgb(palette.SLATE)).bg(rgb(palette.DEEP))
                 })
                 .when(cursor_blink, |s| {
                     s.child(
                         div()
                             .text_size(px(12.0))
-                            .text_color(rgb(theme::DEEP))
+                            .text_color(rgb(palette.DEEP))
                             .child("\u{2713}"),
                     )
                 })
@@ -438,16 +445,16 @@ impl Render for SettingsView {
                     .justify_center()
                     .cursor_pointer()
                     .when(activity_pulse, |s| {
-                        s.border_color(rgb(theme::FOG)).bg(rgb(theme::FOG))
+                        s.border_color(rgb(palette.FOG)).bg(rgb(palette.FOG))
                     })
                     .when(!activity_pulse, |s| {
-                        s.border_color(rgb(theme::SLATE)).bg(rgb(theme::DEEP))
+                        s.border_color(rgb(palette.SLATE)).bg(rgb(palette.DEEP))
                     })
                     .when(activity_pulse, |s| {
                         s.child(
                             div()
                                 .text_size(px(12.0))
-                                .text_color(rgb(theme::DEEP))
+                                .text_color(rgb(palette.DEEP))
                                 .child("\u{2713}"),
                         )
                     })
@@ -474,16 +481,16 @@ impl Render for SettingsView {
                     .justify_center()
                     .cursor_pointer()
                     .when(agent_notifications, |s| {
-                        s.border_color(rgb(theme::FOG)).bg(rgb(theme::FOG))
+                        s.border_color(rgb(palette.FOG)).bg(rgb(palette.FOG))
                     })
                     .when(!agent_notifications, |s| {
-                        s.border_color(rgb(theme::SLATE)).bg(rgb(theme::DEEP))
+                        s.border_color(rgb(palette.SLATE)).bg(rgb(palette.DEEP))
                     })
                     .when(agent_notifications, |s| {
                         s.child(
                             div()
                                 .text_size(px(12.0))
-                                .text_color(rgb(theme::DEEP))
+                                .text_color(rgb(palette.DEEP))
                                 .child("\u{2713}"),
                         )
                     })
@@ -553,21 +560,143 @@ impl Render for SettingsView {
                 })),
             );
 
-        // ── Theme ──
-        let theme_name = settings.theme.clone();
         let theme_row = Self::setting_row().child(Self::label("Theme")).child(
             div()
-                .h(px(28.0))
-                .px(px(8.0))
                 .flex()
                 .items_center()
-                .rounded(px(4.0))
-                .bg(rgb(theme::DEEP))
-                .border_1()
-                .border_color(rgb(theme::SURFACE))
-                .text_size(px(13.0))
-                .text_color(rgb(theme::FOG))
-                .child(theme_name),
+                .gap(px(12.0))
+                .child(
+                    Self::radio_option(
+                        "theme-system",
+                        "System",
+                        settings.theme_mode == ThemeMode::System,
+                    )
+                    .on_click(cx.listener(|_this, _, _, cx| {
+                        let mut s = cx.global::<AppSettings>().clone();
+                        s.theme_mode = ThemeMode::System;
+                        cx.set_global(s);
+                    })),
+                )
+                .child(
+                    Self::radio_option(
+                        "theme-dark",
+                        "Dark",
+                        settings.theme_mode == ThemeMode::Manual
+                            && settings.manual_theme == ThemeId::Dark,
+                    )
+                    .on_click(cx.listener(|_this, _, _, cx| {
+                        let mut s = cx.global::<AppSettings>().clone();
+                        s.theme_mode = ThemeMode::Manual;
+                        s.manual_theme = ThemeId::Dark;
+                        cx.set_global(s);
+                    })),
+                )
+                .child(
+                    Self::radio_option(
+                        "theme-black",
+                        "Black",
+                        settings.theme_mode == ThemeMode::Manual
+                            && settings.manual_theme == ThemeId::Black,
+                    )
+                    .on_click(cx.listener(|_this, _, _, cx| {
+                        let mut s = cx.global::<AppSettings>().clone();
+                        s.theme_mode = ThemeMode::Manual;
+                        s.manual_theme = ThemeId::Black;
+                        cx.set_global(s);
+                    })),
+                )
+                .child(
+                    Self::radio_option(
+                        "theme-light",
+                        "Light",
+                        settings.theme_mode == ThemeMode::Manual
+                            && settings.manual_theme == ThemeId::Light,
+                    )
+                    .on_click(cx.listener(|_this, _, _, cx| {
+                        let mut s = cx.global::<AppSettings>().clone();
+                        s.theme_mode = ThemeMode::Manual;
+                        s.manual_theme = ThemeId::Light;
+                        cx.set_global(s);
+                    })),
+                )
+                .child(
+                    Self::radio_option(
+                        "theme-sepia",
+                        "Sepia",
+                        settings.theme_mode == ThemeMode::Manual
+                            && settings.manual_theme == ThemeId::Sepia,
+                    )
+                    .on_click(cx.listener(|_this, _, _, cx| {
+                        let mut s = cx.global::<AppSettings>().clone();
+                        s.theme_mode = ThemeMode::Manual;
+                        s.manual_theme = ThemeId::Sepia;
+                        cx.set_global(s);
+                    })),
+                ),
+        );
+
+        let system_light_row = Self::setting_row()
+            .child(Self::label("Light Mode"))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(12.0))
+                    .child(
+                        Self::radio_option(
+                            "system-light-light",
+                            "Light",
+                            settings.system_light_theme == ThemeId::Light,
+                        )
+                        .on_click(cx.listener(|_this, _, _, cx| {
+                            let mut s = cx.global::<AppSettings>().clone();
+                            s.system_light_theme = ThemeId::Light;
+                            cx.set_global(s);
+                        })),
+                    )
+                    .child(
+                        Self::radio_option(
+                            "system-light-sepia",
+                            "Sepia",
+                            settings.system_light_theme == ThemeId::Sepia,
+                        )
+                        .on_click(cx.listener(|_this, _, _, cx| {
+                            let mut s = cx.global::<AppSettings>().clone();
+                            s.system_light_theme = ThemeId::Sepia;
+                            cx.set_global(s);
+                        })),
+                    ),
+            );
+
+        let system_dark_row = Self::setting_row().child(Self::label("Dark Mode")).child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(12.0))
+                .child(
+                    Self::radio_option(
+                        "system-dark-dark",
+                        "Dark",
+                        settings.system_dark_theme == ThemeId::Dark,
+                    )
+                    .on_click(cx.listener(|_this, _, _, cx| {
+                        let mut s = cx.global::<AppSettings>().clone();
+                        s.system_dark_theme = ThemeId::Dark;
+                        cx.set_global(s);
+                    })),
+                )
+                .child(
+                    Self::radio_option(
+                        "system-dark-black",
+                        "Black",
+                        settings.system_dark_theme == ThemeId::Black,
+                    )
+                    .on_click(cx.listener(|_this, _, _, cx| {
+                        let mut s = cx.global::<AppSettings>().clone();
+                        s.system_dark_theme = ThemeId::Black;
+                        cx.set_global(s);
+                    })),
+                ),
         );
 
         // ── Assemble ──
@@ -584,7 +713,7 @@ impl Render for SettingsView {
                     div()
                         .mb(px(24.0))
                         .text_size(px(16.0))
-                        .text_color(rgb(theme::PATCH))
+                        .text_color(rgb(palette.PATCH))
                         .child("Settings"),
                 )
                 // Terminal
@@ -611,12 +740,16 @@ impl Render for SettingsView {
                 .child(div().h(px(12.0)))
                 .child(Self::section_header("Appearance"))
                 .child(theme_row)
+                .when(settings.theme_mode == ThemeMode::System, |this| {
+                    this.child(system_light_row)
+                        .child(system_dark_row)
+                })
                 // Footer
                 .child(
                     div()
                         .mt(px(32.0))
                         .text_size(px(11.0))
-                        .text_color(rgb(theme::SLATE))
+                        .text_color(rgb(palette.SLATE))
                         .child(
                             "Settings are saved automatically. You can also edit settings.json directly.",
                         ),

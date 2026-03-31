@@ -1,0 +1,27 @@
+[package]
+name = "orcashell-ui"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+gpui.workspace = true
+orcashell-session = { path = "../orcashell-session" }
+orcashell-terminal-view = { path = "../orcashell-terminal-view" }
+orcashell-daemon-core = { path = "../orcashell-daemon-core" }
+orcashell-git = { path = "../orcashell-git" }
+tracing.workspace = true
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+parking_lot = { workspace = true }
+orcashell-store = { path = "../orcashell-store" }
+orcashell-platform = { workspace = true }
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+raw-window-handle = { workspace = true }
+
+[dev-dependencies]
+orcashell-syntax = { path = "../orcashell-syntax" }
+orcashell-platform = { workspace = true }
+tempfile = "3"

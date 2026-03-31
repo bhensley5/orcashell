@@ -1,0 +1,18 @@
+[package]
+name = "orcashell-session"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+alacritty_terminal.workspace = true
+portable-pty.workspace = true
+crossbeam-channel.workspace = true
+parking_lot.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+async-channel.workspace = true
+tracing.workspace = true
+orcashell-platform = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"

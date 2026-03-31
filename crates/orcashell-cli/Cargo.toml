@@ -1,0 +1,15 @@
+[package]
+name = "orcashell-cli"
+version = "0.1.0"
+edition.workspace = true
+
+[[bin]]
+name = "orcash"
+path = "src/main.rs"
+
+[dependencies]
+orcashell-ipc = { path = "../orcashell-ipc" }
+orcashell-protocol = { path = "../orcashell-protocol" }
+clap.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true

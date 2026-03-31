@@ -1,0 +1,16 @@
+[package]
+name = "orcashell-platform"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+dirs = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Storage_FileSystem",
+    "Win32_Foundation",
+] }
+
+[dev-dependencies]
+tempfile = "3"

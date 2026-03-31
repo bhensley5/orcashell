@@ -1,0 +1,53 @@
+[workspace]
+members = [
+    "crates/orcashell",
+    "crates/orcashell-cli",
+    "crates/orcashell-ipc",
+    "crates/orcashell-protocol",
+    "crates/orcashell-daemon-core",
+    "crates/orcashell-session",
+    "crates/orcashell-terminal-view",
+    "crates/orcashell-ui",
+    "crates/orcashell-store",
+    "crates/orcashell-git",
+    "crates/orcashell-platform",
+    "crates/orcashell-syntax",
+]
+exclude = [
+    "forks/vte",
+    "forks/alacritty_terminal",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+gpui = "=0.2.2"
+alacritty_terminal = "0.25.1"
+portable-pty = "0.9"
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+async-channel = "2"
+rusqlite = { version = "0.39", features = ["bundled"] }
+dirs = "6"
+raw-window-handle = "0.6"
+orcashell-ipc = { path = "crates/orcashell-ipc" }
+orcashell-platform = { path = "crates/orcashell-platform" }
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
+
+[patch.crates-io]
+vte = { path = "forks/vte" }
+alacritty_terminal = { path = "forks/alacritty_terminal" }

@@ -1,0 +1,189 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Import certificate
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          echo "$MACOS_CERTIFICATE" | base64 --decode > certificate.p12
+          security create-keychain -p "" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "" build.keychain
+          security import certificate.p12 -k build.keychain \
+            -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s \
+            -k "" build.keychain
+
+      - name: Build release binaries
+        run: cargo build --workspace --release --target aarch64-apple-darwin
+
+      - name: Package and sign app bundle
+        timeout-minutes: 5
+        env:
+          CODESIGN_IDENTITY: "Developer ID Application: ${{ secrets.APPLE_DEVELOPER_NAME }} (${{ secrets.APPLE_TEAM_ID }})"
+        run: |
+          ./scripts/package-macos.sh --target aarch64-apple-darwin
+          # Sign binaries first, then the bundle (inside-out)
+          codesign --force --verify --verbose \
+            --sign "$CODESIGN_IDENTITY" \
+            --options runtime \
+            --timestamp \
+            target/OrcaShell.app/Contents/MacOS/orcash
+          codesign --force --verify --verbose \
+            --sign "$CODESIGN_IDENTITY" \
+            --options runtime \
+            --timestamp \
+            target/OrcaShell.app/Contents/MacOS/orcashell
+          codesign --force --verify --verbose \
+            --sign "$CODESIGN_IDENTITY" \
+            --options runtime \
+            --timestamp \
+            target/OrcaShell.app
+
+      - name: Create and sign .dmg
+        env:
+          CODESIGN_IDENTITY: "Developer ID Application: ${{ secrets.APPLE_DEVELOPER_NAME }} (${{ secrets.APPLE_TEAM_ID }})"
+        run: |
+          brew install create-dmg
+          create-dmg \
+            --volname "OrcaShell" \
+            --window-pos 200 120 \
+            --window-size 600 400 \
+            --icon-size 100 \
+            --app-drop-link 450 185 \
+            "target/OrcaShell-macos-arm64.dmg" \
+            "target/OrcaShell.app" \
+            || true  # create-dmg exits 2 on success when --skip-jenkins is absent
+          # Verify the dmg was created
+          test -f "target/OrcaShell-macos-arm64.dmg"
+          # Sign the dmg itself
+          codesign --force --sign "$CODESIGN_IDENTITY" --timestamp \
+            "target/OrcaShell-macos-arm64.dmg"
+
+      - name: Notarize .dmg
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          xcrun notarytool submit \
+            "target/OrcaShell-macos-arm64.dmg" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+          xcrun stapler staple "target/OrcaShell-macos-arm64.dmg"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: OrcaShell-macos-arm64.dmg
+          path: target/OrcaShell-macos-arm64.dmg
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev \
+            libxkbcommon-x11-dev libvulkan-dev libwayland-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-xkb-dev
+
+      - name: Build release binaries
+        run: cargo build --workspace --release --target x86_64-unknown-linux-gnu
+
+      - name: Package Linux archive
+        run: |
+          # Copy cross-compiled binaries to the default release path for the packaging script
+          mkdir -p target/release
+          cp target/x86_64-unknown-linux-gnu/release/orcashell target/release/
+          cp target/x86_64-unknown-linux-gnu/release/orcash target/release/
+          bash scripts/package-linux.sh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: orcashell-linux-x86_64.tar.gz
+          path: target/orcashell-linux-x86_64.tar.gz
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: clippy, rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --target x86_64-pc-windows-msvc -- -D warnings
+
+      - name: Build release binaries
+        run: cargo build --workspace --release --target x86_64-pc-windows-msvc
+
+      - name: Test
+        run: cargo test --workspace --target x86_64-pc-windows-msvc
+
+      - name: Package Windows ZIP
+        run: |
+          mkdir orcashell-windows
+          copy target\x86_64-pc-windows-msvc\release\orcashell.exe orcashell-windows\
+          copy target\x86_64-pc-windows-msvc\release\orcash.exe orcashell-windows\
+          copy packaging\windows\register-context-menu.ps1 orcashell-windows\
+          copy packaging\windows\unregister-context-menu.ps1 orcashell-windows\
+          Compress-Archive -Path orcashell-windows\* -DestinationPath orcashell-windows-x64.zip
+        shell: pwsh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: orcashell-windows-x64.zip
+          path: orcashell-windows-x64.zip
+
+  release:
+    needs: [build-macos, build-linux, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: artifacts/**/*

@@ -1,0 +1,131 @@
+%YAML 1.2
+---
+# Minimal PowerShell syntax for OrcaShell diff highlighting.
+# Covers keywords, comments, strings, variables, operators, and common patterns.
+name: PowerShell
+scope: source.powershell
+file_extensions:
+  - ps1
+  - psm1
+  - psd1
+contexts:
+  main:
+    # Line comments
+    - match: '#'
+      scope: comment.line.powershell
+      push: line_comment
+
+    # Block comments
+    - match: '<#'
+      scope: comment.block.powershell
+      push: block_comment
+
+    # Double-quoted strings (with variable interpolation)
+    - match: '"'
+      scope: string.quoted.double.powershell
+      push: double_string
+
+    # Single-quoted strings (literal)
+    - match: "'"
+      scope: string.quoted.single.powershell
+      push: single_string
+
+    # Here-strings
+    - match: '@"'
+      scope: string.quoted.double.heredoc.powershell
+      push: here_double_string
+    - match: "@'"
+      scope: string.quoted.single.heredoc.powershell
+      push: here_single_string
+
+    # Variables ($name, $env:PATH, $script:var, ${complex name})
+    - match: '\$\{[^}]+\}'
+      scope: variable.other.powershell
+    - match: '\$(?:env|script|global|local|private|using|workflow):[A-Za-z_][A-Za-z0-9_]*'
+      scope: variable.other.powershell
+    - match: '\$(?:true|false|null|_|PSVersionTable|PSScriptRoot|PSCommandPath|ErrorActionPreference|Error|Host|HOME|PROFILE|PWD|PID|args|input|MyInvocation)\b'
+      scope: variable.language.powershell
+    - match: '\$[A-Za-z_][A-Za-z0-9_]*'
+      scope: variable.other.powershell
+
+    # Numeric literals
+    - match: '\b(?:0x[0-9A-Fa-f]+|[0-9]+(?:\.[0-9]+)?(?:e[+-]?[0-9]+)?)\b'
+      scope: constant.numeric.powershell
+
+    # Comparison and logical operators
+    - match: '\s-(?:eq|ne|gt|ge|lt|le|like|notlike|match|notmatch|contains|notcontains|in|notin|replace|split|join|is|isnot|as|band|bor|bxor|bnot|shl|shr|and|or|not|xor)\b'
+      scope: keyword.operator.powershell
+
+    # Flow control keywords
+    - match: '\b(?:if|elseif|else|switch|while|for|foreach|do|until|break|continue|return|exit|throw|try|catch|finally|trap|begin|process|end|dynamicparam)\b'
+      scope: keyword.control.powershell
+
+    # Declaration keywords
+    - match: '\b(?:function|filter|workflow|class|enum|using|param|configuration)\b'
+      scope: keyword.declaration.powershell
+
+    # Storage/scope modifiers
+    - match: '\[(?:string|int|long|double|decimal|bool|byte|char|array|hashtable|psobject|xml|void|switch|regex|scriptblock|type|ref|nullable|datetime|timespan|guid|uri|version|ipaddress|mailaddress|PSCredential|SecureString)\]'
+      scope: storage.type.powershell
+
+    # Common cmdlet verbs (Verb-Noun pattern)
+    - match: '\b(?:Get|Set|New|Remove|Add|Clear|Write|Read|Out|Import|Export|Invoke|Start|Stop|Restart|Test|Update|Select|Where|ForEach|Sort|Group|Measure|Compare|Format|ConvertTo|ConvertFrom|Copy|Move|Rename|Join|Split|Push|Pop|Enter|Exit|Register|Unregister|Enable|Disable|Show|Hide|Find|Search|Save|Open|Close|Connect|Disconnect|Send|Receive|Wait|Debug|Trace|Assert|Confirm|Approve|Deny|Grant|Revoke|Protect|Unprotect|Publish|Unpublish|Install|Uninstall|Initialize|Repair|Resolve|Sync|Watch)-[A-Za-z][A-Za-z0-9]*\b'
+      scope: support.function.powershell
+
+    # Pipeline and redirection
+    - match: '\|'
+      scope: keyword.operator.pipe.powershell
+    - match: '>>|>|2>&1|2>'
+      scope: keyword.operator.redirection.powershell
+
+    # Assignment and arithmetic operators
+    - match: '[+\-*/%]=|='
+      scope: keyword.operator.assignment.powershell
+    - match: '\+\+|--'
+      scope: keyword.operator.arithmetic.powershell
+
+    # Dot-sourcing and call operator
+    - match: '(?<=\s)\.|&'
+      scope: keyword.operator.powershell
+
+  line_comment:
+    - meta_scope: comment.line.powershell
+    - match: '$'
+      pop: true
+
+  block_comment:
+    - meta_scope: comment.block.powershell
+    - match: '#>'
+      pop: true
+
+  double_string:
+    - meta_scope: string.quoted.double.powershell
+    - match: '\\.'
+      scope: constant.character.escape.powershell
+    - match: '`.'
+      scope: constant.character.escape.powershell
+    - match: '\$\([^)]*\)'
+      scope: variable.other.powershell
+    - match: '\$[A-Za-z_][A-Za-z0-9_]*'
+      scope: variable.other.powershell
+    - match: '"'
+      pop: true
+
+  single_string:
+    - meta_scope: string.quoted.single.powershell
+    - match: "''"
+      scope: constant.character.escape.powershell
+    - match: "'"
+      pop: true
+
+  here_double_string:
+    - meta_scope: string.quoted.double.heredoc.powershell
+    - match: '\$[A-Za-z_][A-Za-z0-9_]*'
+      scope: variable.other.powershell
+    - match: '^"@'
+      pop: true
+
+  here_single_string:
+    - meta_scope: string.quoted.single.heredoc.powershell
+    - match: "^'@"
+      pop: true

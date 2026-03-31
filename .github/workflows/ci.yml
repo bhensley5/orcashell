@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "phase-*/*"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  check-unix:
+    strategy:
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev \
+            libxkbcommon-x11-dev libvulkan-dev libwayland-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-xkb-dev
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --workspace -- -D warnings
+
+      - name: Build
+        run: cargo build --workspace
+
+      - name: Test
+        run: cargo test --workspace
+
+  check-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --target x86_64-pc-windows-msvc -- -D warnings
+
+      - name: Build
+        run: cargo build --workspace --target x86_64-pc-windows-msvc
+
+      - name: Test
+        run: cargo test --workspace --target x86_64-pc-windows-msvc

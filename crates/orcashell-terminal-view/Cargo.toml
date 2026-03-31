@@ -1,0 +1,15 @@
+[package]
+name = "orcashell-terminal-view"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+gpui.workspace = true
+orcashell-session = { path = "../orcashell-session" }
+alacritty_terminal.workspace = true
+parking_lot.workspace = true
+crossbeam-channel.workspace = true
+portable-pty.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+orcashell-platform = { workspace = true }

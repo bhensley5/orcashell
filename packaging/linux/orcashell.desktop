@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=OrcaShell
+Comment=Terminal-first agent orchestration platform
+Exec=orcashell
+Icon=orcashell
+Terminal=false
+Type=Application
+Categories=System;TerminalEmulator;Development;
+StartupWMClass=OrcaShell

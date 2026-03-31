@@ -1,0 +1,30 @@
+use gpui::actions;
+
+actions!(
+    orcashell,
+    [
+        SplitRight,
+        SplitDown,
+        NewTab,
+        ClosePane,
+        CloseTab,
+        FocusNextPane,
+        FocusPrevPane,
+        NextTab,
+        PrevTab,
+        GotoTab1,
+        GotoTab2,
+        GotoTab3,
+        GotoTab4,
+        GotoTab5,
+        GotoTab6,
+        GotoTab7,
+        GotoTab8,
+        GotoTab9,
+        ToggleSidebar,
+        AddProject,
+        ToggleSettings,
+        NewWindow,
+        QuitApp,
+    ]
+);

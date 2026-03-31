@@ -1,0 +1,626 @@
+use gpui::prelude::FluentBuilder as _;
+use gpui::*;
+
+use crate::settings::AppSettings;
+use crate::theme;
+use crate::workspace::WorkspaceState;
+use orcashell_store::CursorStyle;
+
+/// Which text field is currently being edited inline.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum EditingField {
+    FontFamily,
+    DefaultShell,
+    NotificationUrgentPatterns,
+}
+
+pub struct SettingsView {
+    workspace: Entity<WorkspaceState>,
+    focus_handle: FocusHandle,
+    editing: Option<EditingField>,
+    edit_buffer: String,
+}
+
+impl SettingsView {
+    pub fn new(workspace: Entity<WorkspaceState>, cx: &mut Context<Self>) -> Self {
+        Self {
+            workspace,
+            focus_handle: cx.focus_handle(),
+            editing: None,
+            edit_buffer: String::new(),
+        }
+    }
+
+    /// Clear any in-progress text edit. Called when settings tab is closed.
+    pub fn reset_edit_state(&mut self) {
+        self.editing = None;
+        self.edit_buffer.clear();
+    }
+
+    pub fn focus_handle(&self) -> &FocusHandle {
+        &self.focus_handle
+    }
+
+    fn start_edit(&mut self, field: EditingField, current_value: &str, cx: &mut Context<Self>) {
+        self.editing = Some(field);
+        self.edit_buffer = current_value.to_string();
+        cx.notify();
+    }
+
+    fn commit_edit(&mut self, cx: &mut Context<Self>) {
+        if let Some(field) = self.editing.take() {
+            let value = self.edit_buffer.clone();
+            let mut settings = cx.global::<AppSettings>().clone();
+            match field {
+                EditingField::FontFamily => settings.font_family = value,
+                EditingField::DefaultShell => {
+                    settings.default_shell = if value.is_empty() { None } else { Some(value) };
+                }
+                EditingField::NotificationUrgentPatterns => {
+                    settings.notification_urgent_patterns = value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|part| !part.is_empty())
+                        .map(str::to_string)
+                        .collect();
+                }
+            }
+            cx.set_global(settings);
+            cx.notify();
+        }
+    }
+
+    fn cancel_edit(&mut self, cx: &mut Context<Self>) {
+        self.editing = None;
+        self.edit_buffer.clear();
+        cx.notify();
+    }
+
+    fn handle_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let key = &event.keystroke.key;
+
+        if self.editing.is_some() {
+            match key.as_str() {
+                "backspace" => {
+                    self.edit_buffer.pop();
+                    cx.notify();
+                }
+                "enter" => self.commit_edit(cx),
+                "escape" => self.cancel_edit(cx),
+                "space" => {
+                    self.edit_buffer.push(' ');
+                    cx.notify();
+                }
+                _ => {
+                    let mods = &event.keystroke.modifiers;
+                    // Use key_char for composed character, filtering out modified keys
+                    if let Some(ref kc) = event.keystroke.key_char {
+                        if !kc.is_empty() && !mods.platform && !mods.control {
+                            self.edit_buffer.push_str(kc);
+                            cx.notify();
+                        }
+                    } else if key.len() == 1 && !mods.control && !mods.alt && !mods.platform {
+                        self.edit_buffer.push_str(key);
+                        cx.notify();
+                    }
+                }
+            }
+        } else if key == "escape" {
+            // Close settings tab when Escape is pressed and not editing
+            self.workspace.update(cx, |ws, cx| ws.close_settings(cx));
+        }
+    }
+
+    // ── Layout helpers ──────────────────────────────────────────────────
+
+    fn section_header(title: &str) -> Div {
+        div()
+            .w_full()
+            .pb(px(8.0))
+            .mb(px(12.0))
+            .border_b_1()
+            .border_color(rgb(theme::SURFACE))
+            .child(
+                div()
+                    .text_size(px(14.0))
+                    .text_color(rgb(theme::PATCH))
+                    .child(title.to_string()),
+            )
+    }
+
+    fn setting_row() -> Div {
+        div()
+            .w_full()
+            .mb(px(10.0))
+            .flex()
+            .items_center()
+            .gap(px(16.0))
+    }
+
+    fn label(text: &str) -> Div {
+        div()
+            .w(px(140.0))
+            .flex_shrink_0()
+            .text_size(px(13.0))
+            .text_color(rgb(theme::BONE))
+            .child(text.to_string())
+    }
+
+    fn stepper_button(id: impl Into<SharedString>, label: &str) -> Stateful<Div> {
+        div()
+            .id(ElementId::Name(id.into()))
+            .w(px(28.0))
+            .h(px(28.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(4.0))
+            .bg(rgb(theme::SURFACE))
+            .text_size(px(14.0))
+            .text_color(rgb(theme::BONE))
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(theme::CURRENT)))
+            .child(label.to_string())
+    }
+
+    fn value_display(value: String) -> Div {
+        div()
+            .w(px(80.0))
+            .h(px(28.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(4.0))
+            .bg(rgb(theme::DEEP))
+            .border_1()
+            .border_color(rgb(theme::SURFACE))
+            .text_size(px(13.0))
+            .text_color(rgb(theme::BONE))
+            .child(value)
+    }
+
+    fn radio_option(id: impl Into<SharedString>, text: &str, selected: bool) -> Stateful<Div> {
+        div()
+            .id(ElementId::Name(id.into()))
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .cursor_pointer()
+            .child(
+                div()
+                    .w(px(14.0))
+                    .h(px(14.0))
+                    .rounded(px(7.0))
+                    .border_1()
+                    .when(selected, |s| {
+                        s.border_color(rgb(theme::FOG)).bg(rgb(theme::FOG))
+                    })
+                    .when(!selected, |s| {
+                        s.border_color(rgb(theme::SLATE)).bg(rgb(theme::DEEP))
+                    }),
+            )
+            .child(
+                div()
+                    .text_size(px(13.0))
+                    .text_color(if selected {
+                        rgb(theme::BONE)
+                    } else {
+                        rgb(theme::FOG)
+                    })
+                    .child(text.to_string()),
+            )
+    }
+
+    fn text_field_display(
+        id: impl Into<SharedString>,
+        current_value: &str,
+        placeholder: &str,
+        is_editing: bool,
+        edit_buffer: &str,
+    ) -> Stateful<Div> {
+        let display = if is_editing {
+            if edit_buffer.is_empty() {
+                "\u{258F}".to_string()
+            } else {
+                format!("{}\u{258F}", edit_buffer)
+            }
+        } else if current_value.is_empty() {
+            placeholder.to_string()
+        } else {
+            current_value.to_string()
+        };
+
+        let text_color = if is_editing {
+            rgb(theme::BONE)
+        } else if current_value.is_empty() {
+            rgb(theme::SLATE)
+        } else {
+            rgb(theme::BONE)
+        };
+
+        div()
+            .id(ElementId::Name(id.into()))
+            .min_w(px(200.0))
+            .h(px(28.0))
+            .px(px(8.0))
+            .flex()
+            .items_center()
+            .rounded(px(4.0))
+            .bg(rgb(theme::DEEP))
+            .border_1()
+            .when(is_editing, |s| s.border_color(rgb(theme::ORCA_BLUE)))
+            .when(!is_editing, |s| s.border_color(rgb(theme::SURFACE)))
+            .cursor_pointer()
+            .text_size(px(13.0))
+            .text_color(text_color)
+            .child(display)
+    }
+}
+
+impl Render for SettingsView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let settings = cx.global::<AppSettings>().clone();
+        let editing = self.editing;
+        let edit_buffer = self.edit_buffer.clone();
+
+        let root = div()
+            .id("settings-view-root")
+            .size_full()
+            .bg(rgb(theme::ABYSS))
+            .flex()
+            .flex_col()
+            .overflow_y_scroll()
+            .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+                this.handle_key_down(event, cx);
+            }));
+
+        // ── Font Size ──
+        let font_size = settings.font_size;
+        let font_size_row = Self::setting_row().child(Self::label("Font Size")).child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(4.0))
+                .child(
+                    Self::stepper_button("font-size-dec", "\u{2212}").on_click(cx.listener(
+                        move |_this, _, _, cx| {
+                            let mut s = cx.global::<AppSettings>().clone();
+                            s.font_size = (s.font_size - 1.0).max(8.0);
+                            cx.set_global(s);
+                        },
+                    )),
+                )
+                .child(Self::value_display(format!("{:.1}", font_size)))
+                .child(
+                    Self::stepper_button("font-size-inc", "+").on_click(cx.listener(
+                        move |_this, _, _, cx| {
+                            let mut s = cx.global::<AppSettings>().clone();
+                            s.font_size = (s.font_size + 1.0).min(32.0);
+                            cx.set_global(s);
+                        },
+                    )),
+                ),
+        );
+
+        // ── Font Family ──
+        let is_editing_font = editing == Some(EditingField::FontFamily);
+        let font_family_display = if is_editing_font {
+            edit_buffer.clone()
+        } else {
+            settings.font_family.clone()
+        };
+        let font_family_row = Self::setting_row().child(Self::label("Font Family")).child(
+            Self::text_field_display(
+                "font-family-input",
+                &settings.font_family,
+                "JetBrains Mono",
+                is_editing_font,
+                &font_family_display,
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                let current = cx.global::<AppSettings>().font_family.clone();
+                this.start_edit(EditingField::FontFamily, &current, cx);
+            })),
+        );
+
+        // ── Scrollback ──
+        let scrollback = settings.scrollback_lines;
+        let scrollback_row =
+            Self::setting_row().child(Self::label("Scrollback")).child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .child(Self::stepper_button("scrollback-dec", "\u{2212}").on_click(
+                        cx.listener(move |_this, _, _, cx| {
+                            let mut s = cx.global::<AppSettings>().clone();
+                            s.scrollback_lines = s.scrollback_lines.saturating_sub(1000).max(100);
+                            cx.set_global(s);
+                        }),
+                    ))
+                    .child(Self::value_display(format!("{}", scrollback)))
+                    .child(
+                        Self::stepper_button("scrollback-inc", "+").on_click(cx.listener(
+                            move |_this, _, _, cx| {
+                                let mut s = cx.global::<AppSettings>().clone();
+                                s.scrollback_lines = (s.scrollback_lines + 1000).min(100_000);
+                                cx.set_global(s);
+                            },
+                        )),
+                    ),
+            );
+
+        // ── Cursor Style ──
+        let cursor_style = settings.cursor_style;
+        let cursor_style_row = Self::setting_row().child(Self::label("Style")).child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(12.0))
+                .child(
+                    Self::radio_option("cursor-block", "Block", cursor_style == CursorStyle::Block)
+                        .on_click(cx.listener(|_this, _, _, cx| {
+                            let mut s = cx.global::<AppSettings>().clone();
+                            s.cursor_style = CursorStyle::Block;
+                            cx.set_global(s);
+                        })),
+                )
+                .child(
+                    Self::radio_option("cursor-bar", "Bar", cursor_style == CursorStyle::Bar)
+                        .on_click(cx.listener(|_this, _, _, cx| {
+                            let mut s = cx.global::<AppSettings>().clone();
+                            s.cursor_style = CursorStyle::Bar;
+                            cx.set_global(s);
+                        })),
+                )
+                .child(
+                    Self::radio_option(
+                        "cursor-underline",
+                        "Underline",
+                        cursor_style == CursorStyle::Underline,
+                    )
+                    .on_click(cx.listener(|_this, _, _, cx| {
+                        let mut s = cx.global::<AppSettings>().clone();
+                        s.cursor_style = CursorStyle::Underline;
+                        cx.set_global(s);
+                    })),
+                ),
+        );
+
+        // ── Cursor Blink ──
+        let cursor_blink = settings.cursor_blink;
+        let cursor_blink_row = Self::setting_row().child(Self::label("Blink")).child(
+            div()
+                .id("cursor-blink-toggle")
+                .w(px(18.0))
+                .h(px(18.0))
+                .rounded(px(4.0))
+                .border_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .when(cursor_blink, |s| {
+                    s.border_color(rgb(theme::FOG)).bg(rgb(theme::FOG))
+                })
+                .when(!cursor_blink, |s| {
+                    s.border_color(rgb(theme::SLATE)).bg(rgb(theme::DEEP))
+                })
+                .when(cursor_blink, |s| {
+                    s.child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(rgb(theme::DEEP))
+                            .child("\u{2713}"),
+                    )
+                })
+                .on_click(cx.listener(move |_this, _, _, cx| {
+                    let mut s = cx.global::<AppSettings>().clone();
+                    s.cursor_blink = !s.cursor_blink;
+                    cx.set_global(s);
+                })),
+        );
+
+        // ── Activity Pulse ──
+        let activity_pulse = settings.activity_pulse;
+        let activity_pulse_row = Self::setting_row()
+            .child(Self::label("Activity Pulse"))
+            .child(
+                div()
+                    .id("activity-pulse-toggle")
+                    .w(px(18.0))
+                    .h(px(18.0))
+                    .rounded(px(4.0))
+                    .border_1()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .when(activity_pulse, |s| {
+                        s.border_color(rgb(theme::FOG)).bg(rgb(theme::FOG))
+                    })
+                    .when(!activity_pulse, |s| {
+                        s.border_color(rgb(theme::SLATE)).bg(rgb(theme::DEEP))
+                    })
+                    .when(activity_pulse, |s| {
+                        s.child(
+                            div()
+                                .text_size(px(12.0))
+                                .text_color(rgb(theme::DEEP))
+                                .child("\u{2713}"),
+                        )
+                    })
+                    .on_click(cx.listener(move |_this, _, _, cx| {
+                        let mut s = cx.global::<AppSettings>().clone();
+                        s.activity_pulse = !s.activity_pulse;
+                        cx.set_global(s);
+                    })),
+            );
+
+        // ── Agent Notifications ──
+        let agent_notifications = settings.agent_notifications;
+        let agent_notifications_row = Self::setting_row()
+            .child(Self::label("Agent Notifications"))
+            .child(
+                div()
+                    .id("agent-notifications-toggle")
+                    .w(px(18.0))
+                    .h(px(18.0))
+                    .rounded(px(4.0))
+                    .border_1()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .when(agent_notifications, |s| {
+                        s.border_color(rgb(theme::FOG)).bg(rgb(theme::FOG))
+                    })
+                    .when(!agent_notifications, |s| {
+                        s.border_color(rgb(theme::SLATE)).bg(rgb(theme::DEEP))
+                    })
+                    .when(agent_notifications, |s| {
+                        s.child(
+                            div()
+                                .text_size(px(12.0))
+                                .text_color(rgb(theme::DEEP))
+                                .child("\u{2713}"),
+                        )
+                    })
+                    .on_click(cx.listener(move |_this, _, _, cx| {
+                        let mut s = cx.global::<AppSettings>().clone();
+                        s.agent_notifications = !s.agent_notifications;
+                        cx.set_global(s);
+                    })),
+            );
+
+        // ── Urgent Patterns ──
+        let is_editing_patterns = editing == Some(EditingField::NotificationUrgentPatterns);
+        let patterns_value = settings.notification_urgent_patterns.join(", ");
+        let patterns_display = if is_editing_patterns {
+            edit_buffer.clone()
+        } else {
+            patterns_value.clone()
+        };
+        let urgent_patterns_row = Self::setting_row()
+            .child(Self::label("Urgent Patterns"))
+            .child(
+                Self::text_field_display(
+                    "urgent-patterns-input",
+                    &patterns_value,
+                    "approv, permission, edit",
+                    is_editing_patterns,
+                    &patterns_display,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    let current = cx
+                        .global::<AppSettings>()
+                        .notification_urgent_patterns
+                        .join(", ");
+                    this.start_edit(EditingField::NotificationUrgentPatterns, &current, cx);
+                })),
+            );
+
+        // ── Default Shell ──
+        let is_editing_shell = editing == Some(EditingField::DefaultShell);
+        let shell_value = settings.default_shell.as_deref().unwrap_or("").to_string();
+        let shell_display = if is_editing_shell {
+            edit_buffer.clone()
+        } else {
+            shell_value.clone()
+        };
+        let shell_row = Self::setting_row()
+            .child(Self::label("Default Shell"))
+            .child(
+                Self::text_field_display(
+                    "shell-input",
+                    &shell_value,
+                    if cfg!(windows) {
+                        "System default (pwsh / powershell / cmd)"
+                    } else {
+                        "System default ($SHELL)"
+                    },
+                    is_editing_shell,
+                    &shell_display,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    let current = cx
+                        .global::<AppSettings>()
+                        .default_shell
+                        .clone()
+                        .unwrap_or_default();
+                    this.start_edit(EditingField::DefaultShell, &current, cx);
+                })),
+            );
+
+        // ── Theme ──
+        let theme_name = settings.theme.clone();
+        let theme_row = Self::setting_row().child(Self::label("Theme")).child(
+            div()
+                .h(px(28.0))
+                .px(px(8.0))
+                .flex()
+                .items_center()
+                .rounded(px(4.0))
+                .bg(rgb(theme::DEEP))
+                .border_1()
+                .border_color(rgb(theme::SURFACE))
+                .text_size(px(13.0))
+                .text_color(rgb(theme::FOG))
+                .child(theme_name),
+        );
+
+        // ── Assemble ──
+        root.child(
+            div()
+                .w_full()
+                .max_w(px(600.0))
+                .mx_auto()
+                .p(px(32.0))
+                .flex()
+                .flex_col()
+                // Title
+                .child(
+                    div()
+                        .mb(px(24.0))
+                        .text_size(px(16.0))
+                        .text_color(rgb(theme::PATCH))
+                        .child("Settings"),
+                )
+                // Terminal
+                .child(Self::section_header("Terminal"))
+                .child(font_size_row)
+                .child(font_family_row)
+                .child(scrollback_row)
+                // Cursor
+                .child(div().h(px(12.0)))
+                .child(Self::section_header("Cursor"))
+                .child(cursor_style_row)
+                .child(cursor_blink_row)
+                // Attention
+                .child(div().h(px(12.0)))
+                .child(Self::section_header("Attention"))
+                .child(activity_pulse_row)
+                .child(agent_notifications_row)
+                .child(urgent_patterns_row)
+                // Shell
+                .child(div().h(px(12.0)))
+                .child(Self::section_header("Shell"))
+                .child(shell_row)
+                // Appearance
+                .child(div().h(px(12.0)))
+                .child(Self::section_header("Appearance"))
+                .child(theme_row)
+                // Footer
+                .child(
+                    div()
+                        .mt(px(32.0))
+                        .text_size(px(11.0))
+                        .text_color(rgb(theme::SLATE))
+                        .child(
+                            "Settings are saved automatically. You can also edit settings.json directly.",
+                        ),
+                ),
+        )
+    }
+}

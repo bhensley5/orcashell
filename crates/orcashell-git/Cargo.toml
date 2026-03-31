@@ -1,0 +1,13 @@
+[package]
+name = "orcashell-git"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+git2 = { version = "0.20.4", default-features = false, features = ["vendored-libgit2"] }
+anyhow.workspace = true
+imara-diff = "0.1"
+orcashell-syntax = { path = "../orcashell-syntax" }
+
+[dev-dependencies]
+tempfile = "3"

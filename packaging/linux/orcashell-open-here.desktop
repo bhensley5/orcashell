@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Service
+ServiceTypes=KonqPopupMenu/Plugin
+X-KDE-ServiceTypes=KonqPopupMenu/Plugin
+MimeType=inode/directory;
+Actions=openOrcaShell;
+X-KDE-Priority=TopLevel
+Icon=utilities-terminal
+
+[Desktop Action openOrcaShell]
+Name=Open OrcaShell Here
+Icon=utilities-terminal
+Exec=orcash open --dir %f

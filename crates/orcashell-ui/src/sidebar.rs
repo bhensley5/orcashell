@@ -7,7 +7,7 @@ use gpui::*;
 
 use crate::app_view::ContextMenuRequest;
 use crate::context_menu::ContextMenuItem;
-use crate::settings::AppSettings;
+use crate::settings::{AppSettings, ThemeId};
 use crate::theme;
 use crate::workspace::layout::LayoutNode;
 use crate::workspace::{RenameLocation, WorkspaceState};
@@ -55,16 +55,17 @@ struct SidebarDragView {
 
 impl Render for SidebarDragView {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = theme::current();
         div()
             .px(px(10.0))
             .py(px(4.0))
-            .bg(rgb(theme::CURRENT))
+            .bg(rgb(palette.CURRENT))
             .border_1()
-            .border_color(rgb(theme::ORCA_BLUE))
+            .border_color(rgb(palette.ORCA_BLUE))
             .rounded(px(4.0))
             .shadow_md()
             .text_size(px(12.0))
-            .text_color(rgb(theme::BONE))
+            .text_color(rgb(palette.BONE))
             .child(self.label.clone())
     }
 }
@@ -229,6 +230,7 @@ impl Sidebar {
     }
 
     fn render_project_list(&self, cx: &App) -> Stateful<Div> {
+        let palette = theme::active(cx);
         let ws = self.workspace.read(cx);
         let activity_pulse = cx.global::<AppSettings>().activity_pulse;
         let mut list = div()
@@ -277,7 +279,7 @@ impl Sidebar {
                         } else {
                             px(13.0)
                         })
-                        .text_color(rgb(theme::BONE))
+                        .text_color(rgb(palette.BONE))
                         .child(if cfg!(target_os = "windows") {
                             format!("\u{1F5C1} {}", project.name)
                         } else {
@@ -294,7 +296,7 @@ impl Sidebar {
                         .justify_center()
                         .w(px(20.0))
                         .text_size(px(13.0))
-                        .text_color(rgb(theme::FOG))
+                        .text_color(rgb(palette.FOG))
                         .child("+")
                         .on_click(move |_event, window, cx| {
                             ws_add.update(cx, |ws, cx| {
@@ -324,8 +326,8 @@ impl Sidebar {
                         cx.new(|_| SidebarDragView { label })
                     },
                 )
-                .drag_over::<ProjectDragPayload>(|style, _, _, _| {
-                    style.border_t(px(2.0)).border_color(rgb(theme::ORCA_BLUE))
+                .drag_over::<ProjectDragPayload>(move |style, _, _, _| {
+                    style.border_t(px(2.0)).border_color(rgb(palette.ORCA_BLUE))
                 })
                 .on_drop({
                     let target_idx = proj_idx;
@@ -403,12 +405,12 @@ impl Sidebar {
                 term_row = term_row.border_l_2();
                 if is_term_focused {
                     term_row = term_row
-                        .bg(rgba(theme::with_alpha(theme::ORCA_BLUE, 0x1A)))
-                        .text_color(rgb(theme::PATCH))
-                        .border_color(rgba(theme::with_alpha(theme::ORCA_BLUE, 0x66)));
+                        .bg(rgba(theme::with_alpha(palette.ORCA_BLUE, 0x1A)))
+                        .text_color(rgb(palette.PATCH))
+                        .border_color(rgba(theme::with_alpha(palette.ORCA_BLUE, 0x66)));
                 } else {
                     term_row = term_row
-                        .text_color(rgb(theme::FOG))
+                        .text_color(rgb(palette.FOG))
                         .border_color(transparent_black());
                 }
 
@@ -422,18 +424,23 @@ impl Sidebar {
 
                 let (icon_text, icon_color, icon_opacity, icon_weight) = if is_notifying {
                     let _ = notification_tier;
-                    ("!!", theme::SEAFOAM, self.pulse_opacity(), FontWeight::BOLD)
+                    (
+                        "!!",
+                        palette.SEAFOAM,
+                        self.pulse_opacity(),
+                        FontWeight::BOLD,
+                    )
                 } else if is_pulsing {
                     (
                         ">_",
-                        theme::ORCA_BLUE,
+                        palette.ORCA_BLUE,
                         self.pulse_opacity(),
                         FontWeight::NORMAL,
                     )
                 } else if is_term_focused {
-                    (">_", theme::PATCH, 1.0, FontWeight::NORMAL)
+                    (">_", palette.PATCH, 1.0, FontWeight::NORMAL)
                 } else {
-                    (">_", theme::FOG, 1.0, FontWeight::NORMAL)
+                    (">_", palette.FOG, 1.0, FontWeight::NORMAL)
                 };
 
                 term_row = term_row.child(
@@ -460,7 +467,7 @@ impl Sidebar {
                             .flex_1()
                             .min_w_0()
                             .h(px(20.0))
-                            .bg(rgb(theme::SURFACE))
+                            .bg(rgb(palette.SURFACE))
                             .rounded(px(3.0))
                             .px(px(4.0))
                             .flex()
@@ -496,9 +503,9 @@ impl Sidebar {
                     );
                 } else {
                     let title_color = if is_term_focused {
-                        rgb(theme::PATCH)
+                        rgb(palette.PATCH)
                     } else {
-                        rgb(theme::BONE)
+                        rgb(palette.BONE)
                     };
                     let mut term_details = div()
                         .flex_1()
@@ -523,9 +530,9 @@ impl Sidebar {
                         let ws_diff = self.workspace.clone();
                         let tid_for_diff = tid.clone();
                         let branch_color = if is_term_focused {
-                            theme::PATCH
+                            palette.PATCH
                         } else {
-                            theme::FOG
+                            palette.FOG
                         };
                         let diff_button = div()
                             .id(ElementId::Name(format!("sidebar-diff-{}", tid).into()))
@@ -536,15 +543,15 @@ impl Sidebar {
                             .items_center()
                             .justify_center()
                             .border_1()
-                            .border_color(rgb(theme::BORDER_EMPHASIS))
+                            .border_color(rgb(palette.BORDER_EMPHASIS))
                             .rounded(px(3.0))
-                            .bg(rgba(theme::with_alpha(theme::ORCA_BLUE, 0x0C)))
+                            .bg(rgba(theme::with_alpha(palette.ORCA_BLUE, 0x0C)))
                             .text_size(px(10.0))
                             .font_family("JetBrains Mono")
-                            .text_color(rgb(theme::FOG))
+                            .text_color(rgb(palette.FOG))
                             .hover(|s| {
-                                s.bg(rgba(theme::with_alpha(theme::ORCA_BLUE, 0x1A)))
-                                    .text_color(rgb(theme::BONE))
+                                s.bg(rgba(theme::with_alpha(palette.ORCA_BLUE, 0x1A)))
+                                    .text_color(rgb(palette.BONE))
                             })
                             .child("Diff")
                             .on_click(move |_event, _window, cx| {
@@ -566,12 +573,12 @@ impl Sidebar {
                                     .px(px(6.0))
                                     .py(px(1.0))
                                     .border_1()
-                                    .border_color(rgb(theme::ORCA_BLUE))
+                                    .border_color(rgb(palette.ORCA_BLUE))
                                     .rounded(px(6.0))
-                                    .bg(rgba(theme::with_alpha(theme::ORCA_BLUE, 0x18)))
+                                    .bg(rgba(theme::with_alpha(palette.ORCA_BLUE, 0x18)))
                                     .text_size(px(10.0))
                                     .font_family("JetBrains Mono")
-                                    .text_color(rgb(theme::ORCA_BLUE))
+                                    .text_color(rgb(palette.ORCA_BLUE))
                                     .child("WT"),
                             );
                         }
@@ -602,17 +609,17 @@ impl Sidebar {
                                     .child(badge_cluster.flex_shrink_0())
                                     .child(
                                         div()
-                                            .text_color(rgb(theme::FOG))
+                                            .text_color(rgb(palette.FOG))
                                             .child(format!("{} files", snapshot.changed_files)),
                                     )
                                     .child(
                                         div()
-                                            .text_color(rgb(theme::STATUS_GREEN))
+                                            .text_color(rgb(palette.STATUS_GREEN))
                                             .child(format!("+{}", snapshot.insertions)),
                                     )
                                     .child(
                                         div()
-                                            .text_color(rgb(theme::STATUS_CORAL))
+                                            .text_color(rgb(palette.STATUS_CORAL))
                                             .child(format!("-{}", snapshot.deletions)),
                                     ),
                             );
@@ -745,8 +752,8 @@ impl Sidebar {
                                 cx.new(|_| SidebarDragView { label })
                             },
                         )
-                        .drag_over::<SidebarTerminalDragPayload>(|style, _, _, _| {
-                            style.border_t(px(2.0)).border_color(rgb(theme::ORCA_BLUE))
+                        .drag_over::<SidebarTerminalDragPayload>(move |style, _, _, _| {
+                            style.border_t(px(2.0)).border_color(rgb(palette.ORCA_BLUE))
                         })
                         .on_drop({
                             let target_tab = src_tab;
@@ -800,10 +807,11 @@ impl Sidebar {
         is_dragging: bool,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
+        let palette = theme::current();
         let thumb_color = if is_dragging {
-            theme::with_alpha(theme::ORCA_BLUE, 0x40)
+            theme::with_alpha(palette.ORCA_BLUE, 0x40)
         } else {
-            theme::with_alpha(theme::ORCA_BLUE, 0x25)
+            theme::with_alpha(palette.ORCA_BLUE, 0x25)
         };
 
         div()
@@ -877,7 +885,7 @@ impl Sidebar {
                     .h(px(thumb_height))
                     .rounded(px(3.0))
                     .bg(rgba(thumb_color))
-                    .hover(|s| s.bg(rgba(theme::with_alpha(theme::ORCA_BLUE, 0xA0)))),
+                    .hover(|s| s.bg(rgba(theme::with_alpha(palette.ORCA_BLUE, 0xA0)))),
             )
     }
 
@@ -903,6 +911,12 @@ impl Sidebar {
 
 impl Render for Sidebar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = theme::active(cx);
+        let selection = theme::active_selection(cx);
+        let (logo_asset, logo_opacity) = match selection.resolved_id {
+            ThemeId::Light | ThemeId::Sepia => ("images/OrcaShellLogoTrimmedBlack.png", 1.0),
+            ThemeId::Dark | ThemeId::Black => ("images/OrcaShellLogoTrimmed.png", 0.75),
+        };
         if !self.visible {
             return div().id("sidebar-root").w(px(0.0)).h_full().flex_shrink_0();
         }
@@ -1024,7 +1038,7 @@ impl Render for Sidebar {
                     .min_w_0()
                     .w(px(sidebar_width - 3.0))
                     .h_full()
-                    .bg(rgb(theme::DEEP))
+                    .bg(rgb(palette.DEEP))
                     .flex()
                     .flex_col()
                     // Header
@@ -1049,7 +1063,7 @@ impl Render for Sidebar {
                                     } else {
                                         px(13.0)
                                     })
-                                    .text_color(rgb(theme::FOG))
+                                    .text_color(rgb(palette.FOG))
                                     .child(if cfg!(target_os = "windows") {
                                         "\u{1F5C1}"
                                     } else {
@@ -1065,7 +1079,7 @@ impl Render for Sidebar {
                         div()
                             .w_full()
                             .h(px(1.0))
-                            .bg(rgb(theme::SURFACE))
+                            .bg(rgb(palette.SURFACE))
                             .flex_shrink_0(),
                     )
                     // Project list with scrollbar overlay
@@ -1100,10 +1114,10 @@ impl Render for Sidebar {
                             .pt(px(16.0))
                             .pb(px(20.0))
                             .child(
-                                img("images/OrcaShellLogoTrimmed.png")
+                                img(logo_asset)
                                     .w(px(160.0))
                                     .h(px(120.0))
-                                    .opacity(0.75),
+                                    .opacity(logo_opacity),
                             ),
                     ),
             )
@@ -1114,7 +1128,7 @@ impl Render for Sidebar {
                     .w(px(3.0))
                     .h_full()
                     .flex_shrink_0()
-                    .bg(rgb(theme::SURFACE))
+                    .bg(rgb(palette.SURFACE))
                     .cursor_col_resize()
                     .on_mouse_down(
                         MouseButton::Left,

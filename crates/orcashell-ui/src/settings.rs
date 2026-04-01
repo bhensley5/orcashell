@@ -1,7 +1,7 @@
 use std::ops::{Deref, DerefMut};
 
 use gpui::{App, Global};
-pub use orcashell_store::{AppSettings as AppSettingsInner, CursorStyle};
+pub use orcashell_store::{AppSettings as AppSettingsInner, CursorStyle, ThemeId, ThemeMode};
 
 /// Wrapper around `AppSettings` so we can implement `Global` in this crate.
 #[derive(Debug, Clone)]

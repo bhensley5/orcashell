@@ -14,7 +14,7 @@ use orcashell_terminal_view::{Copy, TextInputState};
 
 use crate::app_view::ContextMenuRequest;
 use crate::context_menu::ContextMenuItem;
-use crate::theme;
+use crate::theme::{self, OrcaTheme};
 use crate::workspace::{
     ActionBanner, ActionBannerKind, DiffTabState, ManagedWorktreeSummary, RemoveWorktreeConfirm,
     WorkspaceState,
@@ -432,10 +432,11 @@ impl DiffExplorerView {
         if let Some(ref input) = self.commit_input {
             return input.clone();
         }
-        let text_color: Hsla = rgb(theme::BONE).into();
-        let placeholder_color: Hsla = rgb(theme::SLATE).into();
-        let cursor_color: Hsla = rgb(theme::ORCA_BLUE).into();
-        let selection_bg: Hsla = rgba(theme::with_alpha(theme::ORCA_BLUE, 0x40)).into();
+        let palette = theme::active(cx);
+        let text_color: Hsla = rgb(palette.BONE).into();
+        let placeholder_color: Hsla = rgb(palette.SLATE).into();
+        let cursor_color: Hsla = rgb(palette.ORCA_BLUE).into();
+        let selection_bg: Hsla = rgba(theme::with_alpha(palette.ORCA_BLUE, 0x40)).into();
         let input = cx.new(|cx| {
             let mut state = TextInputState::new(
                 text_color,
@@ -456,6 +457,7 @@ impl DiffExplorerView {
     // ------------------------------------------------------------------
 
     fn render_header(&self, scope_root: &Path, snap: &DiffRenderSnapshot, cx: &App) -> Div {
+        let palette = theme::active(cx);
         let ws = self.workspace.read(cx);
         let live_snapshot = ws.git_scope_snapshot(scope_root);
         let branch_name = live_snapshot
@@ -479,31 +481,31 @@ impl DiffExplorerView {
                 div()
                     .text_size(px(11.0))
                     .font_family(DIFF_FONT_FAMILY)
-                    .text_color(rgb(theme::PATCH))
+                    .text_color(rgb(palette.PATCH))
                     .child(branch_name),
             )
             .child(
                 div()
                     .text_size(px(11.0))
                     .font_family(DIFF_FONT_FAMILY)
-                    .text_color(rgb(theme::FOG))
+                    .text_color(rgb(palette.FOG))
                     .child(scope_root.display().to_string()),
             );
 
         // Center badges.
         let mut badges = div().flex().items_center().gap(px(4.0));
         if is_loading {
-            badges = badges.child(Self::header_status_text("loading", theme::ORCA_BLUE));
+            badges = badges.child(Self::header_status_text("loading", palette.ORCA_BLUE));
         }
         if is_stale {
-            badges = badges.child(Self::header_status_text("stale", theme::STATUS_AMBER));
+            badges = badges.child(Self::header_status_text("stale", palette.STATUS_AMBER));
         }
         if let Some(generation) = latest_generation {
             badges = badges.child(
                 div()
                     .text_size(px(10.0))
                     .font_family(DIFF_FONT_FAMILY)
-                    .text_color(rgb(theme::FOG))
+                    .text_color(rgb(palette.FOG))
                     .child(format!("gen {generation}")),
             );
         }
@@ -533,7 +535,7 @@ impl DiffExplorerView {
                     div()
                         .text_size(px(10.0))
                         .font_family(DIFF_FONT_FAMILY)
-                        .text_color(rgb(theme::BONE))
+                        .text_color(rgb(palette.BONE))
                         .child(format!("Remove worktree {branch_label}?")),
                 )
                 .child(
@@ -547,8 +549,8 @@ impl DiffExplorerView {
                         .py(px(2.0))
                         .rounded(px(2.0))
                         .border_1()
-                        .border_color(rgb(theme::SURFACE))
-                        .hover(|s| s.bg(rgba(theme::with_alpha(theme::SURFACE, 0x40))))
+                        .border_color(rgb(palette.SURFACE))
+                        .hover(|s| s.bg(rgba(theme::with_alpha(palette.SURFACE, 0x40))))
                         .on_click(
                             move |_event: &ClickEvent, _window: &mut Window, cx: &mut App| {
                                 ws_toggle.update(cx, |ws, cx| {
@@ -560,7 +562,7 @@ impl DiffExplorerView {
                             div()
                                 .text_size(px(10.0))
                                 .font_family(DIFF_FONT_FAMILY)
-                                .text_color(rgb(theme::FOG))
+                                .text_color(rgb(palette.FOG))
                                 .child(if delete_branch {
                                     "\u{2611} Delete branch"
                                 } else {
@@ -586,12 +588,12 @@ impl DiffExplorerView {
                         .py(px(3.0))
                         .rounded(px(3.0))
                         .border_1()
-                        .border_color(rgb(theme::STATUS_CORAL))
+                        .border_color(rgb(palette.STATUS_CORAL))
                         .text_size(px(10.0))
                         .font_family(DIFF_FONT_FAMILY)
-                        .text_color(rgb(theme::STATUS_CORAL))
+                        .text_color(rgb(palette.STATUS_CORAL))
                         .cursor_pointer()
-                        .hover(|s| s.bg(rgba(theme::with_alpha(theme::STATUS_CORAL, 0x18))))
+                        .hover(|s| s.bg(rgba(theme::with_alpha(palette.STATUS_CORAL, 0x18))))
                         .child("Remove Worktree".to_string())
                         .on_click(
                             move |_event: &ClickEvent, _window: &mut Window, cx: &mut App| {
@@ -678,9 +680,9 @@ impl DiffExplorerView {
             .items_center()
             .justify_between()
             .gap(px(8.0))
-            .bg(rgb(theme::DEEP))
+            .bg(rgb(palette.DEEP))
             .border_b_1()
-            .border_color(rgb(theme::SURFACE))
+            .border_color(rgb(palette.SURFACE))
             .child(left)
             .child(
                 div()
@@ -707,6 +709,7 @@ impl DiffExplorerView {
     /// Render the always-visible action bar at the top of the tree pane.
     /// Height matches the diff pane's file header bar.
     fn render_action_bar(&self, scope_root: &Path, snap: &DiffRenderSnapshot, cx: &App) -> Div {
+        let palette = theme::active(cx);
         let any_in_flight = snap.any_action_in_flight();
 
         // Stage All. Enabled when unstaged files exist.
@@ -733,8 +736,8 @@ impl DiffExplorerView {
             .px(px(12.0))
             .py(px(7.5))
             .border_b_1()
-            .border_color(rgb(theme::SURFACE))
-            .bg(rgb(theme::DEEP))
+            .border_color(rgb(palette.SURFACE))
+            .bg(rgb(palette.DEEP))
             .flex()
             .flex_row()
             .items_center()
@@ -788,6 +791,7 @@ impl DiffExplorerView {
         disabled: bool,
         on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     ) -> Stateful<Div> {
+        let palette = theme::current();
         let mut btn = div()
             .id(ElementId::Name(id.to_string().into()))
             .px(px(8.0))
@@ -802,20 +806,20 @@ impl DiffExplorerView {
 
         if disabled {
             btn = btn
-                .bg(rgb(theme::CURRENT))
-                .border_color(rgb(theme::BORDER_DEFAULT))
-                .text_color(rgb(theme::SLATE))
+                .bg(rgb(palette.CURRENT))
+                .border_color(rgb(palette.BORDER_DEFAULT))
+                .text_color(rgb(palette.SLATE))
                 .cursor(CursorStyle::Arrow)
                 .opacity(0.5);
         } else {
             btn = btn
-                .bg(rgba(theme::with_alpha(theme::ORCA_BLUE, 0x0C)))
-                .border_color(rgb(theme::BORDER_EMPHASIS))
-                .text_color(rgb(theme::FOG))
+                .bg(rgba(theme::with_alpha(palette.ORCA_BLUE, 0x0C)))
+                .border_color(rgb(palette.BORDER_EMPHASIS))
+                .text_color(rgb(palette.FOG))
                 .cursor_pointer()
                 .hover(|s| {
-                    s.bg(rgba(theme::with_alpha(theme::ORCA_BLUE, 0x1A)))
-                        .text_color(rgb(theme::BONE))
+                    s.bg(rgba(theme::with_alpha(palette.ORCA_BLUE, 0x1A)))
+                        .text_color(rgb(palette.BONE))
                 })
                 .on_click(on_click);
         }
@@ -828,22 +832,23 @@ impl DiffExplorerView {
     // ------------------------------------------------------------------
 
     fn render_action_banner(&self, snap: &DiffRenderSnapshot) -> Option<Div> {
+        let palette = theme::current();
         let banner = snap.last_action_banner.as_ref()?;
         let (bg_color, border_color, text_color) = match banner.kind {
             ActionBannerKind::Success => (
-                theme::with_alpha(theme::STATUS_GREEN, 0x12),
-                theme::with_alpha(theme::STATUS_GREEN, 0x30),
-                theme::STATUS_GREEN,
+                theme::with_alpha(palette.STATUS_GREEN, 0x12),
+                theme::with_alpha(palette.STATUS_GREEN, 0x30),
+                palette.STATUS_GREEN,
             ),
             ActionBannerKind::Warning => (
-                theme::with_alpha(theme::STATUS_AMBER, 0x12),
-                theme::with_alpha(theme::STATUS_AMBER, 0x30),
-                theme::STATUS_AMBER,
+                theme::with_alpha(palette.STATUS_AMBER, 0x12),
+                theme::with_alpha(palette.STATUS_AMBER, 0x30),
+                palette.STATUS_AMBER,
             ),
             ActionBannerKind::Error => (
-                theme::with_alpha(theme::STATUS_CORAL, 0x12),
-                theme::with_alpha(theme::STATUS_CORAL, 0x30),
-                theme::STATUS_CORAL,
+                theme::with_alpha(palette.STATUS_CORAL, 0x12),
+                theme::with_alpha(palette.STATUS_CORAL, 0x30),
+                palette.STATUS_CORAL,
             ),
         };
 
@@ -876,8 +881,8 @@ impl DiffExplorerView {
                         .cursor_pointer()
                         .text_size(px(11.0))
                         .font_family(DIFF_FONT_FAMILY)
-                        .text_color(rgb(theme::FOG))
-                        .hover(|s| s.text_color(rgb(theme::PATCH)))
+                        .text_color(rgb(palette.FOG))
+                        .hover(|s| s.text_color(rgb(palette.PATCH)))
                         .child("\u{2715}")
                         .on_click(move |_event, _window, cx| {
                             ws_dismiss.update(cx, |ws, cx| {
@@ -897,6 +902,7 @@ impl DiffExplorerView {
         snap: &DiffRenderSnapshot,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
+        let palette = theme::active(cx);
         let pane = div()
             .id(ElementId::Name(
                 format!("diff-tree-{}", self.scope_root.display()).into(),
@@ -904,9 +910,9 @@ impl DiffExplorerView {
             .w(px(snap.tree_width))
             .h_full()
             .flex_shrink_0()
-            .bg(rgb(theme::DEEP))
+            .bg(rgb(palette.DEEP))
             .border_r_1()
-            .border_color(rgb(theme::SURFACE))
+            .border_color(rgb(palette.SURFACE))
             .overflow_y_scroll();
 
         if snap.index_loading && !snap.has_index {
@@ -986,17 +992,17 @@ impl DiffExplorerView {
                     .flex()
                     .flex_row()
                     .gap(px(6.0))
-                    .bg(rgb(theme::DEEP))
+                    .bg(rgb(palette.DEEP))
                     .border_b_1()
-                    .border_color(rgb(theme::SURFACE))
+                    .border_color(rgb(palette.SURFACE))
                     .child(
                         div()
                             .id("diff-commit-input-wrapper")
                             .flex_1()
                             .h(px(24.0))
-                            .bg(rgb(theme::CURRENT))
+                            .bg(rgb(palette.CURRENT))
                             .border_1()
-                            .border_color(rgb(theme::SURFACE))
+                            .border_color(rgb(palette.SURFACE))
                             .rounded(px(2.0))
                             .px(px(4.0))
                             .flex()
@@ -1089,10 +1095,10 @@ impl DiffExplorerView {
                     .px(px(8.0))
                     .py(px(6.0))
                     .border_1()
-                    .border_color(rgb(theme::STATUS_AMBER))
-                    .bg(rgba(theme::with_alpha(theme::STATUS_AMBER, 0x12)))
+                    .border_color(rgb(palette.STATUS_AMBER))
+                    .bg(rgba(theme::with_alpha(palette.STATUS_AMBER, 0x12)))
                     .text_size(px(11.0))
-                    .text_color(rgb(theme::STATUS_AMBER))
+                    .text_color(rgb(palette.STATUS_AMBER))
                     .child(error.clone()),
             );
         }
@@ -1102,13 +1108,14 @@ impl DiffExplorerView {
 
     /// Render a section header row (e.g. "STAGED CHANGES (3)").
     fn section_header(label: &str, count: usize) -> Div {
+        let palette = theme::current();
         div()
             .w_full()
             .px(px(8.0))
             .py(px(4.0))
-            .bg(rgb(theme::CURRENT))
+            .bg(rgb(palette.CURRENT))
             .border_b_1()
-            .border_color(rgb(theme::SURFACE))
+            .border_color(rgb(palette.SURFACE))
             .flex()
             .items_center()
             .gap(px(6.0))
@@ -1116,7 +1123,7 @@ impl DiffExplorerView {
                 div()
                     .text_size(px(10.0))
                     .font_family(DIFF_FONT_FAMILY)
-                    .text_color(rgb(theme::FOG))
+                    .text_color(rgb(palette.FOG))
                     .child(format!("{label} ({count})")),
             )
     }
@@ -1130,6 +1137,7 @@ impl DiffExplorerView {
         visible_order: &Rc<Vec<DiffSelectionKey>>,
         scope_hash: u64,
     ) -> Vec<AnyElement> {
+        let palette = theme::current();
         let mut rows = Vec::new();
         for node in nodes {
             match &node.kind {
@@ -1142,7 +1150,7 @@ impl DiffExplorerView {
                             .pl(px(8.0 + depth as f32 * 14.0))
                             .text_size(px(11.0))
                             .font_family(DIFF_FONT_FAMILY)
-                            .text_color(rgb(theme::FOG))
+                            .text_color(rgb(palette.FOG))
                             .child(format!("\u{25BE} {}", node.name))
                             .into_any_element(),
                     );
@@ -1195,16 +1203,16 @@ impl DiffExplorerView {
                         .cursor_pointer()
                         .border_l_2()
                         .when(is_primary, |row| {
-                            row.bg(rgba(theme::with_alpha(theme::ORCA_BLUE, 0x1A)))
-                                .border_color(rgba(theme::with_alpha(theme::ORCA_BLUE, 0x66)))
+                            row.bg(rgba(theme::with_alpha(palette.ORCA_BLUE, 0x1A)))
+                                .border_color(rgba(theme::with_alpha(palette.ORCA_BLUE, 0x66)))
                         })
                         .when(!is_primary && is_multi, |row| {
-                            row.bg(rgba(theme::with_alpha(theme::ORCA_BLUE, 0x12)))
-                                .border_color(rgba(theme::with_alpha(theme::ORCA_BLUE, 0x60)))
+                            row.bg(rgba(theme::with_alpha(palette.ORCA_BLUE, 0x12)))
+                                .border_color(rgba(theme::with_alpha(palette.ORCA_BLUE, 0x60)))
                         })
                         .when(!is_primary && !is_multi, |row| {
                             row.border_color(rgba(0x00000000))
-                                .hover(|row| row.bg(rgba(theme::with_alpha(theme::CURRENT, 0x88))))
+                                .hover(|row| row.bg(rgba(theme::with_alpha(palette.CURRENT, 0x88))))
                         })
                         .child(Self::status_pill(file.status))
                         .child(
@@ -1216,9 +1224,9 @@ impl DiffExplorerView {
                                 .text_size(px(11.0))
                                 .font_family(DIFF_FONT_FAMILY)
                                 .text_color(rgb(if is_primary {
-                                    theme::PATCH
+                                    palette.PATCH
                                 } else {
-                                    theme::BONE
+                                    palette.BONE
                                 }))
                                 .child(node.name.clone()),
                         )
@@ -1231,12 +1239,12 @@ impl DiffExplorerView {
                                 .font_family(DIFF_FONT_FAMILY)
                                 .child(
                                     div()
-                                        .text_color(rgb(theme::STATUS_GREEN))
+                                        .text_color(rgb(palette.STATUS_GREEN))
                                         .child(format!("+{}", file.insertions)),
                                 )
                                 .child(
                                     div()
-                                        .text_color(rgb(theme::STATUS_CORAL))
+                                        .text_color(rgb(palette.STATUS_CORAL))
                                         .child(format!("-{}", file.deletions)),
                                 ),
                         )
@@ -1323,7 +1331,7 @@ impl DiffExplorerView {
                             div()
                                 .text_size(px(10.0))
                                 .font_family(DIFF_FONT_FAMILY)
-                                .text_color(rgb(theme::SEAFOAM))
+                                .text_color(rgb(palette.SEAFOAM))
                                 .child("bin"),
                         );
                     }
@@ -1340,6 +1348,7 @@ impl DiffExplorerView {
     // ------------------------------------------------------------------
 
     fn render_diff_pane(&self, snap: &DiffRenderSnapshot, cx: &mut Context<Self>) -> Stateful<Div> {
+        let palette = theme::active(cx);
         let pane_id = ElementId::Name(format!("diff-body-{}", self.scope_root.display()).into());
 
         // A bare pane used for empty/loading/error states (no uniform_list).
@@ -1349,7 +1358,7 @@ impl DiffExplorerView {
                 .flex_1()
                 .min_w_0()
                 .min_h_0()
-                .bg(rgb(theme::ABYSS))
+                .bg(rgb(palette.ABYSS))
         };
 
         // ---- Early-return states ----
@@ -1431,7 +1440,7 @@ impl DiffExplorerView {
                         div()
                             .text_size(px(13.0))
                             .font_family(DIFF_FONT_FAMILY)
-                            .text_color(rgb(theme::PATCH))
+                            .text_color(rgb(palette.PATCH))
                             .child(file_meta.relative_path.display().to_string()),
                     )
                     .child(Self::status_summary(file_meta))
@@ -1455,6 +1464,7 @@ impl DiffExplorerView {
         let line_count = lines.len();
         let selection = self.selection;
         let scroll_x = self.diff_scroll_x;
+        let line_palette = palette.clone();
 
         // Fixed file header bar above the line list.
         let mut file_header = div()
@@ -1463,8 +1473,8 @@ impl DiffExplorerView {
             .px(px(12.0))
             .py(px(10.0))
             .border_b_1()
-            .border_color(rgb(theme::SURFACE))
-            .bg(rgb(theme::DEEP))
+            .border_color(rgb(palette.SURFACE))
+            .bg(rgb(palette.DEEP))
             .flex()
             .items_center()
             .justify_between()
@@ -1473,7 +1483,7 @@ impl DiffExplorerView {
                 div()
                     .text_size(px(12.0))
                     .font_family(DIFF_FONT_FAMILY)
-                    .text_color(rgb(theme::PATCH))
+                    .text_color(rgb(palette.PATCH))
                     .child(file_meta.relative_path.display().to_string()),
             )
             .child(Self::status_summary(file_meta));
@@ -1484,11 +1494,11 @@ impl DiffExplorerView {
                     .w_full()
                     .px(px(12.0))
                     .py(px(6.0))
-                    .bg(rgba(theme::with_alpha(theme::STATUS_AMBER, 0x10)))
+                    .bg(rgba(theme::with_alpha(palette.STATUS_AMBER, 0x10)))
                     .border_b_1()
-                    .border_color(rgb(theme::SURFACE))
+                    .border_color(rgb(palette.SURFACE))
                     .text_size(px(11.0))
-                    .text_color(rgb(theme::STATUS_AMBER))
+                    .text_color(rgb(palette.STATUS_AMBER))
                     .child(error.clone()),
             );
         }
@@ -1496,11 +1506,19 @@ impl DiffExplorerView {
         // The virtualized line list.
         let diff_list = uniform_list("diff-lines", line_count, move |range, _window, _cx| {
             range
-                .map(|ix| render_diff_line_element(&lines[ix], ix, selection.as_ref(), scroll_x))
+                .map(|ix| {
+                    render_diff_line_element(
+                        &line_palette,
+                        &lines[ix],
+                        ix,
+                        selection.as_ref(),
+                        scroll_x,
+                    )
+                })
                 .collect()
         })
         .size_full()
-        .bg(rgb(theme::ABYSS))
+        .bg(rgb(palette.ABYSS))
         .track_scroll(self.diff_scroll_handle.clone())
         .map(|mut list| {
             list.style().restrict_scroll_to_axis = Some(true);
@@ -1573,7 +1591,7 @@ impl DiffExplorerView {
             .flex_1()
             .min_w_0()
             .min_h_0()
-            .bg(rgb(theme::ABYSS))
+            .bg(rgb(palette.ABYSS))
             .flex()
             .flex_col()
             .on_action(cx.listener(|this, _: &Copy, _window, cx| {
@@ -1631,10 +1649,11 @@ impl DiffExplorerView {
         is_dragging: bool,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
+        let palette = theme::current();
         let thumb_color = if is_dragging {
-            theme::with_alpha(theme::ORCA_BLUE, 0x60)
+            theme::with_alpha(palette.ORCA_BLUE, 0x60)
         } else {
-            theme::with_alpha(theme::ORCA_BLUE, 0x4D)
+            theme::with_alpha(palette.ORCA_BLUE, 0x4D)
         };
 
         div()
@@ -1718,7 +1737,7 @@ impl DiffExplorerView {
                     .h(px(thumb_height))
                     .rounded(px(3.0))
                     .bg(rgba(thumb_color))
-                    .hover(|s| s.bg(rgba(theme::with_alpha(theme::ORCA_BLUE, 0xA0)))),
+                    .hover(|s| s.bg(rgba(theme::with_alpha(palette.ORCA_BLUE, 0xA0)))),
             )
     }
 
@@ -1852,6 +1871,7 @@ impl DiffExplorerView {
     // ------------------------------------------------------------------
 
     fn status_summary(file: &ChangedFile) -> Div {
+        let palette = theme::current();
         div()
             .flex()
             .items_center()
@@ -1861,14 +1881,14 @@ impl DiffExplorerView {
                 div()
                     .text_size(px(11.0))
                     .font_family(DIFF_FONT_FAMILY)
-                    .text_color(rgb(theme::STATUS_GREEN))
+                    .text_color(rgb(palette.STATUS_GREEN))
                     .child(format!("+{}", file.insertions)),
             )
             .child(
                 div()
                     .text_size(px(11.0))
                     .font_family(DIFF_FONT_FAMILY)
-                    .text_color(rgb(theme::STATUS_CORAL))
+                    .text_color(rgb(palette.STATUS_CORAL))
                     .child(format!("-{}", file.deletions)),
             )
             .when(file.is_binary, |summary| {
@@ -1876,21 +1896,22 @@ impl DiffExplorerView {
                     div()
                         .text_size(px(10.0))
                         .font_family(DIFF_FONT_FAMILY)
-                        .text_color(rgb(theme::SEAFOAM))
+                        .text_color(rgb(palette.SEAFOAM))
                         .child("binary"),
                 )
             })
     }
 
     fn status_pill(status: GitFileStatus) -> Div {
+        let palette = theme::current();
         let (label, border, text) = match status {
-            GitFileStatus::Added => ("A", theme::STATUS_GREEN, theme::STATUS_GREEN),
-            GitFileStatus::Modified => ("M", theme::ORCA_BLUE, theme::ORCA_BLUE),
-            GitFileStatus::Deleted => ("D", theme::STATUS_CORAL, theme::STATUS_CORAL),
-            GitFileStatus::Renamed => ("R", theme::SEAFOAM, theme::SEAFOAM),
-            GitFileStatus::Typechange => ("T", theme::FOG, theme::FOG),
-            GitFileStatus::Untracked => ("?", theme::STATUS_AMBER, theme::STATUS_AMBER),
-            GitFileStatus::Conflicted => ("U", theme::STATUS_AMBER, theme::STATUS_AMBER),
+            GitFileStatus::Added => ("A", palette.STATUS_GREEN, palette.STATUS_GREEN),
+            GitFileStatus::Modified => ("M", palette.ORCA_BLUE, palette.ORCA_BLUE),
+            GitFileStatus::Deleted => ("D", palette.STATUS_CORAL, palette.STATUS_CORAL),
+            GitFileStatus::Renamed => ("R", palette.SEAFOAM, palette.SEAFOAM),
+            GitFileStatus::Typechange => ("T", palette.FOG, palette.FOG),
+            GitFileStatus::Untracked => ("?", palette.STATUS_AMBER, palette.STATUS_AMBER),
+            GitFileStatus::Conflicted => ("U", palette.STATUS_AMBER, palette.STATUS_AMBER),
         };
 
         div()
@@ -1910,6 +1931,7 @@ impl DiffExplorerView {
     }
 
     fn empty_panel_message(title: &str, body: Option<&str>) -> Div {
+        let palette = theme::current();
         let mut panel = div()
             .size_full()
             .p(px(16.0))
@@ -1921,14 +1943,14 @@ impl DiffExplorerView {
                 div()
                     .text_size(px(13.0))
                     .font_family(DIFF_FONT_FAMILY)
-                    .text_color(rgb(theme::PATCH))
+                    .text_color(rgb(palette.PATCH))
                     .child(title.to_string()),
             );
         if let Some(body) = body {
             panel = panel.child(
                 div()
                     .text_size(px(11.0))
-                    .text_color(rgb(theme::FOG))
+                    .text_color(rgb(palette.FOG))
                     .child(body.to_string()),
             );
         }
@@ -1942,6 +1964,7 @@ impl DiffExplorerView {
 
 impl Render for DiffExplorerView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = theme::active(cx);
         self.measure_char_width(window);
 
         // Extract a lightweight snapshot (no document clone).
@@ -1949,7 +1972,7 @@ impl Render for DiffExplorerView {
             return div()
                 .id("diff-explorer-missing")
                 .size_full()
-                .bg(rgb(theme::ABYSS))
+                .bg(rgb(palette.ABYSS))
                 .child(Self::empty_panel_message(
                     "Diff tab closed",
                     Some("Re-open the diff explorer from a git-backed terminal row."),
@@ -1973,7 +1996,7 @@ impl Render for DiffExplorerView {
                 format!("diff-explorer-{}", scope_root.display()).into(),
             ))
             .size_full()
-            .bg(rgb(theme::ABYSS))
+            .bg(rgb(palette.ABYSS))
             .flex()
             .flex_col()
             .track_focus(&self.focus_handle)
@@ -2064,7 +2087,7 @@ impl Render for DiffExplorerView {
                     div()
                         .w(px(4.0))
                         .h_full()
-                        .bg(rgb(theme::CURRENT))
+                        .bg(rgb(palette.CURRENT))
                         .cursor_col_resize()
                         .on_mouse_down(
                             MouseButton::Left,
@@ -2097,12 +2120,13 @@ impl Render for DiffExplorerView {
 /// This is a free function (not a method) so it can be captured by the
 /// `uniform_list` closure without borrowing `self`.
 fn render_diff_line_element(
+    palette: &OrcaTheme,
     line: &DiffLineView,
     line_index: usize,
     selection: Option<&DiffSelection>,
     scroll_x: f32,
 ) -> AnyElement {
-    let (background, text_color, gutter) = diff_line_colors(line.kind);
+    let (background, text_color, gutter) = diff_line_colors(palette, line.kind);
 
     let mut row = div()
         .w_full()
@@ -2140,11 +2164,12 @@ fn render_diff_line_element(
                     .whitespace_nowrap()
                     .when(scroll_x > 0.0, |d| d.ml(px(-scroll_x)))
                     .child(render_highlighted_text(
+                        palette,
                         &line.text,
                         line.highlights.as_deref(),
                         selection_range_for_line(selection, line_index, line),
                         line.inline_changes.as_deref(),
-                        inline_change_bg(line.kind),
+                        inline_change_bg(palette, line.kind),
                     )),
             ),
         );
@@ -2153,42 +2178,42 @@ fn render_diff_line_element(
 }
 
 /// Return (background, text_color, gutter_color) for a given diff-line kind.
-fn diff_line_colors(kind: DiffLineKind) -> (Option<u32>, u32, u32) {
+fn diff_line_colors(palette: &OrcaTheme, kind: DiffLineKind) -> (Option<u32>, u32, u32) {
     match kind {
         DiffLineKind::Addition => (
-            Some(theme::with_alpha(theme::STATUS_GREEN, 0x1F)),
-            theme::BONE,
-            theme::FOG,
+            Some(theme::with_alpha(palette.STATUS_GREEN, 0x1F)),
+            palette.BONE,
+            palette.FOG,
         ),
         DiffLineKind::Deletion => (
-            Some(theme::with_alpha(theme::STATUS_CORAL, 0x1F)),
-            theme::BONE,
-            theme::FOG,
+            Some(theme::with_alpha(palette.STATUS_CORAL, 0x1F)),
+            palette.BONE,
+            palette.FOG,
         ),
         DiffLineKind::HunkHeader => (
-            Some(theme::with_alpha(theme::ORCA_BLUE, 0x10)),
-            theme::SLATE,
-            theme::SLATE,
+            Some(theme::with_alpha(palette.ORCA_BLUE, 0x10)),
+            palette.SLATE,
+            palette.SLATE,
         ),
         DiffLineKind::FileHeader => (
-            Some(theme::with_alpha(theme::CURRENT, 0xE0)),
-            theme::PATCH,
-            theme::SLATE,
+            Some(theme::with_alpha(palette.CURRENT, 0xE0)),
+            palette.PATCH,
+            palette.SLATE,
         ),
         DiffLineKind::BinaryNotice => (
-            Some(theme::with_alpha(theme::SEAFOAM, 0x10)),
-            theme::SEAFOAM,
-            theme::FOG,
+            Some(theme::with_alpha(palette.SEAFOAM, 0x10)),
+            palette.SEAFOAM,
+            palette.FOG,
         ),
-        DiffLineKind::Context => (None, theme::BONE, theme::FOG),
+        DiffLineKind::Context => (None, palette.BONE, palette.FOG),
     }
 }
 
 /// Return the inline change background color for a given line kind, if applicable.
-fn inline_change_bg(kind: DiffLineKind) -> Option<Hsla> {
+fn inline_change_bg(palette: &OrcaTheme, kind: DiffLineKind) -> Option<Hsla> {
     match kind {
-        DiffLineKind::Addition => Some(rgba(theme::with_alpha(theme::STATUS_GREEN, 0x2E)).into()),
-        DiffLineKind::Deletion => Some(rgba(theme::with_alpha(theme::STATUS_CORAL, 0x2E)).into()),
+        DiffLineKind::Addition => Some(rgba(theme::with_alpha(palette.STATUS_GREEN, 0x2E)).into()),
+        DiffLineKind::Deletion => Some(rgba(theme::with_alpha(palette.STATUS_CORAL, 0x2E)).into()),
         _ => None,
     }
 }
@@ -2416,13 +2441,14 @@ fn in_any_range(pos: usize, ranges: &[Range<usize>]) -> bool {
 /// composite style (foreground from syntax + background from selection) and
 /// no two ranges overlap.
 fn render_highlighted_text(
+    palette: &OrcaTheme,
     text: &str,
     highlights: Option<&[HighlightedSpan]>,
     selection_range: Option<Range<usize>>,
     inline_changes: Option<&[Range<usize>]>,
     inline_bg: Option<Hsla>,
 ) -> AnyElement {
-    let sel_bg: Hsla = rgba(theme::with_alpha(theme::ORCA_BLUE, 0x40)).into();
+    let sel_bg: Hsla = rgba(theme::with_alpha(palette.ORCA_BLUE, 0x40)).into();
 
     // Map inline change ranges from raw text bytes to display text bytes.
     let display_inline: Vec<Range<usize>> = match (inline_changes, inline_bg) {

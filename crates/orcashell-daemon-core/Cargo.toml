@@ -7,6 +7,7 @@ edition.workspace = true
 orcashell-ipc = { path = "../orcashell-ipc" }
 orcashell-protocol = { path = "../orcashell-protocol" }
 orcashell-git = { path = "../orcashell-git" }
+orcashell-store = { path = "../orcashell-store" }
 anyhow.workspace = true
 tracing.workspace = true
 serde_json.workspace = true

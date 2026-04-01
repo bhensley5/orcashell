@@ -21,6 +21,7 @@ use uuid::Uuid;
 
 use crate::settings::AppSettings;
 use crate::theme;
+use crate::theme::OrcaTheme;
 use focus::{FocusManager, FocusTarget};
 use layout::{LayoutNode, SplitDirection};
 use orcashell_session::event::TerminalColors;
@@ -245,18 +246,19 @@ impl WorkspaceState {
         cx: &mut Context<Self>,
     ) -> bool {
         let settings = cx.global::<AppSettings>();
+        let palette = theme::active(cx);
         let scrollback = settings.scrollback_lines as usize;
         let shell_override = settings.default_shell.as_deref();
-        let config = Self::build_terminal_config(settings);
+        let config = Self::build_terminal_config(settings, &palette);
         // Resolve once to avoid duplicate work (Windows probe-spawns are expensive).
         let resolved_shell =
             orcashell_session::shell_integration::resolve_shell_path(shell_override);
         let shell_label = Self::extract_shell_label(&resolved_shell);
 
         let colors = TerminalColors::new(
-            theme::rgb_channels(theme::BONE),
-            theme::rgb_channels(theme::ABYSS),
-            theme::rgb_channels(theme::ORCA_BLUE),
+            theme::rgb_channels(palette.TERMINAL_FOREGROUND),
+            theme::rgb_channels(palette.TERMINAL_BACKGROUND),
+            theme::rgb_channels(palette.TERMINAL_CURSOR),
         );
         match SessionEngine::new_with_shell(80, 24, scrollback, cwd, colors, Some(&resolved_shell))
         {
@@ -1602,17 +1604,53 @@ impl WorkspaceState {
     }
 
     /// Build terminal configuration from settings + theme tokens.
-    pub fn build_terminal_config(settings: &AppSettings) -> TerminalConfig {
-        let (ar, ag, ab) = theme::rgb_channels(theme::ABYSS);
-        let (fr, fg, fb) = theme::rgb_channels(theme::BONE);
-        let (cr, cg, cb) = theme::rgb_channels(theme::ORCA_BLUE);
-        let (tr, tg, tb) = theme::rgb_channels(theme::FOG);
+    pub fn build_terminal_config(settings: &AppSettings, theme: &OrcaTheme) -> TerminalConfig {
+        let (bg_r, bg_g, bg_b) = theme::rgb_channels(theme.TERMINAL_BACKGROUND);
+        let (fg_r, fg_g, fg_b) = theme::rgb_channels(theme.TERMINAL_FOREGROUND);
+        let (cursor_r, cursor_g, cursor_b) = theme::rgb_channels(theme.TERMINAL_CURSOR);
+        let (terminated_r, terminated_g, terminated_b) = theme::rgb_channels(theme.FOG);
 
-        let palette = ColorPalette::builder()
-            .background(ar, ag, ab)
-            .foreground(fr, fg, fb)
-            .cursor(cr, cg, cb)
+        let mut palette = ColorPalette::builder()
+            .background(bg_r, bg_g, bg_b)
+            .foreground(fg_r, fg_g, fg_b)
+            .cursor(cursor_r, cursor_g, cursor_b)
+            .black_channels(theme.ANSI[0])
+            .red_channels(theme.ANSI[1])
+            .green_channels(theme.ANSI[2])
+            .yellow_channels(theme.ANSI[3])
+            .blue_channels(theme.ANSI[4])
+            .magenta_channels(theme.ANSI[5])
+            .cyan_channels(theme.ANSI[6])
+            .white_channels(theme.ANSI[7])
+            .bright_black_channels(theme.ANSI[8])
+            .bright_red_channels(theme.ANSI[9])
+            .bright_green_channels(theme.ANSI[10])
+            .bright_yellow_channels(theme.ANSI[11])
+            .bright_blue_channels(theme.ANSI[12])
+            .bright_magenta_channels(theme.ANSI[13])
+            .bright_cyan_channels(theme.ANSI[14])
+            .bright_white_channels(theme.ANSI[15])
             .build();
+        palette.search_match_active = rgba(theme::with_alpha(theme.ORCA_BLUE, 0x66)).into();
+        palette.search_match_other = rgba(theme::with_alpha(theme.ORCA_BLUE, 0x2E)).into();
+        palette.scrollbar = rgba(theme::with_alpha(theme.ORCA_BLUE, 0x4D)).into();
+        palette.search_bar_bg = rgb(theme.SURFACE).into();
+        palette.search_bar_border = rgba(theme::with_alpha(theme.ORCA_BLUE, 0x40)).into();
+        palette.search_bar_text = rgb(theme.FOG).into();
+        palette.search_input_bg = rgb(theme.ABYSS).into();
+        palette.search_input_text = rgb(theme.BONE).into();
+        palette.search_input_placeholder = rgba(theme::with_alpha(theme.SLATE, 0x80)).into();
+        palette.search_input_cursor = rgb(theme.ORCA_BLUE).into();
+        palette.search_input_selection =
+            rgba(theme::with_alpha(theme.TERMINAL_SELECTION, 0x40)).into();
+        let hover_base = if theme.TERMINAL_BACKGROUND == theme.DEEP {
+            theme.PATCH
+        } else {
+            theme.SLATE
+        };
+        palette.hover_overlay = rgba(theme::with_alpha(hover_base, 0x10)).into();
+        palette.close_hover_overlay = rgba(theme::with_alpha(theme.STATUS_CORAL, 0x40)).into();
+        palette.link = rgb(theme.ORCA_BLUE).into();
 
         let cursor_shape = match settings.cursor_style {
             orcashell_store::CursorStyle::Block => CursorShape::Block,
@@ -1627,14 +1665,33 @@ impl WorkspaceState {
             padding: Edges::all(px(4.0)),
             colors: palette,
             terminated_text_color: Rgba {
-                r: tr as f32 / 255.0,
-                g: tg as f32 / 255.0,
-                b: tb as f32 / 255.0,
+                r: terminated_r as f32 / 255.0,
+                g: terminated_g as f32 / 255.0,
+                b: terminated_b as f32 / 255.0,
                 a: 1.0,
             }
             .into(),
             cursor_shape,
             cursor_blink: settings.cursor_blink,
+        }
+    }
+
+    pub fn refresh_diff_theme(&mut self, _cx: &mut Context<Self>) {
+        let active_theme = theme::active_selection(_cx).resolved_id;
+        self.services.git.set_diff_theme(active_theme);
+
+        let scopes: Vec<PathBuf> = self.diff_tabs.keys().cloned().collect();
+        for scope_root in scopes {
+            let selected = self
+                .diff_tabs
+                .get(&scope_root)
+                .and_then(|tab| tab.selected_file.clone());
+            if let Some(diff_tab) = self.diff_tabs.get_mut(&scope_root) {
+                diff_tab.file.document = None;
+            }
+            if let Some(selection) = selected {
+                self.request_selected_file_diff(&scope_root, selection);
+            }
         }
     }
 
@@ -2674,11 +2731,12 @@ impl WorkspaceState {
         cx: &mut Context<Self>,
     ) {
         let current_name = self.terminal_display_name(&project_id, &terminal_id);
+        let palette = theme::active(cx);
 
         let input = cx.new(|cx| {
-            let (tr, tg, tb) = theme::rgb_channels(theme::BONE);
-            let (pr, pg, pb) = theme::rgb_channels(theme::FOG);
-            let (cr, cg, cb) = theme::rgb_channels(theme::ORCA_BLUE);
+            let (tr, tg, tb) = theme::rgb_channels(palette.BONE);
+            let (pr, pg, pb) = theme::rgb_channels(palette.FOG);
+            let (cr, cg, cb) = theme::rgb_channels(palette.ORCA_BLUE);
             let text_color = Hsla::from(Rgba {
                 r: tr as f32 / 255.0,
                 g: tg as f32 / 255.0,
@@ -3082,7 +3140,8 @@ impl WorkspaceState {
                 let resolved_shell =
                     orcashell_session::shell_integration::resolve_shell_path(shell_override);
                 let shell_label = Self::extract_shell_label(&resolved_shell);
-                let mut config = Self::build_terminal_config(settings);
+                let palette = theme::active(cx);
+                let mut config = Self::build_terminal_config(settings, &palette);
 
                 // Apply per-terminal zoom offset
                 if let Some(offset) = zoom_level {
@@ -3090,9 +3149,9 @@ impl WorkspaceState {
                 }
 
                 let colors = TerminalColors::new(
-                    theme::rgb_channels(theme::BONE),
-                    theme::rgb_channels(theme::ABYSS),
-                    theme::rgb_channels(theme::ORCA_BLUE),
+                    theme::rgb_channels(palette.TERMINAL_FOREGROUND),
+                    theme::rgb_channels(palette.TERMINAL_BACKGROUND),
+                    theme::rgb_channels(palette.TERMINAL_CURSOR),
                 );
                 match SessionEngine::new_with_shell(
                     80,

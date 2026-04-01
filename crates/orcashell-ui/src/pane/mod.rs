@@ -170,12 +170,13 @@ impl LayoutContainer {
     }
 
     fn render_placeholder(&self) -> Div {
+        let palette = theme::current();
         div()
             .size_full()
             .flex()
             .items_center()
             .justify_center()
-            .text_color(rgb(theme::FOG))
+            .text_color(rgb(palette.FOG))
             .text_size(px(13.0))
             .child("Starting terminal...")
     }
@@ -269,6 +270,7 @@ impl LayoutContainer {
         project_id: &str,
         sizes: &[f32],
     ) -> impl IntoElement {
+        let palette = theme::current();
         let active_drag = self.active_drag.clone();
         let split_path = self.layout_path.clone();
         let pid = project_id.to_string();
@@ -296,7 +298,7 @@ impl LayoutContainer {
                 div()
                     .when(is_horizontal, |d| d.w_full().h(px(1.0)))
                     .when(!is_horizontal, |d| d.h_full().w(px(1.0)))
-                    .bg(rgb(theme::SURFACE)),
+                    .bg(rgb(palette.SURFACE)),
             )
             .on_mouse_down(MouseButton::Left, {
                 move |event: &MouseDownEvent, _window, _cx| {
@@ -391,11 +393,11 @@ impl Render for LayoutContainer {
                 .render_tabs(children, active_tab, &project_id, cx)
                 .into_any_element(),
             None => div()
+                .text_color(rgb(theme::current().FOG))
                 .size_full()
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_color(rgb(theme::FOG))
                 .text_size(px(13.0))
                 .child("No layout")
                 .into_any_element(),

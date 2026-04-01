@@ -1126,11 +1126,12 @@ mod tests {
     fn test_build_terminal_config_uses_settings() {
         use super::super::WorkspaceState;
         use crate::settings::AppSettings;
+        use crate::theme::OrcaTheme;
         let mut settings = AppSettings(orcashell_store::AppSettings::default());
         settings.font_size = 18.0;
         settings.font_family = "Fira Code".to_string();
 
-        let config = WorkspaceState::build_terminal_config(&settings);
+        let config = WorkspaceState::build_terminal_config(&settings, &OrcaTheme::dark());
         assert_eq!(f32::from(config.font_size), 18.0);
         assert_eq!(config.font_family, "Fira Code");
     }

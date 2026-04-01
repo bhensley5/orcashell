@@ -57,6 +57,7 @@
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
 use gpui::Hsla;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A color palette that maps ANSI colors to GPUI Hsla colors.
 ///
@@ -105,6 +106,12 @@ pub struct ColorPalette {
     /// Cache generation counter. Bumped when colors change so the renderer
     /// can invalidate cached ShapedLine data that carries color information.
     pub generation: u64,
+}
+
+static NEXT_PALETTE_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn next_palette_generation() -> u64 {
+    NEXT_PALETTE_GENERATION.fetch_add(1, Ordering::Relaxed)
 }
 
 impl Default for ColorPalette {
@@ -432,8 +439,18 @@ impl ColorPaletteBuilder {
         self
     }
 
+    pub fn black_channels(mut self, hex: u32) -> Self {
+        self.set_ansi_hex(0, hex);
+        self
+    }
+
     pub fn red(mut self, r: u8, g: u8, b: u8) -> Self {
         self.set_ansi_color(1, r, g, b);
+        self
+    }
+
+    pub fn red_channels(mut self, hex: u32) -> Self {
+        self.set_ansi_hex(1, hex);
         self
     }
 
@@ -442,8 +459,18 @@ impl ColorPaletteBuilder {
         self
     }
 
+    pub fn green_channels(mut self, hex: u32) -> Self {
+        self.set_ansi_hex(2, hex);
+        self
+    }
+
     pub fn yellow(mut self, r: u8, g: u8, b: u8) -> Self {
         self.set_ansi_color(3, r, g, b);
+        self
+    }
+
+    pub fn yellow_channels(mut self, hex: u32) -> Self {
+        self.set_ansi_hex(3, hex);
         self
     }
 
@@ -452,8 +479,18 @@ impl ColorPaletteBuilder {
         self
     }
 
+    pub fn blue_channels(mut self, hex: u32) -> Self {
+        self.set_ansi_hex(4, hex);
+        self
+    }
+
     pub fn magenta(mut self, r: u8, g: u8, b: u8) -> Self {
         self.set_ansi_color(5, r, g, b);
+        self
+    }
+
+    pub fn magenta_channels(mut self, hex: u32) -> Self {
+        self.set_ansi_hex(5, hex);
         self
     }
 
@@ -462,8 +499,18 @@ impl ColorPaletteBuilder {
         self
     }
 
+    pub fn cyan_channels(mut self, hex: u32) -> Self {
+        self.set_ansi_hex(6, hex);
+        self
+    }
+
     pub fn white(mut self, r: u8, g: u8, b: u8) -> Self {
         self.set_ansi_color(7, r, g, b);
+        self
+    }
+
+    pub fn white_channels(mut self, hex: u32) -> Self {
+        self.set_ansi_hex(7, hex);
         self
     }
 
@@ -472,8 +519,18 @@ impl ColorPaletteBuilder {
         self
     }
 
+    pub fn bright_black_channels(mut self, hex: u32) -> Self {
+        self.set_ansi_hex(8, hex);
+        self
+    }
+
     pub fn bright_red(mut self, r: u8, g: u8, b: u8) -> Self {
         self.set_ansi_color(9, r, g, b);
+        self
+    }
+
+    pub fn bright_red_channels(mut self, hex: u32) -> Self {
+        self.set_ansi_hex(9, hex);
         self
     }
 
@@ -482,8 +539,18 @@ impl ColorPaletteBuilder {
         self
     }
 
+    pub fn bright_green_channels(mut self, hex: u32) -> Self {
+        self.set_ansi_hex(10, hex);
+        self
+    }
+
     pub fn bright_yellow(mut self, r: u8, g: u8, b: u8) -> Self {
         self.set_ansi_color(11, r, g, b);
+        self
+    }
+
+    pub fn bright_yellow_channels(mut self, hex: u32) -> Self {
+        self.set_ansi_hex(11, hex);
         self
     }
 
@@ -492,8 +559,18 @@ impl ColorPaletteBuilder {
         self
     }
 
+    pub fn bright_blue_channels(mut self, hex: u32) -> Self {
+        self.set_ansi_hex(12, hex);
+        self
+    }
+
     pub fn bright_magenta(mut self, r: u8, g: u8, b: u8) -> Self {
         self.set_ansi_color(13, r, g, b);
+        self
+    }
+
+    pub fn bright_magenta_channels(mut self, hex: u32) -> Self {
+        self.set_ansi_hex(13, hex);
         self
     }
 
@@ -502,8 +579,18 @@ impl ColorPaletteBuilder {
         self
     }
 
+    pub fn bright_cyan_channels(mut self, hex: u32) -> Self {
+        self.set_ansi_hex(14, hex);
+        self
+    }
+
     pub fn bright_white(mut self, r: u8, g: u8, b: u8) -> Self {
         self.set_ansi_color(15, r, g, b);
+        self
+    }
+
+    pub fn bright_white_channels(mut self, hex: u32) -> Self {
+        self.set_ansi_hex(15, hex);
         self
     }
 
@@ -519,8 +606,19 @@ impl ColorPaletteBuilder {
         self.palette.generation += 1;
     }
 
+    fn set_ansi_hex(&mut self, idx: usize, hex: u32) {
+        self.set_ansi_color(
+            idx,
+            ((hex >> 16) & 0xFF) as u8,
+            ((hex >> 8) & 0xFF) as u8,
+            (hex & 0xFF) as u8,
+        );
+    }
+
     pub fn build(self) -> ColorPalette {
-        self.palette
+        let mut palette = self.palette;
+        palette.generation = next_palette_generation();
+        palette
     }
 }
 
@@ -617,5 +715,14 @@ mod tests {
         };
         let hsla = palette.resolve(Color::Spec(rgb), &colors);
         assert_eq!(hsla.a, 1.0);
+    }
+
+    #[test]
+    fn test_builder_assigns_fresh_generation() {
+        let first = ColorPalette::builder().build();
+        let second = ColorPalette::builder().build();
+
+        assert_ne!(first.generation, 0);
+        assert_ne!(first.generation, second.generation);
     }
 }

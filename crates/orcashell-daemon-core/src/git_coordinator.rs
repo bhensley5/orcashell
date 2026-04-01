@@ -22,6 +22,7 @@ use orcashell_git::{
     resolve_upstream_info, stage_paths, unstage_paths, DiffDocument, DiffSelectionKey,
     FileDiffDocument, GitSnapshotSummary, ManagedWorktree,
 };
+use orcashell_store::ThemeId;
 use parking_lot::Mutex;
 use tracing::warn;
 use uuid::Uuid;
@@ -107,6 +108,7 @@ impl GitCoordinator {
 
         let inner = Arc::new(GitCoordinatorInner {
             state: Mutex::new(CoordinatorState::default()),
+            diff_theme: Mutex::new(ThemeId::Dark),
             subscribers: Mutex::new(Vec::new()),
             snapshot_tx,
             diff_tx,
@@ -142,6 +144,10 @@ impl GitCoordinator {
         let (tx, rx) = async_unbounded();
         self.inner.subscribers.lock().push(tx);
         rx
+    }
+
+    pub fn set_diff_theme(&self, theme_id: ThemeId) {
+        *self.inner.diff_theme.lock() = theme_id;
     }
 
     // ── Snapshot / diff requests (unchanged shape) ───────────────────
@@ -402,6 +408,7 @@ impl Default for GitCoordinator {
 
 struct GitCoordinatorInner {
     state: Mutex<CoordinatorState>,
+    diff_theme: Mutex<ThemeId>,
     subscribers: Mutex<Vec<AsyncSender<GitEvent>>>,
     snapshot_tx: CrossbeamSender<SnapshotJobEnvelope>,
     diff_tx: CrossbeamSender<DiffJob>,
@@ -817,7 +824,8 @@ fn spawn_diff_worker(
                         generation,
                         selection,
                     } => {
-                        let result = load_file_diff(&scope_root, generation, &selection)
+                        let theme_id = *inner.diff_theme.lock();
+                        let result = load_file_diff(&scope_root, generation, &selection, theme_id)
                             .map_err(|error| error.to_string());
                         inner.broadcast(GitEvent::FileDiffLoaded {
                             scope_root,

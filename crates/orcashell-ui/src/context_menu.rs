@@ -63,6 +63,7 @@ impl ContextMenuOverlay {
 
 impl Render for ContextMenuOverlay {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = theme::active(cx);
         // Focus the menu so Escape works
         if !self.focus_handle.is_focused(window) {
             window.focus(&self.focus_handle);
@@ -90,10 +91,10 @@ impl Render for ContextMenuOverlay {
             if enabled {
                 item_div = item_div
                     .cursor_pointer()
-                    .text_color(rgb(theme::BONE))
-                    .hover(|s| s.bg(rgb(theme::ORCA_BLUE)));
+                    .text_color(rgb(palette.BONE))
+                    .hover(|s| s.bg(rgb(palette.ORCA_BLUE)));
             } else {
-                item_div = item_div.text_color(rgb(theme::SLATE));
+                item_div = item_div.text_color(rgb(palette.SLATE));
             }
 
             item_div = item_div.child(div().flex_1().child(label));
@@ -103,7 +104,7 @@ impl Render for ContextMenuOverlay {
                     div()
                         .ml(px(16.0))
                         .text_size(px(10.0))
-                        .text_color(rgb(theme::SLATE))
+                        .text_color(rgb(palette.SLATE))
                         .flex_shrink_0()
                         .child(sc),
                 );
@@ -153,9 +154,9 @@ impl Render for ContextMenuOverlay {
                 anchored().position(position).snap_to_window().child(
                     div()
                         .id("ctx-panel")
-                        .bg(rgb(theme::DEEP))
+                        .bg(rgb(palette.DEEP))
                         .border_1()
-                        .border_color(rgb(theme::SURFACE))
+                        .border_color(rgb(palette.SURFACE))
                         .rounded(px(4.0))
                         .shadow_xl()
                         .py(px(4.0))
@@ -173,9 +174,10 @@ impl Render for ContextMenuOverlay {
 
 /// Build a separator element for use between menu items.
 pub fn menu_separator() -> Div {
+    let palette = theme::OrcaTheme::default();
     div()
         .h(px(1.0))
         .mx(px(8.0))
         .my(px(4.0))
-        .bg(rgb(theme::SURFACE))
+        .bg(rgb(palette.SURFACE))
 }

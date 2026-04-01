@@ -320,6 +320,7 @@ impl TerminalView {
         self.renderer.font_family = config.font_family.clone();
         self.renderer.font_family_shared = config.font_family.clone().into();
         self.renderer.font_size = zoomed_size;
+        self.renderer.palette = config.colors.clone();
         self.config = config;
         self.config.font_size = zoomed_size;
         self.cell_measured = false;

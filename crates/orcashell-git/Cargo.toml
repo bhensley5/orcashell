@@ -8,6 +8,7 @@ git2 = { version = "0.20.4", default-features = false, features = ["vendored-lib
 anyhow.workspace = true
 imara-diff = "0.1"
 orcashell-syntax = { path = "../orcashell-syntax" }
+orcashell-store = { path = "../orcashell-store" }
 
 [dev-dependencies]
 tempfile = "3"

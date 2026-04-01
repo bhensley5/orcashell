@@ -28,6 +28,7 @@ fn tilde_contract(path: &std::path::Path) -> String {
 
 impl Render for StatusBar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = theme::active(cx);
         let ws = self.workspace.read(cx);
 
         let project_name = ws
@@ -88,15 +89,15 @@ impl Render for StatusBar {
             .w_full()
             .h(px(24.0))
             .flex_shrink_0()
-            .bg(rgb(theme::ABYSS))
+            .bg(rgb(palette.ABYSS))
             .border_t_1()
-            .border_color(rgb(theme::SURFACE))
+            .border_color(rgb(palette.SURFACE))
             .flex()
             .items_center()
             .justify_between()
             .px(px(12.0))
             .text_size(px(11.0))
-            .text_color(rgb(theme::FOG))
+            .text_color(rgb(palette.FOG))
             .child(div().child(left_text))
             .child(div().child(right_text))
     }

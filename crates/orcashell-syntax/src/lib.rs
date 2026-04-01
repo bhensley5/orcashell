@@ -6,6 +6,7 @@
 
 pub mod theme;
 
+use orcashell_store::ThemeId;
 use std::path::Path;
 use std::sync::OnceLock;
 use syntect::easy::HighlightLines;
@@ -15,9 +16,6 @@ static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
 
 /// Embedded PowerShell syntax definition (syntect defaults don't include one).
 const POWERSHELL_SYNTAX: &str = include_str!("powershell.sublime-syntax");
-
-/// Default text color (BONE from Orca theme). Canonical source: orcashell-ui/src/theme.rs.
-const DEFAULT_COLOR: u32 = 0xD8DAE0;
 
 /// A single span of highlighted text with a specific color.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,21 +34,28 @@ pub struct HighlightedSpan {
 /// sequence of consecutive lines.
 pub struct Highlighter {
     inner: HighlightLines<'static>,
+    fallback_color: u32,
 }
 
 impl Highlighter {
     /// Create a highlighter for the given file path. The file extension is used
     /// for language detection. Returns `None` if the file maps to plain text
     /// (highlighting would just return the default color for everything).
-    pub fn for_path(path: &Path) -> Option<Self> {
+    pub fn for_path(path: &Path, theme_id: ThemeId) -> Option<Self> {
         let ss = syntax_set();
         let syntax = get_syntax_for_path(path, ss);
         if std::ptr::eq(syntax, ss.find_syntax_plain_text()) {
             return None;
         }
-        let theme = theme::orca_syntax_theme();
+        let theme = theme::orca_syntax_theme(theme_id);
+        let fallback_color = theme
+            .settings
+            .foreground
+            .map(|fg| ((fg.r as u32) << 16) | ((fg.g as u32) << 8) | fg.b as u32)
+            .unwrap_or(0xD8DAE0);
         Some(Self {
             inner: HighlightLines::new(syntax, theme),
+            fallback_color,
         })
     }
 
@@ -101,7 +106,7 @@ impl Highlighter {
                     vec![]
                 } else {
                     vec![HighlightedSpan {
-                        color: DEFAULT_COLOR,
+                        color: self.fallback_color,
                         text,
                     }]
                 }
@@ -215,14 +220,14 @@ mod tests {
 
     #[test]
     fn highlighter_returns_spans_for_rust() {
-        let mut hl = Highlighter::for_path(Path::new("test.rs")).unwrap();
+        let mut hl = Highlighter::for_path(Path::new("test.rs"), ThemeId::Dark).unwrap();
         let spans = hl.highlight_line("fn main() {\n");
         assert!(!spans.is_empty());
     }
 
     #[test]
     fn keywords_get_orca_blue() {
-        let mut hl = Highlighter::for_path(Path::new("test.rs")).unwrap();
+        let mut hl = Highlighter::for_path(Path::new("test.rs"), ThemeId::Dark).unwrap();
         let spans = hl.highlight_line("fn main() {\n");
         let fn_span = spans.iter().find(|s| s.text.starts_with("fn"));
         assert!(fn_span.is_some(), "expected a span starting with 'fn'");
@@ -231,7 +236,7 @@ mod tests {
 
     #[test]
     fn strings_get_neon_mint() {
-        let mut hl = Highlighter::for_path(Path::new("test.rs")).unwrap();
+        let mut hl = Highlighter::for_path(Path::new("test.rs"), ThemeId::Dark).unwrap();
         // Feed context lines first so the parser state is correct.
         hl.highlight_line("fn main() {\n");
         hl.highlight_line("    let x = 42;\n");
@@ -244,7 +249,7 @@ mod tests {
 
     #[test]
     fn comments_get_fog() {
-        let mut hl = Highlighter::for_path(Path::new("test.rs")).unwrap();
+        let mut hl = Highlighter::for_path(Path::new("test.rs"), ThemeId::Dark).unwrap();
         hl.highlight_line("fn main() {\n");
         hl.highlight_line("    let x = 42;\n");
         let spans = hl.highlight_line("    // a comment\n");
@@ -262,7 +267,7 @@ mod tests {
 
     #[test]
     fn whitespace_normalization() {
-        let mut hl = Highlighter::for_path(Path::new("test.rs")).unwrap();
+        let mut hl = Highlighter::for_path(Path::new("test.rs"), ThemeId::Dark).unwrap();
         let spans = hl.highlight_line("fn\tmain() {\n");
         let full_text: String = spans.iter().map(|s| s.text.as_str()).collect();
         assert!(
@@ -277,13 +282,13 @@ mod tests {
 
     #[test]
     fn plain_text_returns_none() {
-        assert!(Highlighter::for_path(Path::new("test.xyz_unknown")).is_none());
+        assert!(Highlighter::for_path(Path::new("test.xyz_unknown"), ThemeId::Dark).is_none());
     }
 
     #[test]
     fn powershell_highlighting() {
         assert!(
-            Highlighter::for_path(Path::new("profile.ps1")).is_some(),
+            Highlighter::for_path(Path::new("profile.ps1"), ThemeId::Dark).is_some(),
             ".ps1 should be highlighted as PowerShell"
         );
     }
@@ -291,14 +296,14 @@ mod tests {
     #[test]
     fn powershell_module_highlighting() {
         assert!(
-            Highlighter::for_path(Path::new("module.psm1")).is_some(),
+            Highlighter::for_path(Path::new("module.psm1"), ThemeId::Dark).is_some(),
             ".psm1 should be highlighted as PowerShell"
         );
     }
 
     #[test]
     fn powershell_keywords_highlighted() {
-        let mut hl = Highlighter::for_path(Path::new("test.ps1")).unwrap();
+        let mut hl = Highlighter::for_path(Path::new("test.ps1"), ThemeId::Dark).unwrap();
         let spans = hl.highlight_line("function Get-Item { param($Path) }\n");
         assert!(
             !spans.is_empty(),
@@ -312,7 +317,7 @@ mod tests {
     #[test]
     fn batch_file_highlighting() {
         assert!(
-            Highlighter::for_path(Path::new("setup.bat")).is_some(),
+            Highlighter::for_path(Path::new("setup.bat"), ThemeId::Dark).is_some(),
             ".bat should be highlighted as Batch File"
         );
     }
@@ -320,14 +325,14 @@ mod tests {
     #[test]
     fn cmd_file_highlighting() {
         assert!(
-            Highlighter::for_path(Path::new("build.cmd")).is_some(),
+            Highlighter::for_path(Path::new("build.cmd"), ThemeId::Dark).is_some(),
             ".cmd should be highlighted as Batch File"
         );
     }
 
     #[test]
     fn multi_line_comment_state_preserved() {
-        let mut hl = Highlighter::for_path(Path::new("test.rs")).unwrap();
+        let mut hl = Highlighter::for_path(Path::new("test.rs"), ThemeId::Dark).unwrap();
         let line1 = hl.highlight_line("/* start of\n");
         let line2 = hl.highlight_line("   still a comment */\n");
         // Both lines should be FOG (comment color).

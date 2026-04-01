@@ -8,8 +8,25 @@ You'll need:
 
 - **Rust** (stable, 2021 edition): https://rustup.rs
 - **macOS** or **Linux** (Windows support is planned but not yet available)
+- On **macOS**, **Xcode** with the Metal toolchain available via `xcrun`
 
-That's it. All dependencies (including SQLite) are bundled via Cargo.
+All Rust dependencies (including SQLite) are bundled via Cargo.
+
+### macOS notes
+
+OrcaShell uses GPUI, and GPUI compiles Metal shaders as part of the macOS build. Before building on macOS, make sure the Metal compiler is available:
+
+```bash
+xcrun --find metal
+```
+
+If that command fails, or `cargo build` reports `cannot execute tool 'metal' due to missing Metal Toolchain`, install the component Xcode requests:
+
+```bash
+xcodebuild -downloadComponent MetalToolchain
+```
+
+If you have both Xcode and Command Line Tools installed, also make sure `xcode-select` points at the full Xcode app rather than Command Line Tools alone.
 
 ## Building from source
 

@@ -50,6 +50,18 @@ Dark mode with layered blue-black surfaces and subtle elevation through luminanc
 
 Requires Rust stable toolchain (2021 edition).
 
+On macOS, the build also requires Xcode's Metal compiler because GPUI compiles Metal shaders during `cargo build`. You can verify that with:
+
+```bash
+xcrun --find metal
+```
+
+If that fails, install the missing component with:
+
+```bash
+xcodebuild -downloadComponent MetalToolchain
+```
+
 ```bash
 cargo build --workspace
 cargo run -p orcashell

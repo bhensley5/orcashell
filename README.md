@@ -70,7 +70,7 @@ All releases are also available on [GitHub Releases](https://github.com/bhensley
 
 ## Design
 
-Dark mode with layered blue-black surfaces and subtle elevation through luminance shifts. No pure black, no pure white. Everything sits between soft greys and deep navies, orca-inspired, designed to be easy on your eyes for long sessions. Terminal colors use a pastel neon palette, bright enough to be functional and muted enough to stay pleasant. The goal was a workspace you actually want to spend hours in.
+Four built-in themes: dark (orca), light, sepia, and black. OrcaShell follows your system appearance automatically, or you can pick one manually in settings. The default dark theme uses layered blue-black surfaces with subtle elevation through luminance shifts. No pure black, no pure white. Everything sits between soft greys and deep navies, orca-inspired, designed to be easy on your eyes for long sessions. Terminal colors use a pastel neon palette, bright enough to be functional and muted enough to stay pleasant. The goal was a workspace you actually want to spend hours in.
 
 ## Building from source
 

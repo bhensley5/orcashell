@@ -49,6 +49,13 @@ __orcashell_preexec() {
     __orcashell_set_title "$command"
 }
 
+# Match OrcaShell's Alt+Arrow xterm-style escape sequences to word movement.
+# This keeps Option+Left/Right usable for shell line editing on macOS.
+bindkey -M emacs "\e[1;3D" backward-word
+bindkey -M emacs "\e[1;3C" forward-word
+bindkey -M viins "\e[1;3D" backward-word
+bindkey -M viins "\e[1;3C" forward-word
+
 autoload -Uz add-zsh-hook
 add-zsh-hook precmd __orcashell_precmd
 add-zsh-hook preexec __orcashell_preexec

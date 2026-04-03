@@ -85,5 +85,9 @@ __orcashell_debug_trap() {
     __orcashell_in_debug_trap=""
 }
 
+# Match OrcaShell's Alt+Arrow xterm-style escape sequences to readline word movement.
+bind '"\e[1;3D": backward-word'
+bind '"\e[1;3C": forward-word'
+
 PROMPT_COMMAND="__orcashell_prompt_command"
 trap '__orcashell_debug_trap' DEBUG

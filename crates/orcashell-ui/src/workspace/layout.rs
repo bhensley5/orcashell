@@ -1155,6 +1155,8 @@ mod tests {
                 last_activity_at: None,
                 last_local_input_at: None,
                 notification_tier: None,
+                resumable_agent: None,
+                pending_agent_detection: false,
             },
         );
 
@@ -1180,6 +1182,8 @@ mod tests {
                 last_activity_at: None,
                 last_local_input_at: None,
                 notification_tier: None,
+                resumable_agent: None,
+                pending_agent_detection: false,
             },
         );
         assert_eq!(ws.terminal_display_name("proj-1", "t1"), "nvim");
@@ -1193,6 +1197,8 @@ mod tests {
                 last_activity_at: None,
                 last_local_input_at: None,
                 notification_tier: None,
+                resumable_agent: None,
+                pending_agent_detection: false,
             },
         );
         assert_eq!(ws.terminal_display_name("proj-1", "t1"), "terminal");
@@ -1217,6 +1223,8 @@ mod tests {
                 last_activity_at: None,
                 last_local_input_at: None,
                 notification_tier: None,
+                resumable_agent: None,
+                pending_agent_detection: false,
             },
         );
 
@@ -1242,6 +1250,8 @@ mod tests {
                 last_activity_at: None,
                 last_local_input_at: None,
                 notification_tier: None,
+                resumable_agent: None,
+                pending_agent_detection: false,
             },
         );
 
@@ -1263,6 +1273,8 @@ mod tests {
                 last_activity_at: Some(std::time::Instant::now()),
                 last_local_input_at: None,
                 notification_tier: None,
+                resumable_agent: None,
+                pending_agent_detection: false,
             },
         );
         ws.set_terminal_runtime_state(
@@ -1274,6 +1286,8 @@ mod tests {
                 last_activity_at: None,
                 last_local_input_at: None,
                 notification_tier: None,
+                resumable_agent: None,
+                pending_agent_detection: false,
             },
         );
 
@@ -1299,6 +1313,8 @@ mod tests {
                 last_activity_at: Some(std::time::Instant::now()),
                 last_local_input_at: Some(std::time::Instant::now()),
                 notification_tier: None,
+                resumable_agent: None,
+                pending_agent_detection: false,
             },
         );
 

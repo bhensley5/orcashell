@@ -9,7 +9,7 @@ use gpui::*;
 
 use crate::app_view::ContextMenuRequest;
 use crate::context_menu::{platform_shortcut, ContextMenuItem};
-use crate::theme;
+use crate::theme::{self, OrcaTheme};
 use crate::workspace::layout::{LayoutNode, SplitDirection};
 use crate::workspace::WorkspaceState;
 use resize::{ActiveDrag, DragState};
@@ -90,15 +90,16 @@ impl LayoutContainer {
         project_id: &str,
         cx: &App,
     ) -> impl IntoElement {
+        let palette = theme::active(cx);
         let content = if let Some(tid) = terminal_id {
             let ws = self.workspace.read(cx);
             if let Some(view) = ws.terminal_view(tid) {
                 div().size_full().min_h_0().min_w_0().child(view.clone())
             } else {
-                self.render_placeholder()
+                self.render_placeholder(&palette)
             }
         } else {
-            self.render_placeholder()
+            self.render_placeholder(&palette)
         };
 
         // Wrap with click-to-focus
@@ -169,8 +170,7 @@ impl LayoutContainer {
             })
     }
 
-    fn render_placeholder(&self) -> Div {
-        let palette = theme::current();
+    fn render_placeholder(&self, palette: &OrcaTheme) -> Div {
         div()
             .size_full()
             .flex()
@@ -195,6 +195,7 @@ impl LayoutContainer {
         self.retain_valid_children(children.len());
 
         // Normalize sizes to percentages
+        let palette = theme::active(cx);
         let total_size: f32 = sizes.iter().sum();
         let normalized: Vec<f32> = if total_size > 0.0 {
             sizes.iter().map(|s| s / total_size * 100.0).collect()
@@ -211,6 +212,7 @@ impl LayoutContainer {
             // Add divider before this child (if not first)
             if i > 0 {
                 let divider = self.render_divider(
+                    &palette,
                     is_horizontal,
                     i - 1,
                     i,
@@ -261,8 +263,10 @@ impl LayoutContainer {
     }
 
     /// Render a draggable divider between split children.
+    #[allow(clippy::too_many_arguments)]
     fn render_divider(
         &self,
+        palette: &OrcaTheme,
         is_horizontal: bool,
         left_index: usize,
         right_index: usize,
@@ -270,7 +274,6 @@ impl LayoutContainer {
         project_id: &str,
         sizes: &[f32],
     ) -> impl IntoElement {
-        let palette = theme::current();
         let active_drag = self.active_drag.clone();
         let split_path = self.layout_path.clone();
         let pid = project_id.to_string();
@@ -344,6 +347,7 @@ impl LayoutContainer {
 
 impl Render for LayoutContainer {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = theme::active(cx);
         // Read active project and snapshot the layout node at our path.
         // Clone releases the workspace borrow before mutable render methods.
         let (project_id, layout_snapshot) = {
@@ -393,7 +397,7 @@ impl Render for LayoutContainer {
                 .render_tabs(children, active_tab, &project_id, cx)
                 .into_any_element(),
             None => div()
-                .text_color(rgb(theme::current().FOG))
+                .text_color(rgb(palette.FOG))
                 .size_full()
                 .flex()
                 .items_center()

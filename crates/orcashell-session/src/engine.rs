@@ -287,13 +287,16 @@ impl SessionEngine {
         !self.byte_rx.is_empty()
     }
 
-    pub fn write(&self, bytes: &[u8]) {
+    pub fn try_write(&self, bytes: &[u8]) -> std::io::Result<()> {
         let mut writer = self.pty_writer.lock();
-        if let Err(e) = writer.write_all(bytes) {
+        writer.write_all(bytes)?;
+        writer.flush()?;
+        Ok(())
+    }
+
+    pub fn write(&self, bytes: &[u8]) {
+        if let Err(e) = self.try_write(bytes) {
             warn!("PTY write error: {}", e);
-        }
-        if let Err(e) = writer.flush() {
-            warn!("PTY flush error: {}", e);
         }
     }
 

@@ -591,8 +591,12 @@ impl Render for OrcaAppView {
             );
         }
 
-        if let Some(err) = self.workspace.read(cx).action_error() {
+        if let Some(banner) = self.workspace.read(cx).workspace_banner().cloned() {
             let ws_clear = self.workspace.clone();
+            let text_color = match banner.kind {
+                crate::workspace::WorkspaceBannerKind::Warning => rgb(palette.STATUS_AMBER),
+                crate::workspace::WorkspaceBannerKind::Error => rgb(palette.STATUS_CORAL),
+            };
             container = container.child(
                 div()
                     .w_full()
@@ -608,9 +612,9 @@ impl Render for OrcaAppView {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .text_color(rgb(palette.STATUS_AMBER))
+                            .text_color(text_color)
                             .text_size(px(11.0))
-                            .child(err.to_string()),
+                            .child(banner.message),
                     )
                     .child(
                         div()
@@ -620,7 +624,7 @@ impl Render for OrcaAppView {
                             .text_size(px(11.0))
                             .child("\u{2715}")
                             .on_click(move |_event, _window, cx| {
-                                ws_clear.update(cx, |ws, cx| ws.clear_action_error(cx));
+                                ws_clear.update(cx, |ws, cx| ws.clear_workspace_banner(cx));
                             }),
                     ),
             );

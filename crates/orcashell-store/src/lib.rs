@@ -45,6 +45,41 @@ pub struct StoredWorktree {
     pub primary_terminal_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ResumableAgentKind {
+    Codex,
+    ClaudeCode,
+}
+
+impl ResumableAgentKind {
+    fn as_sql(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::ClaudeCode => "claude-code",
+        }
+    }
+
+    fn from_sql(value: &str) -> std::io::Result<Self> {
+        match value {
+            "codex" => Ok(Self::Codex),
+            "claude-code" => Ok(Self::ClaudeCode),
+            other => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unknown resumable agent kind: {other}"),
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredAgentTerminal {
+    pub terminal_id: String,
+    pub project_id: String,
+    pub agent_kind: ResumableAgentKind,
+    pub cwd: PathBuf,
+    pub updated_at: String,
+}
+
 /// SQLite-backed persistence store for projects and app state.
 pub struct Store {
     conn: Connection,
@@ -111,6 +146,14 @@ impl Store {
                 primary_terminal_id TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS agent_terminals (
+                terminal_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                agent_kind TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now'))
             );",
         )?;
         self.conn.execute_batch(
@@ -118,7 +161,13 @@ impl Store {
                 ON worktrees(project_id);
 
             CREATE INDEX IF NOT EXISTS idx_worktrees_primary_terminal_id
-                ON worktrees(primary_terminal_id);",
+                ON worktrees(primary_terminal_id);
+
+            CREATE INDEX IF NOT EXISTS idx_agent_terminals_project_id
+                ON agent_terminals(project_id);
+
+            CREATE INDEX IF NOT EXISTS idx_agent_terminals_agent_cwd
+                ON agent_terminals(agent_kind, cwd);",
         )?;
         Ok(())
     }
@@ -211,6 +260,10 @@ impl Store {
                     "DELETE FROM worktrees WHERE project_id = ?1",
                     params![project_id],
                 )?;
+                tx.execute(
+                    "DELETE FROM agent_terminals WHERE project_id = ?1",
+                    params![project_id],
+                )?;
             }
         }
         tx.execute(
@@ -281,6 +334,10 @@ impl Store {
                 if !current_ids.contains(old_id) {
                     tx.execute(
                         "DELETE FROM worktrees WHERE project_id = ?1",
+                        params![old_id],
+                    )?;
+                    tx.execute(
+                        "DELETE FROM agent_terminals WHERE project_id = ?1",
                         params![old_id],
                     )?;
                     tx.execute("DELETE FROM projects WHERE id = ?1", params![old_id])?;
@@ -396,8 +453,79 @@ impl Store {
     pub fn delete_project(&self, id: &str) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute("DELETE FROM worktrees WHERE project_id = ?1", params![id])?;
+        tx.execute(
+            "DELETE FROM agent_terminals WHERE project_id = ?1",
+            params![id],
+        )?;
         tx.execute("DELETE FROM projects WHERE id = ?1", params![id])?;
         tx.commit()?;
+        Ok(())
+    }
+
+    pub fn upsert_agent_terminal(&self, row: &StoredAgentTerminal) -> Result<()> {
+        let cwd = normalize_stored_path(&row.cwd)?;
+        self.conn.execute(
+            "INSERT INTO agent_terminals (
+                terminal_id, project_id, agent_kind, cwd, updated_at
+             )
+             VALUES (?1, ?2, ?3, ?4, strftime('%Y-%m-%d %H:%M:%f', 'now'))
+             ON CONFLICT(terminal_id) DO UPDATE SET
+                project_id = excluded.project_id,
+                agent_kind = excluded.agent_kind,
+                cwd = excluded.cwd,
+                updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now')",
+            params![
+                row.terminal_id,
+                row.project_id,
+                row.agent_kind.as_sql(),
+                cwd.to_string_lossy().as_ref(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_agent_terminal(&self, terminal_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM agent_terminals WHERE terminal_id = ?1",
+            params![terminal_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_agent_terminals_for_project(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<StoredAgentTerminal>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT terminal_id, project_id, agent_kind, cwd, updated_at
+             FROM agent_terminals
+             WHERE project_id = ?1
+             ORDER BY updated_at DESC, terminal_id DESC",
+        )?;
+        let rows = stmt.query_map(params![project_id], |row| {
+            let agent_kind: String = row.get(2)?;
+            Ok(StoredAgentTerminal {
+                terminal_id: row.get(0)?,
+                project_id: row.get(1)?,
+                agent_kind: ResumableAgentKind::from_sql(&agent_kind).map_err(|err| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Text,
+                        Box::new(err),
+                    )
+                })?,
+                cwd: PathBuf::from(row.get::<_, String>(3)?),
+                updated_at: row.get(4)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn delete_agent_terminals_for_project(&self, project_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM agent_terminals WHERE project_id = ?1",
+            params![project_id],
+        )?;
         Ok(())
     }
 
@@ -566,6 +694,12 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM worktrees", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0);
+
+        let count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM agent_terminals", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     fn make_project(id: &str, name: &str, path: &str, order: i32) -> StoredProject {
@@ -613,6 +747,21 @@ mod tests {
             branch_name: format!("orca/{id}"),
             source_ref: "refs/heads/main".to_string(),
             primary_terminal_id: Some(format!("term-{id}")),
+        }
+    }
+
+    fn make_agent_terminal(
+        terminal_id: &str,
+        project_id: &str,
+        agent_kind: ResumableAgentKind,
+        cwd: &str,
+    ) -> StoredAgentTerminal {
+        StoredAgentTerminal {
+            terminal_id: terminal_id.to_string(),
+            project_id: project_id.to_string(),
+            agent_kind,
+            cwd: PathBuf::from(cwd),
+            updated_at: String::new(),
         }
     }
 
@@ -731,6 +880,104 @@ mod tests {
 
         store.delete_project("p1").unwrap();
         assert!(store.load_worktrees_for_project("p1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_upsert_load_delete_agent_terminal() {
+        let store = Store::open_in_memory().unwrap();
+        let row = make_agent_terminal("term-1", "p1", ResumableAgentKind::Codex, "/repo/wt-1");
+
+        store.upsert_agent_terminal(&row).unwrap();
+
+        let loaded = store.load_agent_terminals_for_project("p1").unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].terminal_id, "term-1");
+        assert_eq!(loaded[0].project_id, "p1");
+        assert_eq!(loaded[0].agent_kind, ResumableAgentKind::Codex);
+        assert_eq!(loaded[0].cwd, PathBuf::from("/repo/wt-1"));
+
+        store.delete_agent_terminal("term-1").unwrap();
+        assert!(store
+            .load_agent_terminals_for_project("p1")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn test_load_agent_terminals_orders_by_updated_at_then_terminal_id() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_agent_terminal(&make_agent_terminal(
+                "term-a",
+                "p1",
+                ResumableAgentKind::Codex,
+                "/repo/wt",
+            ))
+            .unwrap();
+        store
+            .upsert_agent_terminal(&make_agent_terminal(
+                "term-b",
+                "p1",
+                ResumableAgentKind::Codex,
+                "/repo/wt",
+            ))
+            .unwrap();
+        store
+            .upsert_agent_terminal(&make_agent_terminal(
+                "term-c",
+                "p1",
+                ResumableAgentKind::ClaudeCode,
+                "/repo/wt-2",
+            ))
+            .unwrap();
+
+        store
+            .conn
+            .execute(
+                "UPDATE agent_terminals SET updated_at = ?1 WHERE terminal_id = ?2",
+                params!["2026-01-01 00:00:00", "term-a"],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE agent_terminals SET updated_at = ?1 WHERE terminal_id = ?2",
+                params!["2026-01-01 00:00:00", "term-b"],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE agent_terminals SET updated_at = ?1 WHERE terminal_id = ?2",
+                params!["2026-02-01 00:00:00", "term-c"],
+            )
+            .unwrap();
+
+        let loaded = store.load_agent_terminals_for_project("p1").unwrap();
+        let terminal_ids: Vec<_> = loaded.iter().map(|row| row.terminal_id.as_str()).collect();
+        assert_eq!(terminal_ids, vec!["term-c", "term-b", "term-a"]);
+    }
+
+    #[test]
+    fn test_delete_project_cascades_agent_terminals() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .save_project(&make_project("p1", "First", "/a", 0))
+            .unwrap();
+        store
+            .upsert_agent_terminal(&make_agent_terminal(
+                "term-1",
+                "p1",
+                ResumableAgentKind::Codex,
+                "/repo/wt",
+            ))
+            .unwrap();
+
+        store.delete_project("p1").unwrap();
+        assert!(store
+            .load_agent_terminals_for_project("p1")
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -872,6 +1119,29 @@ mod tests {
     }
 
     #[test]
+    fn test_delete_window_cascades_agent_terminals() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.save_window(&make_window(2)).unwrap();
+        store
+            .save_project(&make_project_for_window("p1", "A", "/a", 0, 2))
+            .unwrap();
+        store
+            .upsert_agent_terminal(&make_agent_terminal(
+                "term-1",
+                "p1",
+                ResumableAgentKind::ClaudeCode,
+                "/repo/wt",
+            ))
+            .unwrap();
+
+        store.delete_window(2).unwrap();
+        assert!(store
+            .load_agent_terminals_for_project("p1")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
     fn test_load_projects_for_window() {
         let store = Store::open_in_memory().unwrap();
         store.save_window(&make_window(2)).unwrap();
@@ -928,6 +1198,38 @@ mod tests {
         assert_eq!(loaded_p.len(), 1);
         assert_eq!(loaded_p[0].id, "p1");
         assert!(store.load_worktrees_for_project("p2").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_save_window_state_deletes_agent_rows_for_removed_projects() {
+        let mut store = Store::open_in_memory().unwrap();
+        let w = make_window(1);
+        store
+            .save_window_state(
+                &w,
+                &[
+                    make_project("p1", "First", "/a", 0),
+                    make_project("p2", "Second", "/b", 1),
+                ],
+            )
+            .unwrap();
+        store
+            .upsert_agent_terminal(&make_agent_terminal(
+                "term-1",
+                "p2",
+                ResumableAgentKind::Codex,
+                "/repo/wt",
+            ))
+            .unwrap();
+
+        store
+            .save_window_state(&w, &[make_project("p1", "First", "/a", 0)])
+            .unwrap();
+
+        assert!(store
+            .load_agent_terminals_for_project("p2")
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

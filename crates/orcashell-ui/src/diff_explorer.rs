@@ -571,6 +571,7 @@ impl DiffExplorerView {
                         ),
                 )
                 .child(Self::action_bar_button(
+                    &palette,
                     "diff-remove-cancel",
                     "Cancel",
                     false,
@@ -617,6 +618,7 @@ impl DiffExplorerView {
             let ws_pull = self.workspace.clone();
             let scope_pull = scope_root.to_path_buf();
             actions = actions.child(Self::action_bar_button(
+                &palette,
                 "diff-action-pull",
                 &pull_label,
                 pull_disabled,
@@ -631,6 +633,7 @@ impl DiffExplorerView {
             let ws_push = self.workspace.clone();
             let scope_push = scope_root.to_path_buf();
             actions = actions.child(Self::action_bar_button(
+                &palette,
                 "diff-action-push",
                 "Push",
                 any_in_flight,
@@ -646,6 +649,7 @@ impl DiffExplorerView {
             let ws_merge = self.workspace.clone();
             let scope_merge = scope_root.to_path_buf();
             actions = actions.child(Self::action_bar_button(
+                &palette,
                 "diff-action-merge",
                 "Merge",
                 merge_disabled,
@@ -661,6 +665,7 @@ impl DiffExplorerView {
             let ws_remove = self.workspace.clone();
             let scope_remove = scope_root.to_path_buf();
             actions = actions.child(Self::action_bar_button(
+                &palette,
                 "diff-action-remove",
                 "Remove",
                 remove_disabled,
@@ -744,6 +749,7 @@ impl DiffExplorerView {
             .gap(px(4.0))
             .child(
                 Self::action_bar_button(
+                    &palette,
                     "action-stage-all",
                     "Stage All",
                     stage_all_disabled,
@@ -757,6 +763,7 @@ impl DiffExplorerView {
             )
             .child(
                 Self::action_bar_button(
+                    &palette,
                     "action-unstage-all",
                     "Unstage All",
                     unstage_all_disabled,
@@ -770,6 +777,7 @@ impl DiffExplorerView {
             )
             .child(
                 Self::action_bar_button(
+                    &palette,
                     "action-commit",
                     "Commit",
                     commit_disabled,
@@ -786,12 +794,14 @@ impl DiffExplorerView {
     /// A muted, professional toolbar button with subtle blue tint.
     /// Used in both the tree-pane action bar and header action buttons.
     fn action_bar_button(
+        palette: &OrcaTheme,
         id: &str,
         label: &str,
         disabled: bool,
         on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     ) -> Stateful<Div> {
-        let palette = theme::current();
+        let hover_bg = theme::with_alpha(palette.ORCA_BLUE, 0x1A);
+        let hover_text = palette.BONE;
         let mut btn = div()
             .id(ElementId::Name(id.to_string().into()))
             .px(px(8.0))
@@ -817,10 +827,7 @@ impl DiffExplorerView {
                 .border_color(rgb(palette.BORDER_EMPHASIS))
                 .text_color(rgb(palette.FOG))
                 .cursor_pointer()
-                .hover(|s| {
-                    s.bg(rgba(theme::with_alpha(palette.ORCA_BLUE, 0x1A)))
-                        .text_color(rgb(palette.BONE))
-                })
+                .hover(move |s| s.bg(rgba(hover_bg)).text_color(rgb(hover_text)))
                 .on_click(on_click);
         }
 
@@ -831,9 +838,9 @@ impl DiffExplorerView {
     // Action banner
     // ------------------------------------------------------------------
 
-    fn render_action_banner(&self, snap: &DiffRenderSnapshot) -> Option<Div> {
-        let palette = theme::current();
+    fn render_action_banner(&self, palette: &OrcaTheme, snap: &DiffRenderSnapshot) -> Option<Div> {
         let banner = snap.last_action_banner.as_ref()?;
+        let dismiss_hover = palette.PATCH;
         let (bg_color, border_color, text_color) = match banner.kind {
             ActionBannerKind::Success => (
                 theme::with_alpha(palette.STATUS_GREEN, 0x12),
@@ -882,7 +889,7 @@ impl DiffExplorerView {
                         .text_size(px(11.0))
                         .font_family(DIFF_FONT_FAMILY)
                         .text_color(rgb(palette.FOG))
-                        .hover(|s| s.text_color(rgb(palette.PATCH)))
+                        .hover(move |s| s.text_color(rgb(dismiss_hover)))
                         .child("\u{2715}")
                         .on_click(move |_event, _window, cx| {
                             ws_dismiss.update(cx, |ws, cx| {
@@ -917,6 +924,7 @@ impl DiffExplorerView {
 
         if snap.index_loading && !snap.has_index {
             return pane.child(Self::empty_panel_message(
+                &palette,
                 "Loading diff index...",
                 Some("Git is collecting the changed-file tree for this scope."),
             ));
@@ -924,6 +932,7 @@ impl DiffExplorerView {
         if let Some(error) = snap.index_error.as_ref() {
             if !snap.has_index {
                 return pane.child(Self::empty_panel_message(
+                    &palette,
                     "Could not load diff index",
                     Some(error.as_str()),
                 ));
@@ -932,6 +941,7 @@ impl DiffExplorerView {
 
         if !snap.has_index {
             return pane.child(Self::empty_panel_message(
+                &palette,
                 "Diff index unavailable",
                 Some("Open the diff tab from a git-backed terminal row."),
             ));
@@ -939,6 +949,7 @@ impl DiffExplorerView {
 
         if snap.index_file_count == 0 {
             return pane.child(Self::empty_panel_message(
+                &palette,
                 "Working tree clean",
                 Some("No changed files are available for this scope."),
             ));
@@ -1050,6 +1061,7 @@ impl DiffExplorerView {
 
             // "STAGED CHANGES" section header.
             list = list.child(Self::section_header(
+                &palette,
                 "STAGED CHANGES",
                 snap.staged_file_count,
             ));
@@ -1067,11 +1079,16 @@ impl DiffExplorerView {
                 snap,
                 &visible_order,
                 scope_hash,
+                &palette,
             ));
         }
 
         // "CHANGES" section header (always shown).
-        list = list.child(Self::section_header("CHANGES", snap.unstaged_file_count));
+        list = list.child(Self::section_header(
+            &palette,
+            "CHANGES",
+            snap.unstaged_file_count,
+        ));
 
         // Unstaged tree.
         let unstaged_tree = self
@@ -1086,6 +1103,7 @@ impl DiffExplorerView {
             snap,
             &visible_order,
             scope_hash,
+            &palette,
         ));
 
         if let Some(error) = snap.index_error.as_ref() {
@@ -1107,8 +1125,7 @@ impl DiffExplorerView {
     }
 
     /// Render a section header row (e.g. "STAGED CHANGES (3)").
-    fn section_header(label: &str, count: usize) -> Div {
-        let palette = theme::current();
+    fn section_header(palette: &OrcaTheme, label: &str, count: usize) -> Div {
         div()
             .w_full()
             .px(px(8.0))
@@ -1128,6 +1145,7 @@ impl DiffExplorerView {
             )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_section_tree(
         &self,
         nodes: &[DiffTreeNode],
@@ -1136,8 +1154,8 @@ impl DiffExplorerView {
         snap: &DiffRenderSnapshot,
         visible_order: &Rc<Vec<DiffSelectionKey>>,
         scope_hash: u64,
+        palette: &OrcaTheme,
     ) -> Vec<AnyElement> {
-        let palette = theme::current();
         let mut rows = Vec::new();
         for node in nodes {
             match &node.kind {
@@ -1161,6 +1179,7 @@ impl DiffExplorerView {
                         snap,
                         visible_order,
                         scope_hash,
+                        palette,
                     ));
                 }
                 DiffTreeNodeKind::File(file) => {
@@ -1184,6 +1203,7 @@ impl DiffExplorerView {
                     let element_id = ElementId::Name(
                         format!("diff-{:?}-{}-{}", section, scope_hash, path_hash).into(),
                     );
+                    let hover_bg = rgba(theme::with_alpha(palette.CURRENT, 0x88));
 
                     // Context menu items for right-click.
                     let menu_request = self.menu_request.clone();
@@ -1212,9 +1232,9 @@ impl DiffExplorerView {
                         })
                         .when(!is_primary && !is_multi, |row| {
                             row.border_color(rgba(0x00000000))
-                                .hover(|row| row.bg(rgba(theme::with_alpha(palette.CURRENT, 0x88))))
+                                .hover(move |row| row.bg(hover_bg))
                         })
-                        .child(Self::status_pill(file.status))
+                        .child(Self::status_pill(palette, file.status))
                         .child(
                             div()
                                 .flex_1()
@@ -1365,6 +1385,7 @@ impl DiffExplorerView {
 
         if snap.index_loading && !snap.has_index {
             return bare_pane().child(Self::empty_panel_message(
+                &palette,
                 "Loading diff...",
                 Some("The changed-file tree is still loading."),
             ));
@@ -1372,6 +1393,7 @@ impl DiffExplorerView {
         if let Some(error) = snap.index_error.as_ref() {
             if !snap.has_index {
                 return bare_pane().child(Self::empty_panel_message(
+                    &palette,
                     "Could not load diff",
                     Some(error.as_str()),
                 ));
@@ -1380,6 +1402,7 @@ impl DiffExplorerView {
 
         if !snap.has_index {
             return bare_pane().child(Self::empty_panel_message(
+                &palette,
                 "No diff loaded",
                 Some("Select a git-backed terminal row and open its diff explorer."),
             ));
@@ -1387,6 +1410,7 @@ impl DiffExplorerView {
 
         if snap.index_file_count == 0 {
             return bare_pane().child(Self::empty_panel_message(
+                &palette,
                 "Working tree clean",
                 Some("There are no file changes to render."),
             ));
@@ -1396,6 +1420,7 @@ impl DiffExplorerView {
 
         let Some(selected_path) = selected_path else {
             return bare_pane().child(Self::empty_panel_message(
+                &palette,
                 "Select a file",
                 Some("Pick a changed file from the left pane."),
             ));
@@ -1408,6 +1433,7 @@ impl DiffExplorerView {
                 .is_none_or(|meta| meta.relative_path != *selected_path)
         {
             return bare_pane().child(Self::empty_panel_message(
+                &palette,
                 "Loading file diff...",
                 Some("The selected file patch is still hydrating."),
             ));
@@ -1416,6 +1442,7 @@ impl DiffExplorerView {
         if let Some(error) = snap.file_error.as_ref() {
             if snap.file_meta.is_none() {
                 return bare_pane().child(Self::empty_panel_message(
+                    &palette,
                     "Could not load file diff",
                     Some(error.as_str()),
                 ));
@@ -1424,6 +1451,7 @@ impl DiffExplorerView {
 
         let Some(file_meta) = snap.file_meta.as_ref() else {
             return bare_pane().child(Self::empty_panel_message(
+                &palette,
                 "Select a file",
                 Some("Pick a changed file from the left pane."),
             ));
@@ -1443,8 +1471,9 @@ impl DiffExplorerView {
                             .text_color(rgb(palette.PATCH))
                             .child(file_meta.relative_path.display().to_string()),
                     )
-                    .child(Self::status_summary(file_meta))
+                    .child(Self::status_summary(&palette, file_meta))
                     .child(Self::empty_panel_message(
+                        &palette,
                         OVERSIZE_DIFF_MESSAGE,
                         Some("Open the file in another tool if you need the full patch."),
                     )),
@@ -1456,6 +1485,7 @@ impl DiffExplorerView {
         // Use cached lines (Rc clone = refcount bump on cache hit).
         let Some(cached) = self.line_cache.as_ref() else {
             return bare_pane().child(Self::empty_panel_message(
+                &palette,
                 "Select a file",
                 Some("Pick a changed file from the left pane."),
             ));
@@ -1486,7 +1516,7 @@ impl DiffExplorerView {
                     .text_color(rgb(palette.PATCH))
                     .child(file_meta.relative_path.display().to_string()),
             )
-            .child(Self::status_summary(file_meta));
+            .child(Self::status_summary(&palette, file_meta));
 
         if let Some(error) = snap.file_error.as_ref() {
             file_header = file_header.child(
@@ -1582,7 +1612,7 @@ impl DiffExplorerView {
             .diff_scrollbar_geometry()
             .map(|(thumb_y, thumb_height)| {
                 let is_dragging = self.diff_scrollbar_drag.is_some();
-                self.render_scrollbar(thumb_y, thumb_height, is_dragging, cx)
+                self.render_scrollbar(thumb_y, thumb_height, is_dragging, &palette, cx)
             });
 
         // Assemble: file header + (list area with scrollbar overlay).
@@ -1647,9 +1677,10 @@ impl DiffExplorerView {
         thumb_y: f32,
         thumb_height: f32,
         is_dragging: bool,
+        palette: &OrcaTheme,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
-        let palette = theme::current();
+        let hover_color = theme::with_alpha(palette.ORCA_BLUE, 0xA0);
         let thumb_color = if is_dragging {
             theme::with_alpha(palette.ORCA_BLUE, 0x60)
         } else {
@@ -1737,7 +1768,7 @@ impl DiffExplorerView {
                     .h(px(thumb_height))
                     .rounded(px(3.0))
                     .bg(rgba(thumb_color))
-                    .hover(|s| s.bg(rgba(theme::with_alpha(palette.ORCA_BLUE, 0xA0)))),
+                    .hover(move |s| s.bg(rgba(hover_color))),
             )
     }
 
@@ -1870,13 +1901,12 @@ impl DiffExplorerView {
     // Shared UI helpers
     // ------------------------------------------------------------------
 
-    fn status_summary(file: &ChangedFile) -> Div {
-        let palette = theme::current();
+    fn status_summary(palette: &OrcaTheme, file: &ChangedFile) -> Div {
         div()
             .flex()
             .items_center()
             .gap(px(8.0))
-            .child(Self::status_pill(file.status))
+            .child(Self::status_pill(palette, file.status))
             .child(
                 div()
                     .text_size(px(11.0))
@@ -1902,8 +1932,7 @@ impl DiffExplorerView {
             })
     }
 
-    fn status_pill(status: GitFileStatus) -> Div {
-        let palette = theme::current();
+    fn status_pill(palette: &OrcaTheme, status: GitFileStatus) -> Div {
         let (label, border, text) = match status {
             GitFileStatus::Added => ("A", palette.STATUS_GREEN, palette.STATUS_GREEN),
             GitFileStatus::Modified => ("M", palette.ORCA_BLUE, palette.ORCA_BLUE),
@@ -1930,8 +1959,7 @@ impl DiffExplorerView {
             .child(label)
     }
 
-    fn empty_panel_message(title: &str, body: Option<&str>) -> Div {
-        let palette = theme::current();
+    fn empty_panel_message(palette: &OrcaTheme, title: &str, body: Option<&str>) -> Div {
         let mut panel = div()
             .size_full()
             .p(px(16.0))
@@ -1974,6 +2002,7 @@ impl Render for DiffExplorerView {
                 .size_full()
                 .bg(rgb(palette.ABYSS))
                 .child(Self::empty_panel_message(
+                    &palette,
                     "Diff tab closed",
                     Some("Re-open the diff explorer from a git-backed terminal row."),
                 ));
@@ -2072,7 +2101,7 @@ impl Render for DiffExplorerView {
             .child(self.render_header(&self.scope_root, &snap, cx));
 
         // Action banner (between header and body).
-        if let Some(banner) = self.render_action_banner(&snap) {
+        if let Some(banner) = self.render_action_banner(&palette, &snap) {
             root = root.child(banner);
         }
 

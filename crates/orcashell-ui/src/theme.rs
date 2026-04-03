@@ -5,7 +5,6 @@
 //! `ResolvedTheme` global via [`active`].
 
 use gpui::{App, Global, WindowAppearance};
-use std::sync::{OnceLock, RwLock};
 
 use crate::settings::{AppSettings, ThemeId, ThemeMode};
 
@@ -78,7 +77,7 @@ impl OrcaTheme {
             WIN_CLOSE_HOVER: 0xE81123,
             WIN_CLOSE_HOVER_TEXT: 0xE8EAF0,
             TERMINAL_FOREGROUND: 0xD8DAE0,
-            TERMINAL_BACKGROUND: 0x12151C,
+            TERMINAL_BACKGROUND: 0x1C1F26,
             TERMINAL_CURSOR: 0x5E9BFF,
             TERMINAL_SELECTION: 0x5E9BFF,
         }
@@ -117,8 +116,8 @@ impl OrcaTheme {
 
     pub fn light() -> Self {
         Self {
-            ABYSS: 0xEEF2F7,
-            DEEP: 0xF7F9FC,
+            ABYSS: 0xF7F9FC,
+            DEEP: 0xEEF2F7,
             CURRENT: 0xE2E8F1,
             SURFACE: 0xD6DFEA,
             PATCH: 0x17202C,
@@ -148,8 +147,8 @@ impl OrcaTheme {
 
     pub fn sepia() -> Self {
         Self {
-            ABYSS: 0xF3EBDD,
-            DEEP: 0xFBF5EA,
+            ABYSS: 0xFBF5EA,
+            DEEP: 0xF3EBDD,
             CURRENT: 0xE8DCC5,
             SURFACE: 0xDCC9AD,
             PATCH: 0x2F241B,
@@ -204,19 +203,12 @@ pub struct SystemAppearance(pub WindowAppearance);
 
 impl Global for SystemAppearance {}
 
-static CURRENT_THEME: OnceLock<RwLock<OrcaTheme>> = OnceLock::new();
-
-fn current_theme_store() -> &'static RwLock<OrcaTheme> {
-    CURRENT_THEME.get_or_init(|| RwLock::new(OrcaTheme::default()))
-}
-
 pub fn register_theme(cx: &mut App) {
     let appearance = cx.window_appearance();
     cx.set_global(SystemAppearance(appearance));
 
     let settings = cx.global::<AppSettings>().clone();
     let resolved = resolve_theme(&settings, appearance);
-    *current_theme_store().write().expect("theme lock poisoned") = resolved.theme.clone();
     cx.set_global(resolved);
 }
 
@@ -233,20 +225,12 @@ pub fn sync_from_settings(cx: &mut App) -> bool {
         return false;
     }
 
-    *current_theme_store().write().expect("theme lock poisoned") = resolved.theme.clone();
     cx.set_global(resolved);
     true
 }
 
 pub fn active(cx: &App) -> OrcaTheme {
     cx.global::<ResolvedTheme>().theme.clone()
-}
-
-pub fn current() -> OrcaTheme {
-    current_theme_store()
-        .read()
-        .expect("theme lock poisoned")
-        .clone()
 }
 
 pub fn active_selection(cx: &App) -> ThemeSelection {

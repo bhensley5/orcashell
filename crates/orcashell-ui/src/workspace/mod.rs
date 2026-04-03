@@ -27,7 +27,9 @@ use layout::{LayoutNode, SplitDirection};
 use orcashell_session::event::TerminalColors;
 use orcashell_session::SemanticState;
 use orcashell_session::SessionEngine;
-use orcashell_store::{Store, StoredProject, StoredWorktree};
+use orcashell_store::{
+    ResumableAgentKind, Store, StoredAgentTerminal, StoredProject, StoredWorktree,
+};
 use orcashell_terminal_view::{
     ColorPalette, CursorShape, TerminalConfig, TerminalRuntimeEvent, TerminalView, TextInputState,
 };
@@ -102,6 +104,18 @@ pub struct ActionBanner {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceBannerKind {
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceBanner {
+    pub kind: WorkspaceBannerKind,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoveWorktreeConfirm {
     pub delete_branch: bool,
@@ -141,6 +155,46 @@ pub(crate) struct TerminalRuntimeState {
     last_local_input_at: Option<Instant>,
     /// Active notification tier, if any. Cleared on focus.
     pub(crate) notification_tier: Option<NotificationTier>,
+    resumable_agent: Option<ResumableAgentKind>,
+    pending_agent_detection: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumeInjectionTrigger {
+    PromptReady,
+    TimeoutFallback,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingResumeInjection {
+    terminal_id: String,
+    agent_kind: ResumableAgentKind,
+    command: &'static str,
+    resume_attempted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedResumeInjection {
+    terminal_id: String,
+    agent_kind: ResumableAgentKind,
+    command: &'static str,
+    trigger: ResumeInjectionTrigger,
+}
+
+#[derive(Debug, Default)]
+struct ProjectResumeRestorePlan {
+    rows_by_terminal_id: HashMap<String, StoredAgentTerminal>,
+    winning_terminal_ids: HashSet<String>,
+    suppressed_duplicates: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SemanticTransition {
+    changed: bool,
+    refresh_git_snapshot: bool,
+    entered_executing: bool,
+    left_executing: bool,
+    prompt_ready: bool,
 }
 
 const ACTIVITY_PULSE_WINDOW: Duration = Duration::from_millis(1000);
@@ -171,8 +225,10 @@ pub struct WorkspaceState {
     diff_tabs: HashMap<PathBuf, DiffTabState>,
     /// Active inline rename, if any.
     pub renaming: Option<RenameState>,
-    pub action_error: Option<String>,
+    pub workspace_banner: Option<WorkspaceBanner>,
     pending_focus_terminal_id: Option<String>,
+    pending_resume_injections: HashMap<String, PendingResumeInjection>,
+    pending_resume_timeout_tasks: HashMap<String, Task<()>>,
 }
 
 #[derive(Clone)]
@@ -229,8 +285,10 @@ impl WorkspaceState {
             active_auxiliary_tab_id: None,
             diff_tabs: HashMap::new(),
             renaming: None,
-            action_error: None,
+            workspace_banner: None,
             pending_focus_terminal_id: None,
+            pending_resume_injections: HashMap::new(),
+            pending_resume_timeout_tasks: HashMap::new(),
         }
     }
 
@@ -285,6 +343,16 @@ impl WorkspaceState {
     }
 
     pub fn destroy_session(&mut self, terminal_id: &str) {
+        self.clear_pending_resume_injection(terminal_id);
+        if let Some(store) = self.services.store.lock().as_mut() {
+            if let Err(err) = store.delete_agent_terminal(terminal_id) {
+                tracing::warn!(
+                    "Failed to delete resumable terminal {}: {}",
+                    terminal_id,
+                    err
+                );
+            }
+        }
         self.terminal_views.remove(terminal_id);
         self.terminal_runtime.remove(terminal_id);
         self.detach_terminal_scope(terminal_id);
@@ -316,12 +384,12 @@ impl WorkspaceState {
         id.and_then(move |id| self.project_mut(&id))
     }
 
-    pub fn action_error(&self) -> Option<&str> {
-        self.action_error.as_deref()
+    pub fn workspace_banner(&self) -> Option<&WorkspaceBanner> {
+        self.workspace_banner.as_ref()
     }
 
-    pub fn clear_action_error(&mut self, cx: &mut Context<Self>) {
-        if self.action_error.take().is_some() {
+    pub fn clear_workspace_banner(&mut self, cx: &mut Context<Self>) {
+        if self.workspace_banner.take().is_some() {
             cx.notify();
         }
     }
@@ -330,6 +398,27 @@ impl WorkspaceState {
         self.terminal_git_scopes
             .get(terminal_id)
             .and_then(|scope_root| self.git_scopes.get(scope_root))
+    }
+
+    fn set_workspace_banner(
+        &mut self,
+        kind: WorkspaceBannerKind,
+        message: impl Into<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.workspace_banner = Some(WorkspaceBanner {
+            kind,
+            message: message.into(),
+        });
+        cx.notify();
+    }
+
+    fn set_workspace_error(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
+        self.set_workspace_banner(WorkspaceBannerKind::Error, message, cx);
+    }
+
+    fn set_workspace_warning(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
+        self.set_workspace_banner(WorkspaceBannerKind::Warning, message, cx);
     }
 
     pub fn terminal_is_git_backed(&self, terminal_id: &str) -> bool {
@@ -376,7 +465,7 @@ impl WorkspaceState {
 
     pub fn open_diff_tab_for_terminal(&mut self, terminal_id: &str, cx: &mut Context<Self>) {
         let Some(snapshot) = self.terminal_git_snapshot(terminal_id).cloned() else {
-            self.set_action_error("No git scope is available for this terminal.", cx);
+            self.set_workspace_error("No git scope is available for this terminal.", cx);
             return;
         };
 
@@ -872,7 +961,7 @@ impl WorkspaceState {
         cx: &mut Context<Self>,
     ) {
         let Some(cwd) = self.terminal_working_directory(project_id, terminal_id, cx) else {
-            self.set_action_error(
+            self.set_workspace_error(
                 "Could not resolve a working directory for this terminal.",
                 cx,
             );
@@ -912,14 +1001,14 @@ impl WorkspaceState {
                                 if let Err(error) =
                                     self.persist_worktree(&project_id, &worktree, Some(terminal_id))
                                 {
-                                    self.set_action_error(
+                                    self.set_workspace_error(
                                         format!(
                                             "Worktree opened, but SQLite persistence failed: {error}"
                                         ),
                                         cx,
                                     );
                                 } else {
-                                    self.action_error = None;
+                                    self.workspace_banner = None;
                                     cx.notify();
                                 }
                             }
@@ -933,7 +1022,7 @@ impl WorkspaceState {
                         }
                     }
                     Err(message) => {
-                        self.set_action_error(message, cx);
+                        self.set_workspace_error(message, cx);
                     }
                 }
             }
@@ -949,10 +1038,10 @@ impl WorkspaceState {
                 }
                 match result {
                     Ok(()) => {
-                        self.set_action_error(original_error, cx);
+                        self.set_workspace_error(original_error, cx);
                     }
                     Err(message) => {
-                        self.set_action_error(
+                        self.set_workspace_error(
                             format!(
                                 "{original_error} Rollback also failed for branch {} at {}: {message}",
                                 worktree.branch_name,
@@ -1539,6 +1628,294 @@ impl WorkspaceState {
         Some(project.path.clone())
     }
 
+    fn project_id_for_terminal(&self, terminal_id: &str) -> Option<&str> {
+        self.projects
+            .iter()
+            .find(|project| project.layout.find_terminal_path(terminal_id).is_some())
+            .map(|project| project.id.as_str())
+    }
+
+    fn detect_resumable_agent(title: Option<&str>) -> Option<ResumableAgentKind> {
+        let first = title?.split_whitespace().next()?;
+        match first {
+            "codex" => Some(ResumableAgentKind::Codex),
+            "claude" => Some(ResumableAgentKind::ClaudeCode),
+            _ => None,
+        }
+    }
+
+    fn resume_command(agent_kind: ResumableAgentKind) -> &'static str {
+        match agent_kind {
+            ResumableAgentKind::Codex => "codex resume --last\n",
+            ResumableAgentKind::ClaudeCode => "claude --continue\n",
+        }
+    }
+
+    fn semantic_state_is_prompt_ready(state: SemanticState) -> bool {
+        matches!(
+            state,
+            SemanticState::Prompt | SemanticState::Input | SemanticState::CommandComplete { .. }
+        )
+    }
+
+    fn arm_resumable_agent(&mut self, terminal_id: &str, agent_kind: ResumableAgentKind, cx: &App) {
+        let Some(project_id) = self
+            .project_id_for_terminal(terminal_id)
+            .map(str::to_string)
+        else {
+            return;
+        };
+        let Some(runtime) = self.terminal_runtime.get_mut(terminal_id) else {
+            return;
+        };
+        if runtime.resumable_agent.is_some() {
+            runtime.pending_agent_detection = false;
+            return;
+        }
+        runtime.resumable_agent = Some(agent_kind);
+        runtime.pending_agent_detection = false;
+
+        let Some(cwd) = self.terminal_working_directory(&project_id, terminal_id, cx) else {
+            tracing::warn!(
+                "Failed to determine cwd for resumable terminal {} in project {}",
+                terminal_id,
+                project_id
+            );
+            return;
+        };
+
+        let row = StoredAgentTerminal {
+            terminal_id: terminal_id.to_string(),
+            project_id,
+            agent_kind,
+            cwd,
+            updated_at: String::new(),
+        };
+        if let Some(store) = self.services.store.lock().as_mut() {
+            if let Err(err) = store.upsert_agent_terminal(&row) {
+                tracing::warn!(
+                    "Failed to persist resumable terminal {}: {}",
+                    terminal_id,
+                    err
+                );
+            }
+        }
+    }
+
+    fn disarm_resumable_agent(&mut self, terminal_id: &str) {
+        self.clear_pending_resume_injection(terminal_id);
+        let Some(runtime) = self.terminal_runtime.get_mut(terminal_id) else {
+            return;
+        };
+        let had_agent = runtime.resumable_agent.take().is_some();
+        runtime.pending_agent_detection = false;
+        if had_agent {
+            if let Some(store) = self.services.store.lock().as_mut() {
+                if let Err(err) = store.delete_agent_terminal(terminal_id) {
+                    tracing::warn!(
+                        "Failed to clear resumable terminal {}: {}",
+                        terminal_id,
+                        err
+                    );
+                }
+            }
+        }
+    }
+
+    fn maybe_arm_resumable_agent_from_title(&mut self, terminal_id: &str, cx: &App) {
+        let candidate = self
+            .terminal_runtime
+            .get(terminal_id)
+            .filter(|runtime| {
+                runtime.semantic_state == SemanticState::Executing
+                    && runtime.pending_agent_detection
+                    && runtime.resumable_agent.is_none()
+            })
+            .and_then(|runtime| Self::detect_resumable_agent(runtime.live_title.as_deref()));
+        if let Some(agent_kind) = candidate {
+            self.arm_resumable_agent(terminal_id, agent_kind, cx);
+        }
+    }
+
+    fn clear_pending_resume_injection(&mut self, terminal_id: &str) {
+        self.pending_resume_injections.remove(terminal_id);
+        self.pending_resume_timeout_tasks.remove(terminal_id);
+    }
+
+    fn cancel_resume_injection(
+        &mut self,
+        terminal_id: &str,
+        warning: impl Into<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .pending_resume_injections
+            .get(terminal_id)
+            .is_some_and(|pending| !pending.resume_attempted)
+        {
+            self.clear_pending_resume_injection(terminal_id);
+            self.set_workspace_warning(warning, cx);
+        }
+    }
+
+    fn queue_resume_injection(
+        &mut self,
+        terminal_id: &str,
+        agent_kind: ResumableAgentKind,
+        cx: &mut Context<Self>,
+    ) {
+        let pending = PendingResumeInjection {
+            terminal_id: terminal_id.to_string(),
+            agent_kind,
+            command: Self::resume_command(agent_kind),
+            resume_attempted: false,
+        };
+        self.pending_resume_injections
+            .insert(terminal_id.to_string(), pending);
+
+        let terminal_id = terminal_id.to_string();
+        let timeout_terminal_id = terminal_id.clone();
+        let task = cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            Timer::after(Duration::from_secs(5)).await;
+            let _ = this.update(cx, |workspace, cx| {
+                workspace.attempt_resume_injection(
+                    &timeout_terminal_id,
+                    ResumeInjectionTrigger::TimeoutFallback,
+                    cx,
+                );
+            });
+        });
+        self.pending_resume_timeout_tasks.insert(terminal_id, task);
+    }
+
+    fn should_queue_resume_injection(
+        row: &StoredAgentTerminal,
+        restored_cwd: &Path,
+        winning_terminal_ids: &HashSet<String>,
+    ) -> bool {
+        winning_terminal_ids.contains(&row.terminal_id) && restored_cwd == row.cwd
+    }
+
+    fn prepare_resume_injection_attempt(
+        &mut self,
+        terminal_id: &str,
+        trigger: ResumeInjectionTrigger,
+    ) -> Option<PreparedResumeInjection> {
+        let pending = self.pending_resume_injections.get_mut(terminal_id)?;
+        if pending.resume_attempted {
+            return None;
+        }
+        pending.resume_attempted = true;
+        Some(PreparedResumeInjection {
+            terminal_id: pending.terminal_id.clone(),
+            agent_kind: pending.agent_kind,
+            command: pending.command,
+            trigger,
+        })
+    }
+
+    fn finish_resume_injection_attempt(
+        &mut self,
+        prepared: PreparedResumeInjection,
+        result: std::io::Result<()>,
+        cx: &mut Context<Self>,
+    ) {
+        self.clear_pending_resume_injection(&prepared.terminal_id);
+        match result {
+            Ok(()) => {
+                self.mark_resume_injection_succeeded(&prepared);
+                if prepared.trigger == ResumeInjectionTrigger::TimeoutFallback {
+                    self.set_workspace_warning(
+                        "Agent resume used the timeout fallback before shell prompt markers arrived.",
+                        cx,
+                    );
+                }
+            }
+            Err(err) => {
+                self.set_workspace_error(
+                    format!(
+                        "Failed to inject agent resume command for terminal {}: {}",
+                        prepared.terminal_id, err
+                    ),
+                    cx,
+                );
+            }
+        }
+    }
+
+    fn attempt_resume_injection(
+        &mut self,
+        terminal_id: &str,
+        trigger: ResumeInjectionTrigger,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(prepared) = self.prepare_resume_injection_attempt(terminal_id, trigger) else {
+            return;
+        };
+
+        let result = self
+            .terminal_view(&prepared.terminal_id)
+            .map(|view| {
+                view.read(cx)
+                    .engine()
+                    .try_write(prepared.command.as_bytes())
+            })
+            .unwrap_or_else(|| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "terminal session is no longer available",
+                ))
+            });
+
+        self.finish_resume_injection_attempt(prepared, result, cx);
+    }
+
+    fn mark_resume_injection_succeeded(&mut self, prepared: &PreparedResumeInjection) {
+        if let Some(runtime) = self.terminal_runtime.get_mut(&prepared.terminal_id) {
+            runtime.resumable_agent = Some(prepared.agent_kind);
+            runtime.pending_agent_detection = false;
+        }
+    }
+
+    fn build_project_resume_restore_plan(&self, project_id: &str) -> ProjectResumeRestorePlan {
+        let store_guard = self.services.store.lock();
+        let Some(store) = store_guard.as_ref() else {
+            return ProjectResumeRestorePlan::default();
+        };
+        let rows = match store.load_agent_terminals_for_project(project_id) {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to load resumable terminals for project {}: {}",
+                    project_id,
+                    err
+                );
+                return ProjectResumeRestorePlan::default();
+            }
+        };
+
+        let mut rows_by_terminal_id = HashMap::new();
+        let mut winning_terminal_ids = HashSet::new();
+        let mut seen_groups = HashSet::new();
+        let mut suppressed_duplicates = 0;
+
+        for row in rows {
+            let group_key = (row.agent_kind, row.cwd.clone());
+            if seen_groups.insert(group_key) {
+                winning_terminal_ids.insert(row.terminal_id.clone());
+            } else {
+                suppressed_duplicates += 1;
+            }
+            rows_by_terminal_id.insert(row.terminal_id.clone(), row);
+        }
+
+        ProjectResumeRestorePlan {
+            rows_by_terminal_id,
+            winning_terminal_ids,
+            suppressed_duplicates,
+        }
+    }
+
     fn restored_terminal_cwd(project_path: &Path, working_directory: Option<&PathBuf>) -> PathBuf {
         working_directory
             .filter(|path| path.exists())
@@ -1596,11 +1973,6 @@ impl WorkspaceState {
         });
         cx.notify();
         Ok(new_terminal_id)
-    }
-
-    fn set_action_error(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
-        self.action_error = Some(message.into());
-        cx.notify();
     }
 
     /// Build terminal configuration from settings + theme tokens.
@@ -1715,6 +2087,8 @@ impl WorkspaceState {
                 last_activity_at: None,
                 last_local_input_at: None,
                 notification_tier: None,
+                resumable_agent: None,
+                pending_agent_detection: false,
             },
         );
         cx.subscribe(&view, |this, _view, event: &TerminalRuntimeEvent, cx| {
@@ -1743,13 +2117,25 @@ impl WorkspaceState {
         &mut self,
         terminal_id: &str,
         state: SemanticState,
-    ) -> (bool, bool) {
+    ) -> SemanticTransition {
         let Some(runtime) = self.terminal_runtime.get_mut(terminal_id) else {
-            return (false, false);
+            return SemanticTransition {
+                changed: false,
+                refresh_git_snapshot: false,
+                entered_executing: false,
+                left_executing: false,
+                prompt_ready: false,
+            };
         };
 
         if runtime.semantic_state == state {
-            return (false, false);
+            return SemanticTransition {
+                changed: false,
+                refresh_git_snapshot: false,
+                entered_executing: false,
+                left_executing: false,
+                prompt_ready: false,
+            };
         }
 
         let previous_state = runtime.semantic_state;
@@ -1761,11 +2147,22 @@ impl WorkspaceState {
         if state != SemanticState::Executing {
             runtime.last_local_input_at = None;
         }
+        let entered_executing =
+            previous_state != SemanticState::Executing && state == SemanticState::Executing;
+        let left_executing =
+            previous_state == SemanticState::Executing && state != SemanticState::Executing;
+        if entered_executing {
+            runtime.pending_agent_detection = true;
+            runtime.resumable_agent = None;
+        }
 
-        (
-            true,
-            previous_state == SemanticState::Executing && state != SemanticState::Executing,
-        )
+        SemanticTransition {
+            changed: true,
+            refresh_git_snapshot: left_executing,
+            entered_executing,
+            left_executing,
+            prompt_ready: Self::semantic_state_is_prompt_ready(state),
+        }
     }
 
     fn handle_terminal_runtime_event(
@@ -1818,12 +2215,23 @@ impl WorkspaceState {
                     }
                 }),
             TerminalRuntimeEvent::SemanticStateChanged { terminal_id, state } => {
-                let (changed, refresh_git_snapshot) =
-                    self.apply_semantic_state_change(terminal_id, *state);
-                if refresh_git_snapshot {
+                let transition = self.apply_semantic_state_change(terminal_id, *state);
+                if transition.refresh_git_snapshot {
                     self.refresh_terminal_git_snapshot(terminal_id, cx);
                 }
-                changed
+                if transition.entered_executing {
+                    self.maybe_arm_resumable_agent_from_title(terminal_id, cx);
+                }
+                if transition.left_executing {
+                    self.disarm_resumable_agent(terminal_id);
+                } else if transition.prompt_ready {
+                    self.attempt_resume_injection(
+                        terminal_id,
+                        ResumeInjectionTrigger::PromptReady,
+                        cx,
+                    );
+                }
+                transition.changed
             }
             // Notification/Bell: skip if disabled or terminal is already focused.
             TerminalRuntimeEvent::Notification { terminal_id, .. }
@@ -1868,6 +2276,16 @@ impl WorkspaceState {
                     }
                 }),
         };
+
+        if let TerminalRuntimeEvent::LocalInput { terminal_id } = event {
+            self.cancel_resume_injection(
+                terminal_id,
+                "Agent resume was canceled because input arrived before restore could safely attach.",
+                cx,
+            );
+        } else if let TerminalRuntimeEvent::TitleChanged { terminal_id, .. } = event {
+            self.maybe_arm_resumable_agent_from_title(terminal_id, cx);
+        }
 
         if changed {
             cx.notify();
@@ -2623,6 +3041,15 @@ impl WorkspaceState {
         for tid in &ids_to_destroy {
             self.destroy_session(tid);
         }
+        if let Some(store) = self.services.store.lock().as_mut() {
+            if let Err(err) = store.delete_agent_terminals_for_project(project_id) {
+                tracing::warn!(
+                    "Failed to clear resumable terminals for removed project {}: {}",
+                    project_id,
+                    err
+                );
+            }
+        }
 
         // If that was the last project, create a fresh one at cwd
         if self.projects.is_empty() {
@@ -3077,9 +3504,21 @@ impl WorkspaceState {
             // regardless of when the path was originally saved (pre- or post-CP1).
             project.path = Self::normalize_project_path(&project.path);
             let project_path = project.path.clone();
+            let resume_plan = if cx.global::<AppSettings>().resume_agent_sessions {
+                self.build_project_resume_restore_plan(&project.id)
+            } else {
+                ProjectResumeRestorePlan::default()
+            };
 
             // Walk layout tree and spawn sessions for each terminal
-            self.restore_layout_terminals(&mut project.layout, &project_path, cx);
+            self.restore_layout_terminals(&mut project.layout, &project_path, &resume_plan, cx);
+
+            if resume_plan.suppressed_duplicates > 0 {
+                self.set_workspace_warning(
+                    "Suppressed duplicate same-directory agent resume and restored those terminals as plain shells.",
+                    cx,
+                );
+            }
 
             project.layout.normalize();
             Self::enforce_root_tabs(&mut project);
@@ -3114,6 +3553,7 @@ impl WorkspaceState {
         &mut self,
         node: &mut LayoutNode,
         project_path: &Path,
+        resume_plan: &ProjectResumeRestorePlan,
         cx: &mut Context<Self>,
     ) {
         match node {
@@ -3174,6 +3614,26 @@ impl WorkspaceState {
                         self.services
                             .git
                             .request_snapshot(&cwd, terminal_id.as_deref());
+                        if let Some(row) = resume_plan
+                            .rows_by_terminal_id
+                            .get(terminal_id.as_deref().unwrap_or_default())
+                        {
+                            if Self::should_queue_resume_injection(
+                                row,
+                                &cwd,
+                                &resume_plan.winning_terminal_ids,
+                            ) {
+                                self.queue_resume_injection(&row.terminal_id, row.agent_kind, cx);
+                            } else if resume_plan.winning_terminal_ids.contains(&row.terminal_id) {
+                                self.set_workspace_warning(
+                                    format!(
+                                        "Skipped agent resume for {} because its saved working directory could not be restored.",
+                                        row.terminal_id
+                                    ),
+                                    cx,
+                                );
+                            }
+                        }
                     }
                     Err(e) => {
                         tracing::error!("Failed to restore terminal session: {e}");
@@ -3182,7 +3642,7 @@ impl WorkspaceState {
             }
             LayoutNode::Split { children, .. } | LayoutNode::Tabs { children, .. } => {
                 for child in children {
-                    self.restore_layout_terminals(child, project_path, cx);
+                    self.restore_layout_terminals(child, project_path, resume_plan, cx);
                 }
             }
         }
@@ -3299,12 +3759,14 @@ impl Default for WorkspaceState {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::time::Instant;
 
     use orcashell_daemon_core::git_coordinator::{GitActionKind, GitRemoteKind};
+    use parking_lot::Mutex;
 
     // Import only the types tests actually need. Avoid `use super::*` which
     // pulls in GPUI types and blows the gpui_macros proc-macro stack budget
@@ -3312,13 +3774,15 @@ mod tests {
     use super::{
         classify_notification, AuxiliaryTabKind, AuxiliaryTabState, DiffTabState, FocusTarget,
         GitEvent, GitSnapshotSummary, LayoutNode, NotificationTier, ProjectData,
-        TerminalRuntimeState, WorkspaceServices, WorkspaceState, SETTINGS_TAB_ID,
+        ResumableAgentKind, ResumeInjectionTrigger, TerminalRuntimeState, WorkspaceServices,
+        WorkspaceState, SETTINGS_TAB_ID,
     };
     use orcashell_git::{
         ChangedFile, DiffDocument, DiffSectionKind, DiffSelectionKey, FileDiffDocument,
         GitFileStatus, GitTrackingStatus,
     };
     use orcashell_session::semantic_zone::SemanticState;
+    use orcashell_store::Store;
     use uuid::Uuid;
 
     fn term(id: &str) -> LayoutNode {
@@ -3354,7 +3818,17 @@ mod tests {
             last_activity_at: None,
             last_local_input_at: None,
             notification_tier,
+            resumable_agent: None,
+            pending_agent_detection: false,
         }
+    }
+
+    fn workspace_with_store() -> WorkspaceState {
+        let services = WorkspaceServices {
+            git: orcashell_daemon_core::git_coordinator::GitCoordinator::new(),
+            store: Arc::new(Mutex::new(Some(Store::open_in_memory().unwrap()))),
+        };
+        WorkspaceState::new_with_services(services)
     }
 
     fn snapshot(scope_root: &str) -> GitSnapshotSummary {
@@ -3969,15 +4443,17 @@ mod tests {
                 last_activity_at: None,
                 last_local_input_at: Some(Instant::now()),
                 notification_tier: None,
+                resumable_agent: None,
+                pending_agent_detection: false,
             },
         );
 
-        let (changed, refresh_git_snapshot) = ws.apply_semantic_state_change(
+        let transition = ws.apply_semantic_state_change(
             "t1",
             SemanticState::CommandComplete { exit_code: Some(0) },
         );
-        assert!(changed);
-        assert!(refresh_git_snapshot);
+        assert!(transition.changed);
+        assert!(transition.refresh_git_snapshot);
 
         ws.sync_terminal_git_scope("t1", Some(repo.clone()));
 
@@ -4069,6 +4545,245 @@ mod tests {
             WorkspaceState::restored_terminal_cwd(&project_path, Some(&missing)),
             project_path
         );
+    }
+
+    #[test]
+    fn detect_resumable_agent_matches_supported_commands_only() {
+        assert_eq!(
+            WorkspaceState::detect_resumable_agent(Some("codex --last")),
+            Some(ResumableAgentKind::Codex)
+        );
+        assert_eq!(
+            WorkspaceState::detect_resumable_agent(Some("   claude --continue")),
+            Some(ResumableAgentKind::ClaudeCode)
+        );
+        assert_eq!(
+            WorkspaceState::detect_resumable_agent(Some("echo codex")),
+            None
+        );
+        assert_eq!(
+            WorkspaceState::detect_resumable_agent(Some("env FOO=1 codex")),
+            None
+        );
+    }
+
+    #[test]
+    fn entering_executing_enables_pending_agent_detection() {
+        let mut ws = WorkspaceState::new();
+        ws.terminal_runtime.insert("t1".into(), runtime_state(None));
+
+        let transition = ws.apply_semantic_state_change("t1", SemanticState::Executing);
+
+        assert!(transition.changed);
+        assert!(transition.entered_executing);
+        assert!(
+            ws.terminal_runtime
+                .get("t1")
+                .unwrap()
+                .pending_agent_detection
+        );
+    }
+
+    #[test]
+    fn later_title_changes_do_not_retarget_armed_agent() {
+        let mut ws = WorkspaceState::new();
+        let mut runtime = runtime_state(None);
+        runtime.semantic_state = SemanticState::Executing;
+        runtime.pending_agent_detection = true;
+        runtime.live_title = Some("codex --last".into());
+        ws.terminal_runtime.insert("t1".into(), runtime);
+
+        assert_eq!(
+            WorkspaceState::detect_resumable_agent(ws.terminal_runtime["t1"].live_title.as_deref()),
+            Some(ResumableAgentKind::Codex)
+        );
+
+        {
+            let runtime = ws.terminal_runtime.get_mut("t1").unwrap();
+            runtime.resumable_agent = Some(ResumableAgentKind::Codex);
+            runtime.pending_agent_detection = false;
+            runtime.live_title = Some("claude --continue".into());
+        }
+
+        assert_eq!(
+            ws.terminal_runtime["t1"].resumable_agent,
+            Some(ResumableAgentKind::Codex)
+        );
+    }
+
+    #[test]
+    fn build_project_resume_restore_plan_suppresses_duplicate_same_cwd_rows() {
+        let mut ws = workspace_with_store();
+        ws.projects.push(project(
+            "proj-1",
+            tabs(vec![term("term-a"), term("term-b")], 0),
+        ));
+
+        {
+            let mut store = ws.services.store.lock();
+            let store = store.as_mut().unwrap();
+            store
+                .upsert_agent_terminal(&orcashell_store::StoredAgentTerminal {
+                    terminal_id: "term-a".into(),
+                    project_id: "proj-1".into(),
+                    agent_kind: ResumableAgentKind::Codex,
+                    cwd: PathBuf::from("/repo/wt"),
+                    updated_at: String::new(),
+                })
+                .unwrap();
+            store
+                .upsert_agent_terminal(&orcashell_store::StoredAgentTerminal {
+                    terminal_id: "term-b".into(),
+                    project_id: "proj-1".into(),
+                    agent_kind: ResumableAgentKind::Codex,
+                    cwd: PathBuf::from("/repo/wt"),
+                    updated_at: String::new(),
+                })
+                .unwrap();
+            store
+                .upsert_agent_terminal(&orcashell_store::StoredAgentTerminal {
+                    terminal_id: "term-c".into(),
+                    project_id: "proj-1".into(),
+                    agent_kind: ResumableAgentKind::ClaudeCode,
+                    cwd: PathBuf::from("/repo/wt-2"),
+                    updated_at: String::new(),
+                })
+                .unwrap();
+            store.delete_agent_terminal("term-a").unwrap();
+            store
+                .upsert_agent_terminal(&orcashell_store::StoredAgentTerminal {
+                    terminal_id: "term-a".into(),
+                    project_id: "proj-1".into(),
+                    agent_kind: ResumableAgentKind::Codex,
+                    cwd: PathBuf::from("/repo/wt"),
+                    updated_at: String::new(),
+                })
+                .unwrap();
+        }
+
+        let plan = ws.build_project_resume_restore_plan("proj-1");
+
+        assert_eq!(plan.rows_by_terminal_id.len(), 3);
+        assert!(plan.winning_terminal_ids.contains("term-c"));
+        assert_ne!(
+            plan.winning_terminal_ids.contains("term-a"),
+            plan.winning_terminal_ids.contains("term-b")
+        );
+        assert_eq!(plan.suppressed_duplicates, 1);
+    }
+
+    #[test]
+    fn prepare_resume_injection_marks_attempted_before_write() {
+        let mut ws = WorkspaceState::new();
+        ws.pending_resume_injections.insert(
+            "term-1".into(),
+            super::PendingResumeInjection {
+                terminal_id: "term-1".into(),
+                agent_kind: ResumableAgentKind::Codex,
+                command: WorkspaceState::resume_command(ResumableAgentKind::Codex),
+                resume_attempted: false,
+            },
+        );
+
+        let prepared =
+            ws.prepare_resume_injection_attempt("term-1", ResumeInjectionTrigger::PromptReady);
+        assert!(prepared.is_some());
+        assert!(
+            ws.pending_resume_injections["term-1"].resume_attempted,
+            "resume attempt should be marked before the write occurs"
+        );
+        assert!(ws
+            .prepare_resume_injection_attempt("term-1", ResumeInjectionTrigger::TimeoutFallback)
+            .is_none());
+    }
+
+    #[test]
+    fn disarm_resumable_agent_clears_persisted_row() {
+        let mut ws = workspace_with_store();
+        ws.projects
+            .push(project("proj-1", tabs(vec![term("term-1")], 0)));
+        let mut runtime = runtime_state(None);
+        runtime.semantic_state = SemanticState::Executing;
+        runtime.resumable_agent = Some(ResumableAgentKind::Codex);
+        runtime.pending_agent_detection = false;
+        ws.terminal_runtime.insert("term-1".into(), runtime);
+
+        {
+            let mut store = ws.services.store.lock();
+            store
+                .as_mut()
+                .unwrap()
+                .upsert_agent_terminal(&orcashell_store::StoredAgentTerminal {
+                    terminal_id: "term-1".into(),
+                    project_id: "proj-1".into(),
+                    agent_kind: ResumableAgentKind::Codex,
+                    cwd: PathBuf::from("/repo/wt"),
+                    updated_at: String::new(),
+                })
+                .unwrap();
+        }
+
+        ws.disarm_resumable_agent("term-1");
+
+        assert!(ws
+            .services
+            .store
+            .lock()
+            .as_ref()
+            .unwrap()
+            .load_agent_terminals_for_project("proj-1")
+            .unwrap()
+            .is_empty());
+        assert!(ws.terminal_runtime["term-1"].resumable_agent.is_none());
+    }
+
+    #[test]
+    fn should_queue_resume_injection_requires_winner_and_matching_cwd() {
+        let row = orcashell_store::StoredAgentTerminal {
+            terminal_id: "term-1".into(),
+            project_id: "proj-1".into(),
+            agent_kind: ResumableAgentKind::Codex,
+            cwd: PathBuf::from("/repo/wt"),
+            updated_at: String::new(),
+        };
+        let winners = HashSet::from([String::from("term-1")]);
+
+        assert!(WorkspaceState::should_queue_resume_injection(
+            &row,
+            PathBuf::from("/repo/wt").as_path(),
+            &winners,
+        ));
+        assert!(!WorkspaceState::should_queue_resume_injection(
+            &row,
+            PathBuf::from("/repo/project-root").as_path(),
+            &winners,
+        ));
+        assert!(!WorkspaceState::should_queue_resume_injection(
+            &row,
+            PathBuf::from("/repo/wt").as_path(),
+            &HashSet::new(),
+        ));
+    }
+
+    #[test]
+    fn successful_resume_injection_marks_terminal_for_cleanup() {
+        let mut ws = WorkspaceState::new();
+        ws.terminal_runtime
+            .insert("term-1".into(), runtime_state(None));
+        let prepared = super::PreparedResumeInjection {
+            terminal_id: "term-1".into(),
+            agent_kind: ResumableAgentKind::ClaudeCode,
+            command: WorkspaceState::resume_command(ResumableAgentKind::ClaudeCode),
+            trigger: ResumeInjectionTrigger::PromptReady,
+        };
+
+        ws.mark_resume_injection_succeeded(&prepared);
+
+        assert_eq!(
+            ws.terminal_runtime["term-1"].resumable_agent,
+            Some(ResumableAgentKind::ClaudeCode)
+        );
+        assert!(!ws.terminal_runtime["term-1"].pending_agent_detection);
     }
 
     // ── CP2: Action state tests ──────────────────────────────────────

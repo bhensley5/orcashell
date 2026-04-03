@@ -245,9 +245,12 @@ fn apply_windows_drag(bar: Div, cx: &mut Context<WindowTabBar>) -> Div {
 /// Append minimize / maximize-or-restore / close buttons to a bar div.
 /// Each button is 46px wide x 32px tall (Windows standard caption button size).
 #[cfg(target_os = "windows")]
-fn append_window_controls(bar: Div, window: &mut Window) -> Div {
-    let palette = theme::current();
+fn append_window_controls(bar: Div, window: &mut Window, palette: &theme::OrcaTheme) -> Div {
     let is_maximized = window.is_maximized();
+    let surface = palette.SURFACE;
+    let fog = palette.FOG;
+    let close_hover = palette.WIN_CLOSE_HOVER;
+    let close_hover_text = palette.WIN_CLOSE_HOVER_TEXT;
 
     bar
         // Separator before window controls
@@ -270,8 +273,8 @@ fn append_window_controls(bar: Div, window: &mut Window) -> Div {
                 .flex_shrink_0()
                 .cursor_pointer()
                 .text_size(px(18.0))
-                .text_color(rgb(palette.FOG))
-                .hover(|s| s.bg(rgb(palette.SURFACE)))
+                .text_color(rgb(fog))
+                .hover(move |s| s.bg(rgb(surface)))
                 .child(div().mt(px(-4.0)).child("\u{2500}")) // ─
                 .occlude()
                 .window_control_area(WindowControlArea::Min),
@@ -288,8 +291,8 @@ fn append_window_controls(bar: Div, window: &mut Window) -> Div {
                 .flex_shrink_0()
                 .cursor_pointer()
                 .text_size(px(14.0))
-                .text_color(rgb(palette.FOG))
-                .hover(|s| s.bg(rgb(palette.SURFACE)))
+                .text_color(rgb(fog))
+                .hover(move |s| s.bg(rgb(surface)))
                 .child(
                     div()
                         .mt(px(-2.0))
@@ -310,11 +313,8 @@ fn append_window_controls(bar: Div, window: &mut Window) -> Div {
                 .flex_shrink_0()
                 .cursor_pointer()
                 .text_size(px(12.0))
-                .text_color(rgb(palette.FOG))
-                .hover(|s| {
-                    s.bg(rgb(palette.WIN_CLOSE_HOVER))
-                        .text_color(rgb(palette.WIN_CLOSE_HOVER_TEXT))
-                })
+                .text_color(rgb(fog))
+                .hover(move |s| s.bg(rgb(close_hover)).text_color(rgb(close_hover_text)))
                 .child("\u{2715}") // ✕
                 .occlude()
                 .window_control_area(WindowControlArea::Close),
@@ -426,7 +426,7 @@ impl Render for WindowTabBar {
             {
                 empty_bar = apply_windows_drag(empty_bar, cx);
                 empty_bar = empty_bar.child(div().flex_1()); // Spacer pushes controls right
-                empty_bar = append_window_controls(empty_bar, window);
+                empty_bar = append_window_controls(empty_bar, window, &palette);
             }
 
             return empty_bar;
@@ -939,7 +939,7 @@ impl Render for WindowTabBar {
         // Windows: append minimize / maximize-or-restore / close controls
         #[cfg(target_os = "windows")]
         {
-            bar = append_window_controls(bar, window);
+            bar = append_window_controls(bar, window, &palette);
         }
 
         bar

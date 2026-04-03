@@ -3966,7 +3966,7 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "orcashell"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "dirs 6.0.0",
@@ -3986,7 +3986,7 @@ dependencies = [
 
 [[package]]
 name = "orcashell-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -3997,7 +3997,7 @@ dependencies = [
 
 [[package]]
 name = "orcashell-daemon-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-channel 2.5.0",
@@ -4017,7 +4017,7 @@ dependencies = [
 
 [[package]]
 name = "orcashell-git"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "git2",
@@ -4029,7 +4029,7 @@ dependencies = [
 
 [[package]]
 name = "orcashell-ipc"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "tempfile",
  "tracing",
@@ -4038,7 +4038,7 @@ dependencies = [
 
 [[package]]
 name = "orcashell-platform"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "dirs 6.0.0",
  "tempfile",
@@ -4047,7 +4047,7 @@ dependencies = [
 
 [[package]]
 name = "orcashell-protocol"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -4055,7 +4055,7 @@ dependencies = [
 
 [[package]]
 name = "orcashell-session"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -4071,7 +4071,7 @@ dependencies = [
 
 [[package]]
 name = "orcashell-store"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "dirs 6.0.0",
@@ -4085,7 +4085,7 @@ dependencies = [
 
 [[package]]
 name = "orcashell-syntax"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "orcashell-store",
  "syntect",
@@ -4093,7 +4093,7 @@ dependencies = [
 
 [[package]]
 name = "orcashell-terminal-view"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -4108,7 +4108,7 @@ dependencies = [
 
 [[package]]
 name = "orcashell-ui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "gpui",

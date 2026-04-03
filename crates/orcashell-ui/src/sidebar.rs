@@ -8,7 +8,7 @@ use gpui::*;
 use crate::app_view::ContextMenuRequest;
 use crate::context_menu::ContextMenuItem;
 use crate::settings::{AppSettings, ThemeId};
-use crate::theme;
+use crate::theme::{self, OrcaTheme};
 use crate::workspace::layout::LayoutNode;
 use crate::workspace::{RenameLocation, WorkspaceState};
 
@@ -51,21 +51,21 @@ pub struct SidebarTerminalDragPayload {
 /// Ghost view for sidebar drags.
 struct SidebarDragView {
     label: String,
+    palette: OrcaTheme,
 }
 
 impl Render for SidebarDragView {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        let palette = theme::current();
         div()
             .px(px(10.0))
             .py(px(4.0))
-            .bg(rgb(palette.CURRENT))
+            .bg(rgb(self.palette.CURRENT))
             .border_1()
-            .border_color(rgb(palette.ORCA_BLUE))
+            .border_color(rgb(self.palette.ORCA_BLUE))
             .rounded(px(4.0))
             .shadow_md()
             .text_size(px(12.0))
-            .text_color(rgb(palette.BONE))
+            .text_color(rgb(self.palette.BONE))
             .child(self.label.clone())
     }
 }
@@ -323,7 +323,8 @@ impl Sidebar {
                     },
                     move |_payload, _position, _window, cx| {
                         let label = drag_name.clone();
-                        cx.new(|_| SidebarDragView { label })
+                        let palette = theme::active(cx);
+                        cx.new(|_| SidebarDragView { label, palette })
                     },
                 )
                 .drag_over::<ProjectDragPayload>(move |style, _, _, _| {
@@ -749,7 +750,8 @@ impl Sidebar {
                             },
                             move |_payload, _position, _window, cx| {
                                 let label = drag_label.clone();
-                                cx.new(|_| SidebarDragView { label })
+                                let palette = theme::active(cx);
+                                cx.new(|_| SidebarDragView { label, palette })
                             },
                         )
                         .drag_over::<SidebarTerminalDragPayload>(move |style, _, _, _| {
@@ -805,9 +807,10 @@ impl Sidebar {
         thumb_y: f32,
         thumb_height: f32,
         is_dragging: bool,
+        palette: &OrcaTheme,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
-        let palette = theme::current();
+        let hover_color = theme::with_alpha(palette.ORCA_BLUE, 0xA0);
         let thumb_color = if is_dragging {
             theme::with_alpha(palette.ORCA_BLUE, 0x40)
         } else {
@@ -885,7 +888,7 @@ impl Sidebar {
                     .h(px(thumb_height))
                     .rounded(px(3.0))
                     .bg(rgba(thumb_color))
-                    .hover(|s| s.bg(rgba(theme::with_alpha(palette.ORCA_BLUE, 0xA0)))),
+                    .hover(move |s| s.bg(rgba(hover_color))),
             )
     }
 
@@ -914,7 +917,8 @@ impl Render for Sidebar {
         let palette = theme::active(cx);
         let selection = theme::active_selection(cx);
         let (logo_asset, logo_opacity) = match selection.resolved_id {
-            ThemeId::Light | ThemeId::Sepia => ("images/OrcaShellLogoTrimmedBlack.png", 1.0),
+            ThemeId::Light => ("images/OrcaShellLogoTrimmedBlue.png", 1.0),
+            ThemeId::Sepia => ("images/OrcaShellLogoTrimmedBrown.png", 1.0),
             ThemeId::Dark | ThemeId::Black => ("images/OrcaShellLogoTrimmed.png", 0.75),
         };
         if !self.visible {
@@ -1086,7 +1090,7 @@ impl Render for Sidebar {
                     .child({
                         let scrollbar = self.scrollbar_geometry().map(|(thumb_y, thumb_height)| {
                             let is_dragging = self.scrollbar_drag.is_some();
-                            self.render_scrollbar(thumb_y, thumb_height, is_dragging, cx)
+                            self.render_scrollbar(thumb_y, thumb_height, is_dragging, &palette, cx)
                         });
                         // Notify sidebar on scroll so the scrollbar thumb re-renders
                         let project_list = self.render_project_list(cx).on_scroll_wheel(

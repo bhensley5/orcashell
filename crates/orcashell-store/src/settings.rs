@@ -167,6 +167,10 @@ pub struct AppSettings {
     /// Default: ["approv", "permission", "edit"]
     #[serde(default = "default_notification_urgent_patterns")]
     pub notification_urgent_patterns: Vec<String>,
+
+    /// Whether agent session auto-resume runs during workspace restore. Default: true
+    #[serde(default = "default_true")]
+    pub resume_agent_sessions: bool,
 }
 
 impl Default for AppSettings {
@@ -187,6 +191,7 @@ impl Default for AppSettings {
             sidebar_width: default_sidebar_width(),
             agent_notifications: default_true(),
             notification_urgent_patterns: default_notification_urgent_patterns(),
+            resume_agent_sessions: default_true(),
         }
     }
 }
@@ -223,6 +228,8 @@ struct AppSettingsSerde {
     agent_notifications: bool,
     #[serde(default = "default_notification_urgent_patterns")]
     notification_urgent_patterns: Vec<String>,
+    #[serde(default = "default_true")]
+    resume_agent_sessions: bool,
     #[serde(default)]
     theme: Option<String>,
 }
@@ -263,6 +270,7 @@ impl From<AppSettingsSerde> for AppSettings {
             sidebar_width: raw.sidebar_width,
             agent_notifications: raw.agent_notifications,
             notification_urgent_patterns: raw.notification_urgent_patterns,
+            resume_agent_sessions: raw.resume_agent_sessions,
         }
     }
 }
@@ -343,6 +351,7 @@ mod tests {
         assert!(s.sidebar_visible);
         assert!(s.activity_pulse);
         assert!(s.agent_notifications);
+        assert!(s.resume_agent_sessions);
         assert_eq!(
             s.notification_urgent_patterns,
             vec![
@@ -411,6 +420,7 @@ mod tests {
         original.sidebar_visible = false;
         original.activity_pulse = false;
         original.sidebar_width = 300.0;
+        original.resume_agent_sessions = false;
 
         original.save_to(&path).unwrap();
         let loaded = AppSettings::load_from(&path);
@@ -427,6 +437,7 @@ mod tests {
         assert_eq!(loaded.system_dark_theme, ThemeId::Dark);
         assert!(!loaded.sidebar_visible);
         assert!(!loaded.activity_pulse);
+        assert!(!loaded.resume_agent_sessions);
         assert!((loaded.sidebar_width - 300.0).abs() < f32::EPSILON);
     }
 

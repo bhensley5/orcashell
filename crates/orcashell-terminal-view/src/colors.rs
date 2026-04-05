@@ -96,6 +96,8 @@ pub struct ColorPalette {
     pub search_input_cursor: Hsla,
     /// Search input selection background (ORCA_BLUE at 25%).
     pub search_input_selection: Hsla,
+    /// Terminal text selection background.
+    pub terminal_selection: Hsla,
     /// Hover overlay for buttons (white-ish at ~6%).
     pub hover_overlay: Hsla,
     /// Close button hover overlay (red-ish at ~25%).
@@ -268,6 +270,7 @@ impl Default for ColorPalette {
             search_input_placeholder: gpui::rgba(0x5C607080).into(),
             search_input_cursor: gpui::rgba(0x5E9BFFFF).into(),
             search_input_selection: gpui::rgba(0x5E9BFF40).into(),
+            terminal_selection: gpui::rgba(0x5E9BFF40).into(),
             hover_overlay: gpui::rgba(0xFFFFFF10).into(),
             close_hover_overlay: gpui::rgba(0xF14C4C40).into(),
             link: gpui::rgba(0x5E9BFFFF).into(),

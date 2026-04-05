@@ -670,6 +670,8 @@ fn set_app_menus(cx: &mut App) {
         Menu {
             name: "OrcaShell".into(),
             items: vec![
+                MenuItem::action("Check for Updates...", CheckForUpdates),
+                MenuItem::separator(),
                 MenuItem::action("Settings...", ToggleSettings),
                 MenuItem::separator(),
                 MenuItem::os_submenu("Services", SystemMenuType::Services),

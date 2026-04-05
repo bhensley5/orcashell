@@ -4,7 +4,8 @@
 
 OrcaShell is a single Rust binary that embeds both a GPUI desktop UI and an orchestration
 daemon core. The UI is a client of the daemon core. The `orcash` CLI is a separate binary
-that communicates with the daemon core over a Unix domain socket.
+that communicates with the daemon core over the platform-native local IPC transport:
+Unix domain sockets on macOS/Linux and named pipes on Windows.
 
 ```
 ┌───────────────────────────────────────────────────────────────────────┐
@@ -31,7 +32,7 @@ that communicates with the daemon core over a Unix domain socket.
 │  │  └───────┬────────────┘  │     │  └──────────────┘               │ │
 │  │          │               │     └─────────────────────────────────┘ │
 │  │  ┌───────▼────────────┐  │                                        │
-│  │  │ Terminal Panes     │  │      Unix domain socket                │
+│  │  │ Terminal Panes     │  │      Local IPC transport               │
 │  │  │ (GPUI views)       │  │◀──────────────────────────────────┐   │
 │  │  │ alacritty_terminal  │  │                                   │   │
 │  │  │ + PTY I/O           │  │                                   │   │
@@ -40,17 +41,17 @@ that communicates with the daemon core over a Unix domain socket.
 └───────────────────────────────────────────────────────────────────┬──┘
                                                                     │
                                                           ┌─────────▼──────────┐
-                                                          │    orca CLI         │
+                                                          │   orcash CLI        │
                                                           │ (human + agent API) │
                                                           └─────────────────────┘
 ```
 
 ## Process Model
 
-MVP runs as one process with the daemon logic embedded. Future headless mode (`orcashelld`)
-runs the daemon core standalone with tokio for remote clients.
+The current product runs as one process with the daemon logic embedded. Future headless
+mode (`orcashelld`) runs the daemon core standalone with tokio for remote clients.
 
-- `orcashell` (MVP): desktop app + embedded daemon
+- `orcashell` (current): desktop app + embedded daemon
 - `orcashelld` (future): headless daemon for remote/web clients
 - `orcashell --attach` (future): attach UI to an existing daemon
 
@@ -159,8 +160,8 @@ pub trait AgentAdapter: Send + Sync {
 }
 ```
 
-MVP implements `ClaudeCodeAdapter` only. Other agents spawn in PTYs without structured
-turn capture.
+The current product implements `ClaudeCodeAdapter` only. Other agents spawn in PTYs
+without structured turn capture.
 
 ## Terminal Rendering
 
@@ -193,8 +194,8 @@ SQLite schema (high-level):
 
 ## IPC Protocol
 
-CLI-to-daemon communication uses serde-serialized messages over Unix domain socket.
-Message types defined in `orcashell-protocol` crate:
+CLI-to-daemon communication uses serde-serialized messages over the local platform IPC
+transport. Message types are defined in the `orcashell-protocol` crate:
 
 - **Commands:** request/response (create task, spawn session, resize, handoff)
 - **Events:** pub/sub notifications (task updated, session state changed)
@@ -212,6 +213,9 @@ ORCA_AGENT_ID=claude-code
 ORCA_BRANCH=orca/task-001/feature-name
 ORCA_WORKTREE=/repo/.orcashell/worktrees/task-001
 ```
+
+On Windows, `ORCA_SOCKET` contains the named-pipe endpoint (for example,
+`\\.\pipe\orcashell-<user-sid>`).
 
 Agents discover their context from the environment and call `orcash` CLI commands to
 communicate with the orchestrator.

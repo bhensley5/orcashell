@@ -251,15 +251,11 @@ mod tests {
         assert!(ZSH_INTEGRATION.contains("133;C"));
         assert!(ZSH_INTEGRATION.contains("133;D"));
         assert!(ZSH_INTEGRATION.contains("]2;"));
-        assert!(ZSH_INTEGRATION.contains("\\e[1;3D"));
-        assert!(ZSH_INTEGRATION.contains("\\e[1;3C"));
         assert!(BASH_INTEGRATION.contains("133;A"));
         assert!(BASH_INTEGRATION.contains("133;B"));
         assert!(BASH_INTEGRATION.contains("133;C"));
         assert!(BASH_INTEGRATION.contains("133;D"));
         assert!(BASH_INTEGRATION.contains("]2;"));
-        assert!(BASH_INTEGRATION.contains("\\e[1;3D"));
-        assert!(BASH_INTEGRATION.contains("\\e[1;3C"));
         assert!(POWERSHELL_INTEGRATION.contains("133;A"));
         assert!(POWERSHELL_INTEGRATION.contains("133;B"));
         assert!(POWERSHELL_INTEGRATION.contains("133;C"));

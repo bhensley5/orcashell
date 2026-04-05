@@ -80,26 +80,6 @@ pub(crate) fn is_hyperlink_activation_click(modifiers: Modifiers, button: MouseB
     button == MouseButton::Left && hyperlink_activation_modifier_pressed(modifiers)
 }
 
-/// Returns the system program for opening URLs. Not used on Windows (which uses
-/// `explorer.exe` directly in `open_hyperlink_uri`).
-#[cfg(not(target_os = "windows"))]
-pub(crate) fn hyperlink_open_program() -> Option<&'static str> {
-    #[cfg(target_os = "macos")]
-    {
-        Some("open")
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        Some("xdg-open")
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        None
-    }
-}
-
 pub(crate) fn is_supported_hyperlink_uri(uri: &str) -> bool {
     uri.starts_with("http://") || uri.starts_with("https://")
 }
@@ -108,27 +88,7 @@ pub(crate) fn open_hyperlink_uri(uri: &str) -> bool {
     if !is_supported_hyperlink_uri(uri) {
         return false;
     }
-
-    // Windows: use explorer.exe to open URLs. Bypasses cmd.exe parsing entirely,
-    // so & and other special characters in URIs are handled correctly.
-    #[cfg(target_os = "windows")]
-    {
-        orcashell_platform::command("explorer")
-            .arg(uri)
-            .spawn()
-            .is_ok()
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        let Some(program) = hyperlink_open_program() else {
-            return false;
-        };
-        orcashell_platform::command(program)
-            .arg(uri)
-            .spawn()
-            .is_ok()
-    }
+    orcashell_platform::open_url(uri)
 }
 
 pub(crate) fn build_visible_hovered_link(
@@ -312,7 +272,6 @@ mod tests {
 
         assert!(hyperlink_activation_modifier_pressed(command));
         assert!(!hyperlink_activation_modifier_pressed(control));
-        assert_eq!(hyperlink_open_program(), Some("open"));
     }
 
     #[cfg(target_os = "linux")]
@@ -329,7 +288,6 @@ mod tests {
 
         assert!(hyperlink_activation_modifier_pressed(control));
         assert!(!hyperlink_activation_modifier_pressed(command));
-        assert_eq!(hyperlink_open_program(), Some("xdg-open"));
     }
 
     #[cfg(target_os = "windows")]

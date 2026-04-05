@@ -17,10 +17,11 @@ use crossbeam_channel::{
 };
 use notify::{recommended_watcher, Event as NotifyEvent, RecursiveMode, Watcher};
 use orcashell_git::{
-    commit_staged, create_managed_worktree, load_diff_index, load_file_diff, load_snapshot,
-    merge_managed_branch, pull_integrate, remove_managed_worktree, resolve_source_scope,
-    resolve_upstream_info, stage_paths, unstage_paths, DiffDocument, DiffSelectionKey,
-    FileDiffDocument, GitSnapshotSummary, ManagedWorktree,
+    capture_feed_event, commit_staged, create_managed_worktree, load_diff_index, load_file_diff,
+    load_snapshot, merge_managed_branch, pull_integrate, remove_managed_worktree,
+    resolve_source_scope, resolve_upstream_info, stage_paths, unstage_paths, DiffDocument,
+    DiffSelectionKey, FeedCaptureResult, FeedScopeCapture, FileDiffDocument, GitSnapshotSummary,
+    ManagedWorktree,
 };
 use orcashell_store::ThemeId;
 use parking_lot::Mutex;
@@ -67,6 +68,13 @@ pub enum GitEvent {
         selection: DiffSelectionKey,
         result: Result<FileDiffDocument, String>,
     },
+    FeedCaptureCompleted {
+        project_id: String,
+        scope_root: PathBuf,
+        generation: u64,
+        request_revision: u64,
+        result: Result<FeedCaptureResult, String>,
+    },
     ManagedWorktreeCreated {
         project_id: String,
         origin_terminal_id: Option<String>,
@@ -102,6 +110,7 @@ impl GitCoordinator {
     pub fn new() -> Self {
         let (snapshot_tx, snapshot_rx) = crossbeam_unbounded();
         let (diff_tx, diff_rx) = crossbeam_unbounded();
+        let (feed_capture_tx, feed_capture_rx) = crossbeam_unbounded();
         let (local_mutation_tx, local_mutation_rx) = crossbeam_unbounded();
         let (remote_op_tx, remote_op_rx) = crossbeam_unbounded();
         let (watch_event_tx, watch_event_rx) = crossbeam_unbounded();
@@ -112,6 +121,7 @@ impl GitCoordinator {
             subscribers: Mutex::new(Vec::new()),
             snapshot_tx,
             diff_tx,
+            feed_capture_tx,
             local_mutation_tx,
             remote_op_tx,
             watch_event_tx,
@@ -128,6 +138,7 @@ impl GitCoordinator {
             ));
         }
         handles.push(spawn_diff_worker(inner.clone(), diff_rx));
+        handles.push(spawn_feed_capture_worker(inner.clone(), feed_capture_rx));
         handles.push(spawn_local_mutation_worker(
             inner.clone(),
             local_mutation_rx,
@@ -188,6 +199,23 @@ impl GitCoordinator {
             scope_root: self.resolve_scope_root(scope_root),
             generation,
             selection: selection.clone(),
+        });
+    }
+
+    pub fn request_feed_capture(
+        &self,
+        project_id: &str,
+        scope_root: &Path,
+        generation: u64,
+        request_revision: u64,
+        previous: Option<Arc<FeedScopeCapture>>,
+    ) {
+        let _ = self.inner.feed_capture_tx.send(FeedCaptureJob::Capture {
+            project_id: project_id.to_string(),
+            scope_root: self.resolve_scope_root(scope_root),
+            generation,
+            request_revision,
+            previous,
         });
     }
 
@@ -412,6 +440,7 @@ struct GitCoordinatorInner {
     subscribers: Mutex<Vec<AsyncSender<GitEvent>>>,
     snapshot_tx: CrossbeamSender<SnapshotJobEnvelope>,
     diff_tx: CrossbeamSender<DiffJob>,
+    feed_capture_tx: CrossbeamSender<FeedCaptureJob>,
     local_mutation_tx: CrossbeamSender<LocalMutationJob>,
     remote_op_tx: CrossbeamSender<RemoteOpJob>,
     watch_event_tx: CrossbeamSender<PathBuf>,
@@ -637,6 +666,7 @@ impl Drop for GitCoordinatorInner {
             let _ = self.snapshot_tx.send(SnapshotJobEnvelope::Stop);
         }
         let _ = self.diff_tx.send(DiffJob::Stop);
+        let _ = self.feed_capture_tx.send(FeedCaptureJob::Stop);
         let _ = self.local_mutation_tx.send(LocalMutationJob::Stop);
         let _ = self.remote_op_tx.send(RemoteOpJob::Stop);
 
@@ -761,6 +791,18 @@ enum LocalMutationJob {
 }
 
 #[derive(Debug)]
+enum FeedCaptureJob {
+    Capture {
+        project_id: String,
+        scope_root: PathBuf,
+        generation: u64,
+        request_revision: u64,
+        previous: Option<Arc<FeedScopeCapture>>,
+    },
+    Stop,
+}
+
+#[derive(Debug)]
 enum RemoteOpJob {
     Push { scope_root: PathBuf },
     Pull { scope_root: PathBuf },
@@ -839,6 +881,45 @@ fn spawn_diff_worker(
             }
         })
         .expect("failed to spawn git file-diff worker")
+}
+
+fn spawn_feed_capture_worker(
+    inner: Arc<GitCoordinatorInner>,
+    rx: CrossbeamReceiver<FeedCaptureJob>,
+) -> JoinHandle<()> {
+    thread::Builder::new()
+        .name("orca-git-feed-capture".into())
+        .spawn(move || {
+            while let Ok(job) = rx.recv() {
+                match job {
+                    FeedCaptureJob::Capture {
+                        project_id,
+                        scope_root,
+                        generation,
+                        request_revision,
+                        previous,
+                    } => {
+                        let theme_id = *inner.diff_theme.lock();
+                        let result = capture_feed_event(
+                            &scope_root,
+                            generation,
+                            previous.as_deref(),
+                            theme_id,
+                        )
+                        .map_err(|error| error.to_string());
+                        inner.broadcast(GitEvent::FeedCaptureCompleted {
+                            project_id,
+                            scope_root,
+                            generation,
+                            request_revision,
+                            result,
+                        });
+                    }
+                    FeedCaptureJob::Stop => break,
+                }
+            }
+        })
+        .expect("failed to spawn git feed-capture worker")
 }
 
 /// Single-threaded local mutation worker. Project-scoped jobs (CreateWorktree,

@@ -24,33 +24,34 @@ const MIN_TREE_WIDTH: f32 = 180.0;
 const MIN_DIFF_WIDTH: f32 = 320.0;
 
 /// Height of each diff row: 20px min-height + 2×1px vertical padding.
-const LINE_HEIGHT: f32 = 22.0;
+pub(crate) const LINE_HEIGHT: f32 = 22.0;
 
 /// Scrollbar hit-zone width (invisible track area that accepts clicks).
-const SCROLLBAR_HIT_WIDTH: f32 = 12.0;
+pub(crate) const SCROLLBAR_HIT_WIDTH: f32 = 12.0;
 /// Visible scrollbar thumb width.
-const SCROLLBAR_THUMB_WIDTH: f32 = 6.0;
+pub(crate) const SCROLLBAR_THUMB_WIDTH: f32 = 6.0;
 /// Minimum scrollbar thumb height so it remains clickable.
-const SCROLLBAR_THUMB_MIN: f32 = 20.0;
+pub(crate) const SCROLLBAR_THUMB_MIN: f32 = 20.0;
 /// Inset from the right edge of the track to the thumb center.
-const SCROLLBAR_THUMB_INSET: f32 = 3.0;
+pub(crate) const SCROLLBAR_THUMB_INSET: f32 = 3.0;
 
 /// Width of each line-number gutter column.
-const GUTTER_WIDTH: f32 = 52.0;
+pub(crate) const GUTTER_WIDTH: f32 = 52.0;
 /// Gap between gutter columns and between the last gutter and the text.
-const GUTTER_GAP: f32 = 8.0;
+pub(crate) const GUTTER_GAP: f32 = 8.0;
 /// Horizontal padding on each diff row.
-const LINE_PAD_X: f32 = 12.0;
+pub(crate) const LINE_PAD_X: f32 = 12.0;
 /// X offset where the text column begins, relative to the row's leading edge.
-const TEXT_COL_X: f32 = LINE_PAD_X + GUTTER_WIDTH + GUTTER_GAP + GUTTER_WIDTH + GUTTER_GAP;
+pub(crate) const TEXT_COL_X: f32 =
+    LINE_PAD_X + GUTTER_WIDTH + GUTTER_GAP + GUTTER_WIDTH + GUTTER_GAP;
 
 /// Fallback advance width per character before font measurement completes.
-const DEFAULT_CHAR_WIDTH: f32 = 6.6;
+pub(crate) const DEFAULT_CHAR_WIDTH: f32 = 6.6;
 
 /// Font family used in the diff view.
-const DIFF_FONT_FAMILY: &str = "JetBrains Mono";
+pub(crate) const DIFF_FONT_FAMILY: &str = "JetBrains Mono";
 /// Font size used in the diff view.
-const DIFF_FONT_SIZE: f32 = 11.0;
+pub(crate) const DIFF_FONT_SIZE: f32 = 11.0;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -63,22 +64,22 @@ struct DiffResizeDrag {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct ScrollbarDrag {
-    start_y: f32,
-    start_scroll_y: f32,
+pub(crate) struct ScrollbarDrag {
+    pub(crate) start_y: f32,
+    pub(crate) start_scroll_y: f32,
 }
 
 /// Cached filtered diff lines for the currently displayed file. Rebuilt only
 /// when the selected diff document or git generation changes. Not on every
 /// scroll/drag frame.
-struct CachedDiffLines {
-    selection: DiffSelectionKey,
-    generation: u64,
-    lines: Rc<Vec<DiffLineView>>,
+pub(crate) struct CachedDiffLines {
+    pub(crate) selection: DiffSelectionKey,
+    pub(crate) generation: u64,
+    pub(crate) lines: Rc<Vec<DiffLineView>>,
     /// Longest line in characters (not pixels).  Pixel width is derived at
     /// render time via `measured_char_width` so font/DPI changes don't stale
     /// the cache.
-    max_line_chars: usize,
+    pub(crate) max_line_chars: usize,
 }
 
 /// Cached file tree for the current diff index generation. Rebuilt only when
@@ -178,15 +179,15 @@ impl DiffRenderSnapshot {
 /// tracks the current pointer position.  The two may be in any order; call
 /// [`DiffSelection::normalized`] to get (min, max).
 #[derive(Debug, Clone, Copy)]
-struct DiffSelection {
-    start: (usize, usize),
-    end: (usize, usize),
-    is_selecting: bool,
+pub(crate) struct DiffSelection {
+    pub(crate) start: (usize, usize),
+    pub(crate) end: (usize, usize),
+    pub(crate) is_selecting: bool,
 }
 
 impl DiffSelection {
     /// Return (start, end) in ascending (line, col) order.
-    fn normalized(self) -> ((usize, usize), (usize, usize)) {
+    pub(crate) fn normalized(self) -> ((usize, usize), (usize, usize)) {
         let (a, b) = (self.start, self.end);
         if a.0 < b.0 || (a.0 == b.0 && a.1 <= b.1) {
             (a, b)
@@ -197,15 +198,15 @@ impl DiffSelection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct DiffTreeNode {
-    name: String,
-    path: PathBuf,
-    kind: DiffTreeNodeKind,
-    children: Vec<DiffTreeNode>,
+pub(crate) struct DiffTreeNode {
+    pub(crate) name: String,
+    pub(crate) path: PathBuf,
+    pub(crate) kind: DiffTreeNodeKind,
+    pub(crate) children: Vec<DiffTreeNode>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum DiffTreeNodeKind {
+pub(crate) enum DiffTreeNodeKind {
     Directory,
     File(ChangedFile),
 }
@@ -290,32 +291,15 @@ impl DiffExplorerView {
         &self.focus_handle
     }
 
+    pub fn invalidate_theme_cache(&mut self, cx: &mut Context<Self>) {
+        self.line_cache = None;
+        cx.notify();
+    }
+
     /// Measure the actual character advance width using the GPUI text system.
     /// Called once per render; the result is cached until the next render.
     fn measure_char_width(&mut self, window: &mut Window) {
-        let font = Font {
-            family: SharedString::from(DIFF_FONT_FAMILY),
-            features: FontFeatures::default(),
-            fallbacks: None,
-            weight: FontWeight::NORMAL,
-            style: FontStyle::Normal,
-        };
-        let text_run = TextRun {
-            len: "M".len(),
-            font,
-            color: gpui::black(),
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        };
-        let shaped =
-            window
-                .text_system()
-                .shape_line("M".into(), px(DIFF_FONT_SIZE), &[text_run], None);
-        let w: f32 = shaped.width.into();
-        if w > 0.0 {
-            self.measured_char_width = w;
-        }
+        self.measured_char_width = measure_diff_char_width(window);
     }
 
     /// Extract a lightweight render snapshot from workspace state.
@@ -1125,7 +1109,7 @@ impl DiffExplorerView {
     }
 
     /// Render a section header row (e.g. "STAGED CHANGES (3)").
-    fn section_header(palette: &OrcaTheme, label: &str, count: usize) -> Div {
+    pub(crate) fn section_header(palette: &OrcaTheme, label: &str, count: usize) -> Div {
         div()
             .w_full()
             .px(px(8.0))
@@ -1145,6 +1129,143 @@ impl DiffExplorerView {
             )
     }
 
+    pub(crate) fn directory_tree_row(palette: &OrcaTheme, name: &str, depth: usize) -> Div {
+        div()
+            .w_full()
+            .px(px(8.0))
+            .py(px(4.0))
+            .pl(px(8.0 + depth as f32 * 14.0))
+            .text_size(px(11.0))
+            .font_family(DIFF_FONT_FAMILY)
+            .text_color(rgb(palette.FOG))
+            .child(format!("\u{25BE} {name}"))
+    }
+
+    pub(crate) fn file_tree_row(
+        palette: &OrcaTheme,
+        element_id: ElementId,
+        name: &str,
+        depth: usize,
+        file: &ChangedFile,
+        is_primary: bool,
+        is_multi: bool,
+    ) -> Stateful<Div> {
+        let hover_bg = rgba(theme::with_alpha(palette.CURRENT, 0x88));
+        let mut row = div()
+            .id(element_id)
+            .w_full()
+            .px(px(8.0))
+            .py(px(4.0))
+            .pl(px(8.0 + depth as f32 * 14.0))
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .cursor_pointer()
+            .border_l_2()
+            .when(is_primary, |row| {
+                row.bg(rgba(theme::with_alpha(palette.ORCA_BLUE, 0x1A)))
+                    .border_color(rgba(theme::with_alpha(palette.ORCA_BLUE, 0x66)))
+            })
+            .when(!is_primary && is_multi, |row| {
+                row.bg(rgba(theme::with_alpha(palette.ORCA_BLUE, 0x12)))
+                    .border_color(rgba(theme::with_alpha(palette.ORCA_BLUE, 0x60)))
+            })
+            .when(!is_primary && !is_multi, |row| {
+                row.border_color(rgba(0x00000000))
+                    .hover(move |row| row.bg(hover_bg))
+            })
+            .child(Self::status_pill(palette, file.status))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .text_size(px(11.0))
+                    .font_family(DIFF_FONT_FAMILY)
+                    .text_color(rgb(if is_primary {
+                        palette.PATCH
+                    } else {
+                        palette.BONE
+                    }))
+                    .child(name.to_string()),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .text_size(px(10.0))
+                    .font_family(DIFF_FONT_FAMILY)
+                    .child(
+                        div()
+                            .text_color(rgb(palette.STATUS_GREEN))
+                            .child(format!("+{}", file.insertions)),
+                    )
+                    .child(
+                        div()
+                            .text_color(rgb(palette.STATUS_CORAL))
+                            .child(format!("-{}", file.deletions)),
+                    ),
+            );
+
+        if file.is_binary {
+            row = row.child(
+                div()
+                    .text_size(px(10.0))
+                    .font_family(DIFF_FONT_FAMILY)
+                    .text_color(rgb(palette.SEAFOAM))
+                    .child("bin"),
+            );
+        }
+
+        row
+    }
+
+    pub(crate) fn diff_file_header(
+        palette: &OrcaTheme,
+        file_meta: &ChangedFile,
+        error: Option<&str>,
+    ) -> Div {
+        let mut file_header = div()
+            .w_full()
+            .flex_shrink_0()
+            .px(px(12.0))
+            .py(px(10.0))
+            .border_b_1()
+            .border_color(rgb(palette.SURFACE))
+            .bg(rgb(palette.DEEP))
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(12.0))
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .font_family(DIFF_FONT_FAMILY)
+                    .text_color(rgb(palette.PATCH))
+                    .child(file_meta.relative_path.display().to_string()),
+            )
+            .child(Self::status_summary(palette, file_meta));
+
+        if let Some(error) = error {
+            file_header = file_header.child(
+                div()
+                    .w_full()
+                    .px(px(12.0))
+                    .py(px(6.0))
+                    .bg(rgba(theme::with_alpha(palette.STATUS_AMBER, 0x10)))
+                    .border_b_1()
+                    .border_color(rgb(palette.SURFACE))
+                    .text_size(px(11.0))
+                    .text_color(rgb(palette.STATUS_AMBER))
+                    .child(error.to_string()),
+            );
+        }
+
+        file_header
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn render_section_tree(
         &self,
@@ -1161,16 +1282,7 @@ impl DiffExplorerView {
             match &node.kind {
                 DiffTreeNodeKind::Directory => {
                     rows.push(
-                        div()
-                            .w_full()
-                            .px(px(8.0))
-                            .py(px(4.0))
-                            .pl(px(8.0 + depth as f32 * 14.0))
-                            .text_size(px(11.0))
-                            .font_family(DIFF_FONT_FAMILY)
-                            .text_color(rgb(palette.FOG))
-                            .child(format!("\u{25BE} {}", node.name))
-                            .into_any_element(),
+                        Self::directory_tree_row(palette, &node.name, depth).into_any_element(),
                     );
                     rows.extend(self.render_section_tree(
                         &node.children,
@@ -1203,158 +1315,86 @@ impl DiffExplorerView {
                     let element_id = ElementId::Name(
                         format!("diff-{:?}-{}-{}", section, scope_hash, path_hash).into(),
                     );
-                    let hover_bg = rgba(theme::with_alpha(palette.CURRENT, 0x88));
-
                     // Context menu items for right-click.
                     let menu_request = self.menu_request.clone();
                     let key_ctx = key.clone();
                     let ws_for_ctx = ws_handle.clone();
                     let scope_for_ctx = scope_root.clone();
 
-                    let mut row = div()
-                        .id(element_id)
-                        .w_full()
-                        .px(px(8.0))
-                        .py(px(4.0))
-                        .pl(px(8.0 + depth as f32 * 14.0))
-                        .flex()
-                        .items_center()
-                        .gap(px(8.0))
-                        .cursor_pointer()
-                        .border_l_2()
-                        .when(is_primary, |row| {
-                            row.bg(rgba(theme::with_alpha(palette.ORCA_BLUE, 0x1A)))
-                                .border_color(rgba(theme::with_alpha(palette.ORCA_BLUE, 0x66)))
-                        })
-                        .when(!is_primary && is_multi, |row| {
-                            row.bg(rgba(theme::with_alpha(palette.ORCA_BLUE, 0x12)))
-                                .border_color(rgba(theme::with_alpha(palette.ORCA_BLUE, 0x60)))
-                        })
-                        .when(!is_primary && !is_multi, |row| {
-                            row.border_color(rgba(0x00000000))
-                                .hover(move |row| row.bg(hover_bg))
-                        })
-                        .child(Self::status_pill(palette, file.status))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .text_size(px(11.0))
-                                .font_family(DIFF_FONT_FAMILY)
-                                .text_color(rgb(if is_primary {
-                                    palette.PATCH
-                                } else {
-                                    palette.BONE
-                                }))
-                                .child(node.name.clone()),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(6.0))
-                                .text_size(px(10.0))
-                                .font_family(DIFF_FONT_FAMILY)
-                                .child(
-                                    div()
-                                        .text_color(rgb(palette.STATUS_GREEN))
-                                        .child(format!("+{}", file.insertions)),
-                                )
-                                .child(
-                                    div()
-                                        .text_color(rgb(palette.STATUS_CORAL))
-                                        .child(format!("-{}", file.deletions)),
-                                ),
-                        )
-                        .on_click(move |event: &ClickEvent, _window, cx| {
-                            let mods = event.modifiers();
-                            if mods.platform {
-                                // Cmd+click: toggle multi-select.
-                                ws_for_click.update(cx, |ws, cx| {
-                                    ws.diff_toggle_multi_select(
-                                        &scope_for_click,
-                                        key_click.clone(),
-                                        cx,
-                                    );
-                                });
-                            } else if mods.shift {
-                                // Shift+click: range select.
-                                ws_for_click.update(cx, |ws, cx| {
-                                    ws.diff_range_select(
-                                        &scope_for_click,
-                                        key_click.clone(),
-                                        &visible_for_shift,
-                                        cx,
-                                    );
-                                });
-                            } else {
-                                // Plain click: replace select + load diff.
-                                ws_for_select.update(cx, |ws, cx| {
-                                    ws.diff_replace_select(
-                                        &scope_for_select,
-                                        key_select.clone(),
-                                        cx,
-                                    );
-                                    ws.select_diff_file(&scope_for_select, key_select.clone(), cx);
+                    let row = Self::file_tree_row(
+                        palette, element_id, &node.name, depth, file, is_primary, is_multi,
+                    )
+                    .on_click(move |event: &ClickEvent, _window, cx| {
+                        let mods = event.modifiers();
+                        if mods.platform {
+                            // Cmd+click: toggle multi-select.
+                            ws_for_click.update(cx, |ws, cx| {
+                                ws.diff_toggle_multi_select(
+                                    &scope_for_click,
+                                    key_click.clone(),
+                                    cx,
+                                );
+                            });
+                        } else if mods.shift {
+                            // Shift+click: range select.
+                            ws_for_click.update(cx, |ws, cx| {
+                                ws.diff_range_select(
+                                    &scope_for_click,
+                                    key_click.clone(),
+                                    &visible_for_shift,
+                                    cx,
+                                );
+                            });
+                        } else {
+                            // Plain click: replace select + load diff.
+                            ws_for_select.update(cx, |ws, cx| {
+                                ws.diff_replace_select(&scope_for_select, key_select.clone(), cx);
+                                ws.select_diff_file(&scope_for_select, key_select.clone(), cx);
+                            });
+                        }
+                    })
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        move |event: &MouseDownEvent, _window, cx| {
+                            // Collapse selection to this row if not already selected.
+                            let is_in_selection = ws_for_ctx
+                                .read(cx)
+                                .diff_tab_state(&scope_for_ctx)
+                                .is_some_and(|tab| tab.multi_select.contains(&key_ctx));
+                            if !is_in_selection {
+                                ws_for_ctx.update(cx, |ws, cx| {
+                                    ws.diff_replace_select(&scope_for_ctx, key_ctx.clone(), cx);
                                 });
                             }
-                        })
-                        .on_mouse_down(
-                            MouseButton::Right,
-                            move |event: &MouseDownEvent, _window, cx| {
-                                // Collapse selection to this row if not already selected.
-                                let is_in_selection = ws_for_ctx
-                                    .read(cx)
-                                    .diff_tab_state(&scope_for_ctx)
-                                    .is_some_and(|tab| tab.multi_select.contains(&key_ctx));
-                                if !is_in_selection {
-                                    ws_for_ctx.update(cx, |ws, cx| {
-                                        ws.diff_replace_select(&scope_for_ctx, key_ctx.clone(), cx);
-                                    });
-                                }
-                                let ctx_section = key_ctx.section;
-                                let scope = scope_for_ctx.clone();
-                                let in_flight = ws_for_ctx
-                                    .read(cx)
-                                    .diff_tab_state(&scope_for_ctx)
-                                    .is_some_and(|tab| {
-                                        tab.local_action_in_flight || tab.remote_op_in_flight
-                                    });
-                                let (label, action_section) = match ctx_section {
-                                    DiffSectionKind::Staged => ("Unstage", DiffSectionKind::Staged),
-                                    DiffSectionKind::Unstaged => {
-                                        ("Stage", DiffSectionKind::Unstaged)
+                            let ctx_section = key_ctx.section;
+                            let scope = scope_for_ctx.clone();
+                            let in_flight = ws_for_ctx
+                                .read(cx)
+                                .diff_tab_state(&scope_for_ctx)
+                                .is_some_and(|tab| {
+                                    tab.local_action_in_flight || tab.remote_op_in_flight
+                                });
+                            let (label, action_section) = match ctx_section {
+                                DiffSectionKind::Staged => ("Unstage", DiffSectionKind::Staged),
+                                DiffSectionKind::Unstaged => ("Stage", DiffSectionKind::Unstaged),
+                            };
+                            let items = vec![ContextMenuItem {
+                                label: label.to_string(),
+                                shortcut: None,
+                                enabled: !in_flight,
+                                action: Box::new(move |ws_state, cx| match action_section {
+                                    DiffSectionKind::Staged => {
+                                        ws_state.unstage_selected(&scope, cx);
                                     }
-                                };
-                                let items = vec![ContextMenuItem {
-                                    label: label.to_string(),
-                                    shortcut: None,
-                                    enabled: !in_flight,
-                                    action: Box::new(move |ws_state, cx| match action_section {
-                                        DiffSectionKind::Staged => {
-                                            ws_state.unstage_selected(&scope, cx);
-                                        }
-                                        DiffSectionKind::Unstaged => {
-                                            ws_state.stage_selected(&scope, cx);
-                                        }
-                                    }),
-                                }];
-                                *menu_request.borrow_mut() = Some((event.position, items));
-                                cx.stop_propagation();
-                            },
-                        );
-
-                    if file.is_binary {
-                        row = row.child(
-                            div()
-                                .text_size(px(10.0))
-                                .font_family(DIFF_FONT_FAMILY)
-                                .text_color(rgb(palette.SEAFOAM))
-                                .child("bin"),
-                        );
-                    }
+                                    DiffSectionKind::Unstaged => {
+                                        ws_state.stage_selected(&scope, cx);
+                                    }
+                                }),
+                            }];
+                            *menu_request.borrow_mut() = Some((event.position, items));
+                            cx.stop_propagation();
+                        },
+                    );
 
                     rows.push(row.into_any_element());
                 }
@@ -1497,41 +1537,7 @@ impl DiffExplorerView {
         let line_palette = palette.clone();
 
         // Fixed file header bar above the line list.
-        let mut file_header = div()
-            .w_full()
-            .flex_shrink_0()
-            .px(px(12.0))
-            .py(px(10.0))
-            .border_b_1()
-            .border_color(rgb(palette.SURFACE))
-            .bg(rgb(palette.DEEP))
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap(px(12.0))
-            .child(
-                div()
-                    .text_size(px(12.0))
-                    .font_family(DIFF_FONT_FAMILY)
-                    .text_color(rgb(palette.PATCH))
-                    .child(file_meta.relative_path.display().to_string()),
-            )
-            .child(Self::status_summary(&palette, file_meta));
-
-        if let Some(error) = snap.file_error.as_ref() {
-            file_header = file_header.child(
-                div()
-                    .w_full()
-                    .px(px(12.0))
-                    .py(px(6.0))
-                    .bg(rgba(theme::with_alpha(palette.STATUS_AMBER, 0x10)))
-                    .border_b_1()
-                    .border_color(rgb(palette.SURFACE))
-                    .text_size(px(11.0))
-                    .text_color(rgb(palette.STATUS_AMBER))
-                    .child(error.clone()),
-            );
-        }
+        let file_header = Self::diff_file_header(&palette, file_meta, snap.file_error.as_deref());
 
         // The virtualized line list.
         let diff_list = uniform_list("diff-lines", line_count, move |range, _window, _cx| {
@@ -1901,7 +1907,7 @@ impl DiffExplorerView {
     // Shared UI helpers
     // ------------------------------------------------------------------
 
-    fn status_summary(palette: &OrcaTheme, file: &ChangedFile) -> Div {
+    pub(crate) fn status_summary(palette: &OrcaTheme, file: &ChangedFile) -> Div {
         div()
             .flex()
             .items_center()
@@ -1932,7 +1938,7 @@ impl DiffExplorerView {
             })
     }
 
-    fn status_pill(palette: &OrcaTheme, status: GitFileStatus) -> Div {
+    pub(crate) fn status_pill(palette: &OrcaTheme, status: GitFileStatus) -> Div {
         let (label, border, text) = match status {
             GitFileStatus::Added => ("A", palette.STATUS_GREEN, palette.STATUS_GREEN),
             GitFileStatus::Modified => ("M", palette.ORCA_BLUE, palette.ORCA_BLUE),
@@ -1959,7 +1965,7 @@ impl DiffExplorerView {
             .child(label)
     }
 
-    fn empty_panel_message(palette: &OrcaTheme, title: &str, body: Option<&str>) -> Div {
+    pub(crate) fn empty_panel_message(palette: &OrcaTheme, title: &str, body: Option<&str>) -> Div {
         let mut panel = div()
             .size_full()
             .p(px(16.0))
@@ -2148,7 +2154,7 @@ impl Render for DiffExplorerView {
 ///
 /// This is a free function (not a method) so it can be captured by the
 /// `uniform_list` closure without borrowing `self`.
-fn render_diff_line_element(
+pub(crate) fn render_diff_line_element(
     palette: &OrcaTheme,
     line: &DiffLineView,
     line_index: usize,
@@ -2207,7 +2213,7 @@ fn render_diff_line_element(
 }
 
 /// Return (background, text_color, gutter_color) for a given diff-line kind.
-fn diff_line_colors(palette: &OrcaTheme, kind: DiffLineKind) -> (Option<u32>, u32, u32) {
+pub(crate) fn diff_line_colors(palette: &OrcaTheme, kind: DiffLineKind) -> (Option<u32>, u32, u32) {
     match kind {
         DiffLineKind::Addition => (
             Some(theme::with_alpha(palette.STATUS_GREEN, 0x1F)),
@@ -2239,7 +2245,7 @@ fn diff_line_colors(palette: &OrcaTheme, kind: DiffLineKind) -> (Option<u32>, u3
 }
 
 /// Return the inline change background color for a given line kind, if applicable.
-fn inline_change_bg(palette: &OrcaTheme, kind: DiffLineKind) -> Option<Hsla> {
+pub(crate) fn inline_change_bg(palette: &OrcaTheme, kind: DiffLineKind) -> Option<Hsla> {
     match kind {
         DiffLineKind::Addition => Some(rgba(theme::with_alpha(palette.STATUS_GREEN, 0x2E)).into()),
         DiffLineKind::Deletion => Some(rgba(theme::with_alpha(palette.STATUS_CORAL, 0x2E)).into()),
@@ -2249,7 +2255,7 @@ fn inline_change_bg(palette: &OrcaTheme, kind: DiffLineKind) -> Option<Hsla> {
 
 /// Compute the byte range within the line's display text that is selected,
 /// or `None` if this line is outside the selection.
-fn selection_range_for_line(
+pub(crate) fn selection_range_for_line(
     selection: Option<&DiffSelection>,
     line_index: usize,
     line: &DiffLineView,
@@ -2288,7 +2294,7 @@ fn selection_range_for_line(
 }
 
 /// Convert a character index to a byte offset in a string.
-fn char_to_byte(s: &str, char_idx: usize) -> usize {
+pub(crate) fn char_to_byte(s: &str, char_idx: usize) -> usize {
     s.char_indices()
         .nth(char_idx)
         .map(|(byte, _)| byte)
@@ -2296,13 +2302,13 @@ fn char_to_byte(s: &str, char_idx: usize) -> usize {
 }
 
 /// Get the display text length in characters for a diff line.
-fn plain_text_len(raw: &str, highlights: Option<&[HighlightedSpan]>) -> usize {
+pub(crate) fn plain_text_len(raw: &str, highlights: Option<&[HighlightedSpan]>) -> usize {
     plain_text_for_line(raw, highlights).chars().count()
 }
 
 /// Get the plain text content for a diff line (joining highlighted spans if
 /// present, otherwise using the raw text with whitespace normalization).
-fn plain_text_for_line(raw: &str, highlights: Option<&[HighlightedSpan]>) -> String {
+pub(crate) fn plain_text_for_line(raw: &str, highlights: Option<&[HighlightedSpan]>) -> String {
     match highlights {
         Some(spans) if !spans.is_empty() => {
             let mut s = String::new();
@@ -2320,7 +2326,7 @@ fn plain_text_for_line(raw: &str, highlights: Option<&[HighlightedSpan]>) -> Str
 
 /// Build the display-ready text for a line (with whitespace normalization),
 /// matching what `render_highlighted_text` renders.
-fn display_text_for_line(raw: &str, highlights: Option<&[HighlightedSpan]>) -> String {
+pub(crate) fn display_text_for_line(raw: &str, highlights: Option<&[HighlightedSpan]>) -> String {
     match highlights {
         Some(spans) if !spans.is_empty() => {
             let mut s = String::new();
@@ -2334,12 +2340,12 @@ fn display_text_for_line(raw: &str, highlights: Option<&[HighlightedSpan]>) -> S
 }
 
 /// Get the plain text for a line, normalized for the clipboard (NBSPs → spaces).
-fn clipboard_text_for_line(raw: &str, highlights: Option<&[HighlightedSpan]>) -> String {
+pub(crate) fn clipboard_text_for_line(raw: &str, highlights: Option<&[HighlightedSpan]>) -> String {
     plain_text_for_line(raw, highlights).replace('\u{00A0}', " ")
 }
 
 /// Extract the selected text from diff lines.
-fn extract_selected_text(
+pub(crate) fn extract_selected_text(
     lines: &[&DiffLineView],
     start_line: usize,
     start_col: usize,
@@ -2387,12 +2393,39 @@ fn extract_selected_text(
 // Text rendering
 // ---------------------------------------------------------------------------
 
-fn render_diff_text(text: &str) -> SharedString {
+pub(crate) fn measure_diff_char_width(window: &mut Window) -> f32 {
+    let font = Font {
+        family: SharedString::from(DIFF_FONT_FAMILY),
+        features: FontFeatures::default(),
+        fallbacks: None,
+        weight: FontWeight::NORMAL,
+        style: FontStyle::Normal,
+    };
+    let text_run = TextRun {
+        len: "M".len(),
+        font,
+        color: gpui::black(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let shaped = window
+        .text_system()
+        .shape_line("M".into(), px(DIFF_FONT_SIZE), &[text_run], None);
+    let width: f32 = shaped.width.into();
+    if width > 0.0 {
+        width
+    } else {
+        DEFAULT_CHAR_WIDTH
+    }
+}
+
+pub(crate) fn render_diff_text(text: &str) -> SharedString {
     SharedString::from(render_diff_text_string(text))
 }
 
 /// Like `render_diff_text` but returns an owned `String`.
-fn render_diff_text_string(text: &str) -> String {
+pub(crate) fn render_diff_text_string(text: &str) -> String {
     let text = text.trim_end_matches(['\r', '\n']);
     text.replace('\t', "\u{00A0}\u{00A0}\u{00A0}\u{00A0}")
         .replace(' ', "\u{00A0}")
@@ -2403,7 +2436,7 @@ fn render_diff_text_string(text: &str) -> String {
 /// Raw text has single-byte spaces and tabs; display text replaces them with
 /// multi-byte NBSP (`\u{00A0}`, 2 bytes each) and tab→4 NBSPs (8 bytes).
 /// Trailing `\r`/`\n` are stripped.
-fn map_raw_to_display_ranges(raw: &str, ranges: &[Range<usize>]) -> Vec<Range<usize>> {
+pub(crate) fn map_raw_to_display_ranges(raw: &str, ranges: &[Range<usize>]) -> Vec<Range<usize>> {
     if ranges.is_empty() {
         return vec![];
     }
@@ -2458,7 +2491,7 @@ fn map_raw_to_display_ranges(raw: &str, ranges: &[Range<usize>]) -> Vec<Range<us
 }
 
 /// Check if a display byte offset falls inside any of the given display ranges.
-fn in_any_range(pos: usize, ranges: &[Range<usize>]) -> bool {
+pub(crate) fn in_any_range(pos: usize, ranges: &[Range<usize>]) -> bool {
     ranges.iter().any(|r| pos >= r.start && pos < r.end)
 }
 
@@ -2469,7 +2502,7 @@ fn in_any_range(pos: usize, ranges: &[Range<usize>]) -> bool {
 /// the selection boundaries so that every sub-range carries the correct
 /// composite style (foreground from syntax + background from selection) and
 /// no two ranges overlap.
-fn render_highlighted_text(
+pub(crate) fn render_highlighted_text(
     palette: &OrcaTheme,
     text: &str,
     highlights: Option<&[HighlightedSpan]>,
@@ -2623,7 +2656,7 @@ fn render_highlighted_text(
 // Tree builder
 // ---------------------------------------------------------------------------
 
-fn build_diff_tree(files: &[ChangedFile]) -> Vec<DiffTreeNode> {
+pub(crate) fn build_diff_tree(files: &[ChangedFile]) -> Vec<DiffTreeNode> {
     let mut builder = DirectoryBuilder::default();
     for file in files {
         builder.insert(file.clone());
@@ -2632,7 +2665,7 @@ fn build_diff_tree(files: &[ChangedFile]) -> Vec<DiffTreeNode> {
 }
 
 /// Recursively collect all file-level DiffSelectionKey entries from a tree.
-fn collect_file_keys(
+pub(crate) fn collect_file_keys(
     nodes: &[DiffTreeNode],
     section: DiffSectionKind,
     out: &mut Vec<DiffSelectionKey>,
@@ -2652,7 +2685,7 @@ fn collect_file_keys(
     }
 }
 
-fn line_cache_matches(
+pub(crate) fn line_cache_matches(
     cached_selection: &DiffSelectionKey,
     cached_generation: u64,
     selection: &DiffSelectionKey,
@@ -2662,7 +2695,7 @@ fn line_cache_matches(
 }
 
 /// Simple non-cryptographic hash for generating stable element IDs.
-fn simple_hash(s: &str) -> u64 {
+pub(crate) fn simple_hash(s: &str) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for b in s.bytes() {
         h = h.wrapping_mul(0x100000001b3);
@@ -2716,13 +2749,13 @@ impl DirectoryBuilder {
     }
 }
 
-fn is_oversize_document(document: &orcashell_git::FileDiffDocument) -> bool {
+pub(crate) fn is_oversize_document(document: &orcashell_git::FileDiffDocument) -> bool {
     document.lines.len() == 1
         && document.lines[0].kind == DiffLineKind::BinaryNotice
         && document.lines[0].text == OVERSIZE_DIFF_MESSAGE
 }
 
-fn is_copy_keystroke(key: &str, modifiers: &Modifiers) -> bool {
+pub(crate) fn is_copy_keystroke(key: &str, modifiers: &Modifiers) -> bool {
     key == "c" && (modifiers.platform || modifiers.control)
 }
 

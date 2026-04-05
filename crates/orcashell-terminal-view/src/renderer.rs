@@ -1112,7 +1112,7 @@ impl TerminalRenderer {
                     let x = px((f32::from(origin.x) + cw * start as f32).floor());
                     let y = origin.y + self.cell_height * (line_idx as f32);
                     let width = px((cw * (sel_end - start) as f32).ceil());
-                    let highlight = gpui::hsla(0.0, 0.0, 1.0, 0.18);
+                    let highlight = self.palette.terminal_selection;
                     window.paint_quad(quad(
                         Bounds {
                             origin: Point { x, y },

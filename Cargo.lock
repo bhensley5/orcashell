@@ -3966,7 +3966,7 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "orcashell"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "dirs 6.0.0",
@@ -3986,7 +3986,7 @@ dependencies = [
 
 [[package]]
 name = "orcashell-cli"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3997,7 +3997,7 @@ dependencies = [
 
 [[package]]
 name = "orcashell-daemon-core"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-channel 2.5.0",
@@ -4017,7 +4017,7 @@ dependencies = [
 
 [[package]]
 name = "orcashell-git"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "git2",
@@ -4029,7 +4029,7 @@ dependencies = [
 
 [[package]]
 name = "orcashell-ipc"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "tempfile",
  "tracing",
@@ -4038,7 +4038,7 @@ dependencies = [
 
 [[package]]
 name = "orcashell-platform"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "dirs 6.0.0",
  "tempfile",
@@ -4047,7 +4047,7 @@ dependencies = [
 
 [[package]]
 name = "orcashell-protocol"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4055,7 +4055,7 @@ dependencies = [
 
 [[package]]
 name = "orcashell-session"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -4071,7 +4071,7 @@ dependencies = [
 
 [[package]]
 name = "orcashell-store"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "dirs 6.0.0",
@@ -4085,7 +4085,7 @@ dependencies = [
 
 [[package]]
 name = "orcashell-syntax"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "orcashell-store",
  "syntect",
@@ -4093,7 +4093,7 @@ dependencies = [
 
 [[package]]
 name = "orcashell-terminal-view"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -4108,9 +4108,10 @@ dependencies = [
 
 [[package]]
 name = "orcashell-ui"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
+ "async-channel 2.5.0",
  "gpui",
  "orcashell-daemon-core",
  "orcashell-git",
@@ -4125,6 +4126,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tracing",
+ "ureq",
  "uuid",
 ]
 
@@ -5005,6 +5007,7 @@ version = "0.23.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "758025cb5fccfd3bc2fd74708fd4682be41d99e5dff73c377c0646c6012c73a4"
 dependencies = [
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -6443,6 +6446,34 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
+name = "ureq"
+version = "3.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dea7109cdcd5864d4eeb1b58a1648dc9bf520360d7af16ec26d0a9354bafcfc0"
+dependencies = [
+ "base64",
+ "log",
+ "percent-encoding",
+ "rustls",
+ "rustls-pki-types",
+ "ureq-proto",
+ "utf8-zero",
+ "webpki-roots",
+]
+
+[[package]]
+name = "ureq-proto"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e994ba84b0bd1b1b0cf92878b7ef898a5c1760108fe7b6010327e274917a808c"
+dependencies = [
+ "base64",
+ "http",
+ "httparse",
+ "log",
+]
+
+[[package]]
 name = "url"
 version = "2.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6487,6 +6518,12 @@ name = "utf-8"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09cc8ee72d2a9becf2f2febe0205bbed8fc6615b7cb429ad062dc7b7ddd036a9"
+
+[[package]]
+name = "utf8-zero"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8c0a043c9540bae7c578c88f91dda8bd82e59ae27c21baca69c8b191aaf5a6e"
 
 [[package]]
 name = "utf8_iter"
@@ -6880,6 +6917,15 @@ checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22cfaf3c063993ff62e73cb4311efde4db1efb31ab78a3e5c457939ad5cc0bed"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]

@@ -1,7 +1,7 @@
 //! Platform helpers for OrcaShell.
 //!
 //! Provides cross-platform abstractions for subprocess spawning, file replacement,
-//! and home directory resolution.
+//! home directory resolution, and opening URLs in the user's default browser.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -51,6 +51,35 @@ pub fn user_home_dir() -> Option<PathBuf> {
             None
         }
     })
+}
+
+/// Open a web URL in the platform-default browser.
+///
+/// Returns `false` if the URL scheme is unsupported or the spawn fails.
+pub fn open_url(url: &str) -> bool {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return false;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        command("explorer").arg(url).spawn().is_ok()
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        command("open").arg(url).spawn().is_ok()
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        command("xdg-open").arg(url).spawn().is_ok()
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        false
+    }
 }
 
 // ── Platform-specific implementation ────────────────────────────────

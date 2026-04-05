@@ -10,7 +10,7 @@ use crate::context_menu::ContextMenuItem;
 use crate::settings::{AppSettings, ThemeId};
 use crate::theme::{self, OrcaTheme};
 use crate::workspace::layout::LayoutNode;
-use crate::workspace::{RenameLocation, WorkspaceState};
+use crate::workspace::{AuxiliaryTabKind, RenameLocation, WorkspaceState};
 
 const DOUBLE_CLICK_MS: u128 = 400;
 const MIN_SIDEBAR_WIDTH: f32 = 240.0;
@@ -54,6 +54,10 @@ struct SidebarDragView {
     palette: OrcaTheme,
 }
 
+struct SidebarTooltipView {
+    label: String,
+}
+
 impl Render for SidebarDragView {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div()
@@ -66,6 +70,23 @@ impl Render for SidebarDragView {
             .shadow_md()
             .text_size(px(12.0))
             .text_color(rgb(self.palette.BONE))
+            .child(self.label.clone())
+    }
+}
+
+impl Render for SidebarTooltipView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = theme::active(cx);
+        div()
+            .px(px(8.0))
+            .py(px(4.0))
+            .bg(rgb(palette.SURFACE))
+            .border_1()
+            .border_color(rgb(palette.BORDER_EMPHASIS))
+            .rounded(px(6.0))
+            .text_size(px(10.0))
+            .font_family("JetBrains Mono")
+            .text_color(rgb(palette.BONE))
             .child(self.label.clone())
     }
 }
@@ -247,6 +268,20 @@ impl Sidebar {
             let pid = project.id.clone();
             let project_name = project.name.clone();
             let ws_proj_drop = self.workspace.clone();
+            let terminal_ids = project.layout.collect_terminal_ids();
+            let project_has_git = terminal_ids
+                .iter()
+                .any(|terminal_id| ws.terminal_is_git_backed(terminal_id));
+            let live_diff_is_open = ws.auxiliary_tabs().iter().any(|tab| {
+                matches!(
+                    &tab.kind,
+                    AuxiliaryTabKind::LiveDiffStream { project_id } if project_id == &project.id
+                )
+            });
+            let live_diff_is_active = matches!(
+                ws.active_auxiliary_tab().map(|tab| &tab.kind),
+                Some(AuxiliaryTabKind::LiveDiffStream { project_id }) if project_id == &project.id
+            );
 
             // Project header row
             let mut project_row = div()
@@ -266,6 +301,70 @@ impl Sidebar {
             let drag_name = project_name.clone();
             let ws_add = self.workspace.clone();
             let pid_for_add = pid.clone();
+            let ws_live_diff = self.workspace.clone();
+            let pid_for_live_diff = pid.clone();
+            let mut project_actions = div().flex().items_center().gap(px(4.0));
+            if project_has_git {
+                project_actions = project_actions.child(
+                    div()
+                        .id(ElementId::Name(
+                            format!("sidebar-live-diff-{}", project.id).into(),
+                        ))
+                        .cursor_pointer()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .w(px(20.0))
+                        .text_size(px(12.0))
+                        .text_color(rgb(if live_diff_is_active || live_diff_is_open {
+                            palette.STATUS_GREEN
+                        } else {
+                            palette.FOG
+                        }))
+                        .hover(move |s| s.text_color(rgb(palette.STATUS_GREEN)))
+                        .tooltip(move |_window, cx| {
+                            cx.new(|_| SidebarTooltipView {
+                                label: "Open Live Diff Stream".into(),
+                            })
+                            .into()
+                        })
+                        .child("◉")
+                        .on_click(move |_event, _window, cx| {
+                            cx.stop_propagation();
+                            ws_live_diff.update(cx, |ws, cx| {
+                                ws.open_live_diff_stream_for_project(&pid_for_live_diff, cx);
+                            });
+                        }),
+                );
+            }
+            project_actions = project_actions.child(
+                div()
+                    .id(ElementId::Name(
+                        format!("sidebar-add-term-{}", project.id).into(),
+                    ))
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(24.0))
+                    .text_size(px(15.0))
+                    .text_color(rgb(palette.FOG))
+                    .hover(|s| s.text_color(rgb(palette.BONE)))
+                    .tooltip(move |_window, cx| {
+                        cx.new(|_| SidebarTooltipView {
+                            label: "Open New Terminal".into(),
+                        })
+                        .into()
+                    })
+                    .child("+")
+                    .on_click(move |_event, window, cx| {
+                        cx.stop_propagation();
+                        ws_add.update(cx, |ws, cx| {
+                            ws.add_terminal_to_project(&pid_for_add, cx);
+                        });
+                        focus_active_terminal(&ws_add, window, cx);
+                    }),
+            );
             project_row = project_row
                 .justify_between()
                 .child(
@@ -286,25 +385,7 @@ impl Sidebar {
                             format!("\u{1F4C1} {}", project.name)
                         }),
                 )
-                .child(
-                    div()
-                        .id(ElementId::Name(
-                            format!("sidebar-add-term-{}", project.id).into(),
-                        ))
-                        .cursor_pointer()
-                        .flex()
-                        .justify_center()
-                        .w(px(20.0))
-                        .text_size(px(13.0))
-                        .text_color(rgb(palette.FOG))
-                        .child("+")
-                        .on_click(move |_event, window, cx| {
-                            ws_add.update(cx, |ws, cx| {
-                                ws.add_terminal_to_project(&pid_for_add, cx);
-                            });
-                            focus_active_terminal(&ws_add, window, cx);
-                        }),
-                )
+                .child(project_actions)
                 .on_click({
                     let ws = self.workspace.clone();
                     let pid = pid.clone();
@@ -345,6 +426,7 @@ impl Sidebar {
                     let ws_notify = self.workspace.clone();
                     move |event: &MouseDownEvent, _window, cx| {
                         let pid_worktree = pid.clone();
+                        let pid_feed = pid.clone();
                         let pid_remove = pid.clone();
                         let items = vec![
                             ContextMenuItem {
@@ -354,6 +436,14 @@ impl Sidebar {
                                     ws.create_project_worktree(&pid_worktree, cx);
                                 }),
                                 enabled: true,
+                            },
+                            ContextMenuItem {
+                                label: "Open Live Diff Feed".into(),
+                                shortcut: None,
+                                action: Box::new(move |ws, cx| {
+                                    ws.open_live_diff_stream_for_project(&pid_feed, cx);
+                                }),
+                                enabled: project_has_git,
                             },
                             ContextMenuItem {
                                 label: "Remove Project".into(),
@@ -372,7 +462,6 @@ impl Sidebar {
             list = list.child(project_row);
 
             // Terminal rows - one per tab (each tab's first terminal)
-            let terminal_ids = project.layout.collect_terminal_ids();
             for tid in &terminal_ids {
                 let term_name = ws.terminal_display_name(&project.id, tid);
                 let git_snapshot = ws.terminal_git_snapshot(tid).cloned();
@@ -919,7 +1008,8 @@ impl Render for Sidebar {
         let (logo_asset, logo_opacity) = match selection.resolved_id {
             ThemeId::Light => ("images/OrcaShellLogoTrimmedBlue.png", 1.0),
             ThemeId::Sepia => ("images/OrcaShellLogoTrimmedBrown.png", 1.0),
-            ThemeId::Dark | ThemeId::Black => ("images/OrcaShellLogoTrimmed.png", 0.75),
+            ThemeId::Dark => ("images/OrcaShellLogoTrimmed.png", 0.75),
+            ThemeId::Black => ("images/OrcaShellLogoTrimmed.png", 1.0),
         };
         if !self.visible {
             return div().id("sidebar-root").w(px(0.0)).h_full().flex_shrink_0();

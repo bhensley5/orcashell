@@ -3,23 +3,25 @@ pub mod focus;
 pub mod layout;
 pub mod project;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use gpui::*;
 use orcashell_daemon_core::git_coordinator::{
     GitActionKind, GitCoordinator, GitEvent, GitRemoteKind,
 };
 use orcashell_git::{
-    DiffDocument, DiffSectionKind, DiffSelectionKey, FileDiffDocument, GitSnapshotSummary,
+    rehighlight_captured_feed_event, DiffDocument, DiffLineKind, DiffSectionKind, DiffSelectionKey,
+    FeedCaptureResult, FeedCapturedEvent, FeedEventData, FeedEventFailure, FeedEventFile,
+    FeedEventFileSummary, FeedEventKind, FeedScopeCapture, FileDiffDocument, GitSnapshotSummary,
     ManagedWorktree,
 };
 use parking_lot::Mutex;
 use uuid::Uuid;
 
-use crate::settings::AppSettings;
+use crate::settings::{AppSettings, ThemeId};
 use crate::theme;
 use crate::theme::OrcaTheme;
 use focus::{FocusManager, FocusTarget};
@@ -65,6 +67,7 @@ pub enum NotificationTier {
 pub enum AuxiliaryTabKind {
     Settings,
     Diff { scope_root: PathBuf },
+    LiveDiffStream { project_id: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,6 +92,91 @@ pub struct DiffFileState {
     pub loading: bool,
     pub requested_generation: Option<u64>,
     pub requested_selection: Option<DiffSelectionKey>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeedEntryOrigin {
+    BootstrapSnapshot,
+    LiveDelta,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeedScopeKind {
+    ProjectRoot,
+    ManagedWorktree,
+}
+
+pub type ChangeFeedFileSummary = FeedEventFileSummary;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FeedCaptureState {
+    Pending,
+    Ready(CapturedEventDiff),
+    Truncated(CapturedEventDiff),
+    Failed { message: String },
+}
+
+pub type CapturedEventDiff = FeedCapturedEvent;
+pub type CapturedDiffFile = FeedEventFile;
+pub type CapturedDiffFailure = FeedEventFailure;
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedPreviewFile {
+    pub selection: DiffSelectionKey,
+    pub relative_path: PathBuf,
+    pub lines: Vec<orcashell_git::DiffLineView>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedPreviewLayout {
+    pub files: Vec<FeedPreviewFile>,
+    pub hidden_file_count: usize,
+    pub hidden_file_names: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeFeedEntry {
+    pub id: u64,
+    pub observed_at: SystemTime,
+    pub origin: FeedEntryOrigin,
+    pub scope_root: PathBuf,
+    pub branch_name: String,
+    pub scope_kind: FeedScopeKind,
+    pub worktree_name: Option<String>,
+    pub source_terminal_id: Option<String>,
+    pub generation: u64,
+    pub changed_file_count: usize,
+    pub insertions: usize,
+    pub deletions: usize,
+    pub files: Vec<ChangeFeedFileSummary>,
+    pub capture_state: FeedCaptureState,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FeedScopeState {
+    pub last_generation: Option<u64>,
+    pub emitted_baseline: Option<Arc<FeedScopeCapture>>,
+    pub pending_refresh: bool,
+    pub bootstrap_emitted: bool,
+    pub latest_snapshot_generation: Option<u64>,
+    pub latest_request_revision: u64,
+    pub latest_error: Option<String>,
+    pub error_revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeFeedState {
+    pub project_id: String,
+    pub entries: VecDeque<ChangeFeedEntry>,
+    pub selected_entry_id: Option<u64>,
+    pub detail_pane_open: bool,
+    pub unread_count: usize,
+    pub live_follow: bool,
+    next_entry_id: u64,
+    next_error_revision: u64,
+    tracked_scopes: HashMap<PathBuf, FeedScopeState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,6 +289,15 @@ const ACTIVITY_PULSE_WINDOW: Duration = Duration::from_millis(1000);
 const LOCAL_INPUT_SUPPRESS_WINDOW: Duration = Duration::from_millis(1000);
 const SETTINGS_TAB_ID: &str = "aux-settings";
 const DEFAULT_DIFF_TREE_WIDTH: f32 = 300.0;
+const FEED_ENTRY_RETENTION_CAP: usize = 2_000;
+#[allow(dead_code)]
+const FEED_PREVIEW_LINE_BUDGET: usize = 18;
+#[allow(dead_code)]
+const FEED_PREVIEW_FILE_CAP: usize = 3;
+#[allow(dead_code)]
+const FEED_PREVIEW_MIN_LINES_PER_FILE: usize = 3;
+#[allow(dead_code)]
+const FEED_PREVIEW_HIDDEN_NAME_CAP: usize = 3;
 
 fn classify_notification(title: &str, body: &str, patterns: &[String]) -> NotificationTier {
     let lower = format!("{title} {body}").to_lowercase();
@@ -223,6 +320,7 @@ pub struct WorkspaceState {
     auxiliary_tabs: Vec<AuxiliaryTabState>,
     active_auxiliary_tab_id: Option<String>,
     diff_tabs: HashMap<PathBuf, DiffTabState>,
+    live_diff_feeds: HashMap<String, ChangeFeedState>,
     /// Active inline rename, if any.
     pub renaming: Option<RenameState>,
     pub workspace_banner: Option<WorkspaceBanner>,
@@ -266,6 +364,48 @@ impl DiffTabState {
     }
 }
 
+impl ChangeFeedState {
+    fn new(project_id: String) -> Self {
+        Self {
+            project_id,
+            entries: VecDeque::new(),
+            selected_entry_id: None,
+            detail_pane_open: false,
+            unread_count: 0,
+            live_follow: true,
+            next_entry_id: 1,
+            next_error_revision: 1,
+            tracked_scopes: HashMap::new(),
+        }
+    }
+
+    fn replace_tracked_scopes(&mut self, scope_roots: impl IntoIterator<Item = PathBuf>) {
+        let mut next_scopes = HashMap::new();
+        for scope_root in scope_roots {
+            let state = self.tracked_scopes.remove(&scope_root).unwrap_or_default();
+            next_scopes.insert(scope_root, state);
+        }
+        self.tracked_scopes = next_scopes;
+    }
+
+    pub fn tracked_scope_count(&self) -> usize {
+        self.tracked_scopes.len()
+    }
+
+    pub fn latest_scope_error(&self) -> Option<&str> {
+        self.tracked_scopes
+            .values()
+            .filter_map(|scope| {
+                scope
+                    .latest_error
+                    .as_deref()
+                    .map(|error| (scope.error_revision, error))
+            })
+            .max_by_key(|(revision, _)| *revision)
+            .map(|(_, error)| error)
+    }
+}
+
 impl WorkspaceState {
     pub fn new() -> Self {
         Self::new_with_services(WorkspaceServices::default())
@@ -284,6 +424,7 @@ impl WorkspaceState {
             auxiliary_tabs: Vec::new(),
             active_auxiliary_tab_id: None,
             diff_tabs: HashMap::new(),
+            live_diff_feeds: HashMap::new(),
             renaming: None,
             workspace_banner: None,
             pending_focus_terminal_id: None,
@@ -394,6 +535,13 @@ impl WorkspaceState {
         }
     }
 
+    fn report_live_diff_action_error(&mut self, message: String) {
+        self.workspace_banner = Some(WorkspaceBanner {
+            kind: WorkspaceBannerKind::Error,
+            message,
+        });
+    }
+
     pub fn terminal_git_snapshot(&self, terminal_id: &str) -> Option<&GitSnapshotSummary> {
         self.terminal_git_scopes
             .get(terminal_id)
@@ -450,6 +598,114 @@ impl WorkspaceState {
         }
     }
 
+    pub fn live_diff_feed_state(&self, project_id: &str) -> Option<&ChangeFeedState> {
+        self.live_diff_feeds.get(project_id)
+    }
+
+    pub fn live_diff_source_terminal_available(&self, terminal_id: &str) -> bool {
+        self.terminal_exists(terminal_id)
+    }
+
+    pub fn select_feed_entry(&mut self, project_id: &str, entry_id: u64) -> bool {
+        let Some(feed) = self.live_diff_feeds.get_mut(project_id) else {
+            return false;
+        };
+        if !feed.entries.iter().any(|entry| entry.id == entry_id) {
+            return false;
+        }
+
+        let changed = feed.selected_entry_id != Some(entry_id) || !feed.detail_pane_open;
+        feed.selected_entry_id = Some(entry_id);
+        feed.detail_pane_open = true;
+        changed
+    }
+
+    pub fn close_feed_detail_pane(&mut self, project_id: &str) -> bool {
+        let Some(feed) = self.live_diff_feeds.get_mut(project_id) else {
+            return false;
+        };
+        if !feed.detail_pane_open {
+            return false;
+        }
+
+        feed.detail_pane_open = false;
+        feed.selected_entry_id = None;
+        true
+    }
+
+    pub fn set_live_diff_feed_follow_state(&mut self, project_id: &str, live_follow: bool) -> bool {
+        let Some(feed) = self.live_diff_feeds.get_mut(project_id) else {
+            return false;
+        };
+
+        let unread_count = if live_follow { 0 } else { feed.unread_count };
+        let changed = feed.live_follow != live_follow || feed.unread_count != unread_count;
+        feed.live_follow = live_follow;
+        feed.unread_count = unread_count;
+        changed
+    }
+
+    pub fn resume_live_diff_feed(&mut self, project_id: &str) -> bool {
+        self.set_live_diff_feed_follow_state(project_id, true)
+    }
+
+    pub fn open_diff_tab_for_scope_and_file(
+        &mut self,
+        scope_root: &Path,
+        preferred_file: Option<DiffSelectionKey>,
+    ) -> bool {
+        let Some(branch_name) = self
+            .git_scopes
+            .get(scope_root)
+            .map(|snapshot| snapshot.branch_name.clone())
+        else {
+            self.report_live_diff_action_error(format!(
+                "The diff scope {} is no longer available.",
+                scope_root.display()
+            ));
+            return false;
+        };
+
+        self.open_or_focus_diff_tab_internal(scope_root.to_path_buf(), branch_name);
+        if let Some(diff_tab) = self.diff_tabs.get_mut(scope_root) {
+            diff_tab.selected_file = preferred_file;
+            diff_tab.file.document = None;
+            diff_tab.file.error = None;
+        }
+        self.request_diff_index_refresh(scope_root);
+        true
+    }
+
+    pub fn focus_terminal_by_id(&mut self, terminal_id: &str) -> bool {
+        let Some(project_id) = self
+            .project_id_for_terminal(terminal_id)
+            .map(str::to_string)
+        else {
+            self.report_live_diff_action_error(format!(
+                "The source terminal {terminal_id} is no longer available."
+            ));
+            return false;
+        };
+        let Some(layout_path) = self
+            .project(&project_id)
+            .and_then(|project| project.layout.find_terminal_path(terminal_id))
+        else {
+            self.report_live_diff_action_error(format!(
+                "The source terminal {terminal_id} is no longer available."
+            ));
+            return false;
+        };
+        if !self.select_terminal_internal(&project_id, &layout_path) {
+            self.report_live_diff_action_error(format!(
+                "The source terminal {terminal_id} is no longer available."
+            ));
+            return false;
+        }
+
+        self.pending_focus_terminal_id = Some(terminal_id.to_string());
+        true
+    }
+
     pub fn is_settings_focused(&self) -> bool {
         self.active_auxiliary_tab()
             .is_some_and(|tab| matches!(tab.kind, AuxiliaryTabKind::Settings))
@@ -470,6 +726,12 @@ impl WorkspaceState {
         };
 
         if self.open_or_focus_diff_tab_internal(snapshot.scope_root, snapshot.branch_name) {
+            cx.notify();
+        }
+    }
+
+    pub fn open_live_diff_stream_for_project(&mut self, project_id: &str, cx: &mut Context<Self>) {
+        if self.open_or_focus_live_diff_stream_tab_internal(project_id) {
             cx.notify();
         }
     }
@@ -908,6 +1170,31 @@ impl WorkspaceState {
             .create_managed_worktree(project_id, &project.path, None);
     }
 
+    fn open_or_focus_live_diff_stream_tab_internal(&mut self, project_id: &str) -> bool {
+        let Some(project_name) = self.project(project_id).map(|project| project.name.clone())
+        else {
+            return false;
+        };
+
+        let tab_id = Self::live_diff_stream_tab_id(project_id);
+        let title = Self::live_diff_stream_title(&project_name);
+        if let Some(tab) = self.auxiliary_tabs.iter_mut().find(|tab| tab.id == tab_id) {
+            tab.title = title;
+        } else {
+            self.auxiliary_tabs.push(AuxiliaryTabState {
+                id: tab_id.clone(),
+                title,
+                kind: AuxiliaryTabKind::LiveDiffStream {
+                    project_id: project_id.to_string(),
+                },
+            });
+        }
+
+        self.ensure_live_diff_feed_state(project_id);
+        self.active_auxiliary_tab_id = Some(tab_id);
+        true
+    }
+
     fn open_or_focus_diff_tab_internal(
         &mut self,
         scope_root: PathBuf,
@@ -1069,6 +1356,22 @@ impl WorkspaceState {
                 self.apply_file_diff_update(scope_root, generation, selection, result);
                 cx.notify();
             }
+            GitEvent::FeedCaptureCompleted {
+                project_id,
+                scope_root,
+                generation,
+                request_revision,
+                result,
+            } => {
+                self.apply_live_feed_capture_update(
+                    &project_id,
+                    scope_root,
+                    generation,
+                    request_revision,
+                    result,
+                );
+                cx.notify();
+            }
             GitEvent::LocalActionCompleted {
                 scope_root,
                 action,
@@ -1105,10 +1408,12 @@ impl WorkspaceState {
                     }
                 }
                 self.refresh_diff_tab_if_stale(&scope_root, snapshot.generation);
+                self.refresh_live_feeds_for_scope_if_stale(&scope_root, snapshot.generation);
             }
             Err(message) => {
                 if let Some(scope_root) = scope_root {
-                    self.mark_diff_scope_unavailable(&scope_root, message);
+                    self.mark_diff_scope_unavailable(&scope_root, message.clone());
+                    self.record_live_feed_scope_error(&scope_root, message);
                     self.detach_scope(&scope_root);
                 }
                 for terminal_id in terminal_ids {
@@ -1366,6 +1671,14 @@ impl WorkspaceState {
         }
     }
 
+    fn live_diff_stream_tab_id(project_id: &str) -> String {
+        format!("aux-live-diff-{project_id}")
+    }
+
+    fn live_diff_stream_title(project_name: &str) -> String {
+        format!("Live Feed: {project_name}")
+    }
+
     fn diff_tab_id(scope_root: &Path) -> String {
         let scope = scope_root.to_string_lossy();
         format!(
@@ -1396,11 +1709,17 @@ impl WorkspaceState {
         }
 
         self.active_auxiliary_tab_id = Some(tab_id.to_string());
-        if let Some(AuxiliaryTabKind::Diff { scope_root }) =
-            self.active_auxiliary_tab().map(|tab| tab.kind.clone())
-        {
-            self.services.git.request_snapshot(&scope_root, None);
-            self.request_diff_index_refresh(&scope_root);
+        if let Some(tab_kind) = self.active_auxiliary_tab().map(|tab| tab.kind.clone()) {
+            match tab_kind {
+                AuxiliaryTabKind::Diff { scope_root } => {
+                    self.services.git.request_snapshot(&scope_root, None);
+                    self.request_diff_index_refresh(&scope_root);
+                }
+                AuxiliaryTabKind::LiveDiffStream { project_id } => {
+                    self.ensure_live_diff_feed_state(&project_id);
+                }
+                AuxiliaryTabKind::Settings => {}
+            }
         }
         true
     }
@@ -1414,8 +1733,15 @@ impl WorkspaceState {
         if self.active_auxiliary_tab_id.as_deref() == Some(tab_id) {
             self.active_auxiliary_tab_id = None;
         }
-        if let AuxiliaryTabKind::Diff { scope_root } = removed.kind {
-            self.diff_tabs.remove(&scope_root);
+        match removed.kind {
+            AuxiliaryTabKind::Diff { scope_root } => {
+                self.diff_tabs.remove(&scope_root);
+            }
+            AuxiliaryTabKind::LiveDiffStream { project_id } => {
+                self.cancel_feed_captures_for_project(&project_id);
+                self.live_diff_feeds.remove(&project_id);
+            }
+            AuxiliaryTabKind::Settings => {}
         }
         true
     }
@@ -1433,10 +1759,151 @@ impl WorkspaceState {
         }
     }
 
+    fn ensure_live_diff_feed_state(&mut self, project_id: &str) {
+        let tracked_scopes = self.tracked_scope_roots_for_project(project_id);
+        let feed_was_present = self.live_diff_feeds.contains_key(project_id);
+        let scopes_to_refresh = {
+            let feed = self
+                .live_diff_feeds
+                .entry(project_id.to_string())
+                .or_insert_with(|| ChangeFeedState::new(project_id.to_string()));
+            let previous_scopes = feed.tracked_scopes.keys().cloned().collect::<HashSet<_>>();
+            feed.replace_tracked_scopes(tracked_scopes);
+            if !feed_was_present {
+                feed.tracked_scopes.keys().cloned().collect::<Vec<_>>()
+            } else {
+                feed.tracked_scopes
+                    .keys()
+                    .filter(|scope_root| !previous_scopes.contains(*scope_root))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            }
+        };
+
+        for scope_root in scopes_to_refresh {
+            self.request_live_feed_capture(project_id, &scope_root);
+        }
+    }
+
+    fn tracked_scope_roots_for_project(&self, project_id: &str) -> Vec<PathBuf> {
+        let Some(project) = self.project(project_id) else {
+            return Vec::new();
+        };
+
+        let mut seen = HashSet::new();
+        let mut scopes = Vec::new();
+        for terminal_id in project.layout.collect_terminal_ids() {
+            let Some(scope_root) = self.terminal_git_scopes.get(&terminal_id) else {
+                continue;
+            };
+            if seen.insert(scope_root.clone()) {
+                scopes.push(scope_root.clone());
+            }
+        }
+        scopes
+    }
+
+    fn refresh_live_diff_feed_scope_membership(&mut self, project_id: &str) {
+        if !self.live_diff_feeds.contains_key(project_id) {
+            return;
+        }
+        self.ensure_live_diff_feed_state(project_id);
+    }
+
+    fn cancel_feed_captures_for_project(&mut self, project_id: &str) {
+        let _ = project_id;
+    }
+
+    fn cancel_feed_capture_target(&mut self, project_id: &str, entry_id: u64) {
+        let _ = (project_id, entry_id);
+    }
+
+    fn request_live_feed_capture(&mut self, project_id: &str, scope_root: &Path) {
+        let latest_generation = self.latest_diff_generation(scope_root);
+        let Some(feed) = self.live_diff_feeds.get_mut(project_id) else {
+            return;
+        };
+        let Some(scope_state) = feed.tracked_scopes.get_mut(scope_root) else {
+            return;
+        };
+        if let Some(latest_generation) = latest_generation {
+            scope_state.latest_snapshot_generation = Some(
+                scope_state
+                    .latest_snapshot_generation
+                    .map_or(latest_generation, |current| current.max(latest_generation)),
+            );
+        }
+        if scope_state.pending_refresh {
+            return;
+        }
+        let Some(generation) = latest_generation else {
+            return;
+        };
+        let previous = scope_state.emitted_baseline.clone();
+        scope_state.latest_request_revision += 1;
+        let request_revision = scope_state.latest_request_revision;
+        scope_state.pending_refresh = true;
+        self.services.git.request_feed_capture(
+            project_id,
+            scope_root,
+            generation,
+            request_revision,
+            previous,
+        );
+    }
+
+    fn refresh_live_feeds_for_scope_if_stale(&mut self, scope_root: &Path, latest_generation: u64) {
+        let project_ids: Vec<String> = self
+            .live_diff_feeds
+            .iter()
+            .filter(|(_, feed)| feed.tracked_scopes.contains_key(scope_root))
+            .filter_map(|(project_id, feed)| {
+                let scope_state = feed.tracked_scopes.get(scope_root)?;
+                let stale = scope_state
+                    .last_generation
+                    .is_none_or(|generation| generation < latest_generation);
+                if stale {
+                    Some(project_id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for project_id in project_ids {
+            if let Some(feed) = self.live_diff_feeds.get_mut(&project_id) {
+                if let Some(scope_state) = feed.tracked_scopes.get_mut(scope_root) {
+                    scope_state.latest_snapshot_generation = Some(
+                        scope_state
+                            .latest_snapshot_generation
+                            .map_or(latest_generation, |current| current.max(latest_generation)),
+                    );
+                }
+            }
+            self.request_live_feed_capture(&project_id, scope_root);
+        }
+    }
+
     fn latest_diff_generation(&self, scope_root: &Path) -> Option<u64> {
         self.git_scopes
             .get(scope_root)
             .map(|snapshot| snapshot.generation)
+    }
+
+    fn record_live_feed_scope_error(&mut self, scope_root: &Path, message: String) {
+        for feed in self
+            .live_diff_feeds
+            .values_mut()
+            .filter(|feed| feed.tracked_scopes.contains_key(scope_root))
+        {
+            let next_revision = feed.next_error_revision;
+            feed.next_error_revision += 1;
+            if let Some(scope_state) = feed.tracked_scopes.get_mut(scope_root) {
+                scope_state.pending_refresh = false;
+                scope_state.latest_error = Some(format!("{}: {}", scope_root.display(), message));
+                scope_state.error_revision = next_revision;
+            }
+        }
     }
 
     fn request_diff_index_refresh(&mut self, scope_root: &Path) {
@@ -1525,6 +1992,279 @@ impl WorkspaceState {
         self.request_diff_index_refresh(scope_root);
     }
 
+    fn apply_live_feed_capture_update(
+        &mut self,
+        project_id: &str,
+        scope_root: PathBuf,
+        generation: u64,
+        request_revision: u64,
+        result: Result<FeedCaptureResult, String>,
+    ) {
+        let mut entry_to_append = None;
+        let mut should_request_refresh = false;
+
+        {
+            let Some(feed) = self.live_diff_feeds.get_mut(project_id) else {
+                return;
+            };
+            let Some(scope_state) = feed.tracked_scopes.get_mut(&scope_root) else {
+                return;
+            };
+            if request_revision < scope_state.latest_request_revision {
+                return;
+            }
+
+            scope_state.pending_refresh = false;
+
+            match result {
+                Ok(result) => {
+                    let FeedCaptureResult {
+                        current_capture,
+                        event,
+                    } = result;
+                    scope_state.latest_error = None;
+                    scope_state.error_revision = 0;
+                    scope_state.last_generation = Some(generation);
+                    scope_state.emitted_baseline = Some(Arc::new(current_capture));
+                    if let Some(event) = event {
+                        if matches!(event.kind, FeedEventKind::BootstrapSnapshot) {
+                            scope_state.bootstrap_emitted = true;
+                        }
+                        entry_to_append = Some(event);
+                    }
+
+                    should_request_refresh = scope_state
+                        .latest_snapshot_generation
+                        .is_some_and(|latest| latest > generation);
+                }
+                Err(message) => {
+                    scope_state.latest_error =
+                        Some(format!("{}: {}", scope_root.display(), message));
+                    scope_state.error_revision = feed.next_error_revision;
+                    feed.next_error_revision += 1;
+                }
+            }
+        }
+
+        if let Some(event) = entry_to_append.as_ref() {
+            self.append_live_feed_entry(project_id, &scope_root, generation, event);
+        }
+        if should_request_refresh {
+            self.request_live_feed_capture(project_id, &scope_root);
+        }
+    }
+
+    fn append_live_feed_entry(
+        &mut self,
+        project_id: &str,
+        scope_root: &Path,
+        generation: u64,
+        event: &FeedEventData,
+    ) {
+        let Some(branch_name) = self
+            .git_scopes
+            .get(scope_root)
+            .map(|snapshot| snapshot.branch_name.clone())
+        else {
+            return;
+        };
+        let (scope_kind, worktree_name, source_terminal_id) =
+            self.resolve_feed_scope_metadata(scope_root);
+        let mut pruned_ids = Vec::new();
+        let Some(feed) = self.live_diff_feeds.get_mut(project_id) else {
+            return;
+        };
+        let entry_id = feed.next_entry_id;
+        feed.next_entry_id += 1;
+        feed.entries.push_back(ChangeFeedEntry {
+            id: entry_id,
+            observed_at: SystemTime::now(),
+            origin: Self::feed_origin_from_kind(event.kind),
+            scope_root: scope_root.to_path_buf(),
+            branch_name,
+            scope_kind,
+            worktree_name,
+            source_terminal_id,
+            generation,
+            changed_file_count: event.changed_file_count,
+            insertions: event.insertions,
+            deletions: event.deletions,
+            files: event.files.clone(),
+            capture_state: Self::capture_state_from_event(event.capture.clone()),
+        });
+        if !feed.live_follow {
+            feed.unread_count += 1;
+        }
+
+        while feed.entries.len() > FEED_ENTRY_RETENTION_CAP {
+            if let Some(pruned) = feed.entries.pop_front() {
+                pruned_ids.push(pruned.id);
+                if feed.selected_entry_id == Some(pruned.id) {
+                    feed.selected_entry_id = None;
+                    feed.detail_pane_open = false;
+                }
+            }
+        }
+
+        for pruned_id in pruned_ids {
+            self.cancel_feed_capture_target(project_id, pruned_id);
+        }
+    }
+
+    fn resolve_feed_scope_metadata(
+        &self,
+        scope_root: &Path,
+    ) -> (FeedScopeKind, Option<String>, Option<String>) {
+        let stored = self
+            .services
+            .store
+            .lock()
+            .as_ref()
+            .and_then(|store| store.find_worktree_by_path(scope_root).ok().flatten());
+
+        if let Some(stored) = stored {
+            (
+                FeedScopeKind::ManagedWorktree,
+                Some(stored.worktree_name),
+                stored.primary_terminal_id,
+            )
+        } else {
+            (FeedScopeKind::ProjectRoot, None, None)
+        }
+    }
+
+    fn feed_origin_from_kind(kind: FeedEventKind) -> FeedEntryOrigin {
+        match kind {
+            FeedEventKind::BootstrapSnapshot => FeedEntryOrigin::BootstrapSnapshot,
+            FeedEventKind::LiveDelta => FeedEntryOrigin::LiveDelta,
+        }
+    }
+
+    fn capture_state_from_event(captured: CapturedEventDiff) -> FeedCaptureState {
+        if captured.files.is_empty() && !captured.failed_files.is_empty() {
+            FeedCaptureState::Failed {
+                message: format!(
+                    "Could not capture diffs for {} file(s).",
+                    captured.failed_files.len()
+                ),
+            }
+        } else if captured.truncated {
+            FeedCaptureState::Truncated(captured)
+        } else {
+            FeedCaptureState::Ready(captured)
+        }
+    }
+
+    pub(crate) fn build_feed_preview_layout(captured: &CapturedEventDiff) -> FeedPreviewLayout {
+        let previewable_files = captured
+            .files
+            .iter()
+            .filter_map(|file| {
+                if file.file.is_binary {
+                    return None;
+                }
+
+                let preview_lines = file
+                    .document
+                    .lines
+                    .iter()
+                    .filter(|line| include_preview_line(line.kind))
+                    .cloned()
+                    .collect::<Vec<_>>();
+
+                if preview_lines.is_empty() {
+                    None
+                } else {
+                    Some((file, preview_lines))
+                }
+            })
+            .collect::<Vec<_>>();
+        let shown = previewable_files
+            .iter()
+            .take(FEED_PREVIEW_FILE_CAP)
+            .collect::<Vec<_>>();
+        if shown.is_empty() {
+            return FeedPreviewLayout {
+                files: Vec::new(),
+                hidden_file_count: 0,
+                hidden_file_names: Vec::new(),
+            };
+        }
+
+        let hidden_files = previewable_files
+            .iter()
+            .skip(FEED_PREVIEW_FILE_CAP)
+            .collect::<Vec<_>>();
+        let available_per_file = shown
+            .iter()
+            .map(|(_, lines)| lines.len())
+            .collect::<Vec<_>>();
+        let line_budget = available_per_file
+            .iter()
+            .sum::<usize>()
+            .min(FEED_PREVIEW_LINE_BUDGET);
+        let allocations = Self::allocate_feed_preview_lines(&available_per_file, line_budget);
+
+        FeedPreviewLayout {
+            files: shown
+                .into_iter()
+                .zip(allocations)
+                .map(|((file, lines), line_count)| FeedPreviewFile {
+                    selection: file.selection.clone(),
+                    relative_path: file.file.relative_path.clone(),
+                    lines: lines.iter().take(line_count).cloned().collect(),
+                })
+                .collect(),
+            hidden_file_count: hidden_files.len(),
+            hidden_file_names: hidden_files
+                .into_iter()
+                .take(FEED_PREVIEW_HIDDEN_NAME_CAP)
+                .map(|(file, _)| file.file.relative_path.clone())
+                .collect(),
+        }
+    }
+
+    #[allow(dead_code)]
+    fn allocate_feed_preview_lines(
+        available_per_file: &[usize],
+        total_budget: usize,
+    ) -> Vec<usize> {
+        if available_per_file.is_empty() || total_budget == 0 {
+            return vec![0; available_per_file.len()];
+        }
+
+        let mut allocations = vec![0; available_per_file.len()];
+        let mut remaining_budget = total_budget;
+
+        if total_budget >= available_per_file.len() * FEED_PREVIEW_MIN_LINES_PER_FILE {
+            for (allocation, available) in allocations.iter_mut().zip(available_per_file) {
+                let granted = (*available).min(FEED_PREVIEW_MIN_LINES_PER_FILE);
+                *allocation = granted;
+                remaining_budget = remaining_budget.saturating_sub(granted);
+            }
+        }
+
+        while remaining_budget > 0 {
+            let mut granted_any = false;
+            for (allocation, available) in allocations.iter_mut().zip(available_per_file) {
+                if remaining_budget == 0 {
+                    break;
+                }
+                if *allocation < *available {
+                    *allocation += 1;
+                    remaining_budget -= 1;
+                    granted_any = true;
+                }
+            }
+
+            if !granted_any {
+                break;
+            }
+        }
+
+        allocations
+    }
+
     fn mark_diff_scope_unavailable(&mut self, scope_root: &Path, message: String) {
         let Some(diff_tab) = self.diff_tabs.get_mut(scope_root) else {
             return;
@@ -1539,6 +2279,9 @@ impl WorkspaceState {
     }
 
     fn attach_terminal_scope(&mut self, terminal_id: &str, scope_root: PathBuf) {
+        let project_id = self
+            .project_id_for_terminal(terminal_id)
+            .map(str::to_string);
         let already_attached = self
             .terminal_git_scopes
             .get(terminal_id)
@@ -1562,6 +2305,9 @@ impl WorkspaceState {
         }
 
         self.services.git.subscribe(&scope_root);
+        if let Some(project_id) = project_id {
+            self.refresh_live_diff_feed_scope_membership(&project_id);
+        }
     }
 
     fn terminal_exists(&self, terminal_id: &str) -> bool {
@@ -1588,6 +2334,9 @@ impl WorkspaceState {
     }
 
     fn detach_terminal_scope(&mut self, terminal_id: &str) {
+        let project_id = self
+            .project_id_for_terminal(terminal_id)
+            .map(str::to_string);
         let Some(scope_root) = self.terminal_git_scopes.remove(terminal_id) else {
             return;
         };
@@ -1599,6 +2348,9 @@ impl WorkspaceState {
             .any(|candidate| *candidate == scope_root)
         {
             self.git_scopes.remove(&scope_root);
+        }
+        if let Some(project_id) = project_id {
+            self.refresh_live_diff_feed_scope_membership(&project_id);
         }
     }
 
@@ -2015,6 +2767,7 @@ impl WorkspaceState {
         palette.search_input_cursor = rgb(theme.ORCA_BLUE).into();
         palette.search_input_selection =
             rgba(theme::with_alpha(theme.TERMINAL_SELECTION, 0x40)).into();
+        palette.terminal_selection = rgba(theme::with_alpha(theme.TERMINAL_SELECTION, 0x40)).into();
         let hover_base = if theme.TERMINAL_BACKGROUND == theme.DEEP {
             theme.PATCH
         } else {
@@ -2050,7 +2803,12 @@ impl WorkspaceState {
 
     pub fn refresh_diff_theme(&mut self, _cx: &mut Context<Self>) {
         let active_theme = theme::active_selection(_cx).resolved_id;
+        self.refresh_diff_theme_for(active_theme);
+    }
+
+    fn refresh_diff_theme_for(&mut self, active_theme: ThemeId) {
         self.services.git.set_diff_theme(active_theme);
+        self.refresh_live_feed_theme(active_theme);
 
         let scopes: Vec<PathBuf> = self.diff_tabs.keys().cloned().collect();
         for scope_root in scopes {
@@ -2060,9 +2818,26 @@ impl WorkspaceState {
                 .and_then(|tab| tab.selected_file.clone());
             if let Some(diff_tab) = self.diff_tabs.get_mut(&scope_root) {
                 diff_tab.file.document = None;
+                diff_tab.file.error = None;
+                diff_tab.file.loading = false;
+                diff_tab.file.requested_generation = None;
+                diff_tab.file.requested_selection = None;
             }
             if let Some(selection) = selected {
                 self.request_selected_file_diff(&scope_root, selection);
+            }
+        }
+    }
+
+    fn refresh_live_feed_theme(&mut self, active_theme: ThemeId) {
+        for feed in self.live_diff_feeds.values_mut() {
+            for entry in &mut feed.entries {
+                match &mut entry.capture_state {
+                    FeedCaptureState::Ready(captured) | FeedCaptureState::Truncated(captured) => {
+                        rehighlight_captured_feed_event(captured, active_theme);
+                    }
+                    FeedCaptureState::Pending | FeedCaptureState::Failed { .. } => {}
+                }
             }
         }
     }
@@ -3027,6 +3802,10 @@ impl WorkspaceState {
     /// Remove a project and all its terminal sessions.
     /// Switches active project if the removed one was active.
     pub fn remove_project(&mut self, project_id: &str, cx: &mut Context<Self>) {
+        let live_diff_tab_id = Self::live_diff_stream_tab_id(project_id);
+        let _ = self.close_auxiliary_tab_internal(&live_diff_tab_id);
+        self.live_diff_feeds.remove(project_id);
+
         // Collect terminal IDs to destroy
         let ids_to_destroy: Vec<String> = self
             .project(project_id)
@@ -3747,6 +4526,10 @@ impl WorkspaceState {
     }
 }
 
+fn include_preview_line(kind: DiffLineKind) -> bool {
+    !matches!(kind, DiffLineKind::FileHeader | DiffLineKind::HunkHeader)
+}
+
 impl Default for WorkspaceState {
     fn default() -> Self {
         Self::new()
@@ -3763,7 +4546,7 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;
-    use std::time::Instant;
+    use std::time::{Instant, SystemTime};
 
     use orcashell_daemon_core::git_coordinator::{GitActionKind, GitRemoteKind};
     use parking_lot::Mutex;
@@ -3772,17 +4555,21 @@ mod tests {
     // pulls in GPUI types and blows the gpui_macros proc-macro stack budget
     // during test compilation (same pattern as orcashell-terminal-view/search.rs).
     use super::{
-        classify_notification, AuxiliaryTabKind, AuxiliaryTabState, DiffTabState, FocusTarget,
-        GitEvent, GitSnapshotSummary, LayoutNode, NotificationTier, ProjectData,
-        ResumableAgentKind, ResumeInjectionTrigger, TerminalRuntimeState, WorkspaceServices,
-        WorkspaceState, SETTINGS_TAB_ID,
+        classify_notification, AuxiliaryTabKind, AuxiliaryTabState, CapturedDiffFailure,
+        CapturedDiffFile, CapturedEventDiff, ChangeFeedEntry, ChangeFeedState, DiffTabState,
+        FeedCaptureState, FeedEntryOrigin, FeedScopeKind, FocusTarget, GitEvent,
+        GitSnapshotSummary, LayoutNode, NotificationTier, ProjectData, ResumableAgentKind,
+        ResumeInjectionTrigger, TerminalRuntimeState, WorkspaceBannerKind, WorkspaceServices,
+        WorkspaceState, FEED_PREVIEW_FILE_CAP, FEED_PREVIEW_LINE_BUDGET, SETTINGS_TAB_ID,
     };
+    use crate::settings::ThemeId;
     use orcashell_git::{
-        ChangedFile, DiffDocument, DiffSectionKind, DiffSelectionKey, FileDiffDocument,
-        GitFileStatus, GitTrackingStatus,
+        ChangedFile, DiffDocument, DiffSectionKind, DiffSelectionKey, FeedCaptureResult,
+        FeedEventData, FeedEventFileSummary, FeedEventKind, FeedLayerSnapshot, FeedLayerState,
+        FeedScopeCapture, FileDiffDocument, GitFileStatus, GitTrackingStatus, FEED_EVENT_LINE_CAP,
     };
     use orcashell_session::semantic_zone::SemanticState;
-    use orcashell_store::Store;
+    use orcashell_store::{Store, StoredWorktree};
     use uuid::Uuid;
 
     fn term(id: &str) -> LayoutNode {
@@ -3895,6 +4682,168 @@ mod tests {
                 highlights: None,
                 inline_changes: None,
             }],
+        }
+    }
+
+    fn file_document_with_lines(
+        scope_root: &str,
+        generation: u64,
+        path: &str,
+        line_count: usize,
+    ) -> FileDiffDocument {
+        FileDiffDocument {
+            generation,
+            selection: DiffSelectionKey {
+                section: DiffSectionKind::Unstaged,
+                relative_path: PathBuf::from(path),
+            },
+            file: changed_file(path, GitFileStatus::Modified),
+            lines: (0..line_count)
+                .map(|index| orcashell_git::DiffLineView {
+                    kind: orcashell_git::DiffLineKind::Context,
+                    old_lineno: Some((index + 1) as u32),
+                    new_lineno: Some((index + 1) as u32),
+                    text: format!("{scope_root}:{path}:{index}"),
+                    highlights: None,
+                    inline_changes: None,
+                })
+                .collect(),
+        }
+    }
+
+    fn file_document_with_kinds(
+        generation: u64,
+        path: &str,
+        lines: Vec<(orcashell_git::DiffLineKind, &str)>,
+    ) -> FileDiffDocument {
+        FileDiffDocument {
+            generation,
+            selection: DiffSelectionKey {
+                section: DiffSectionKind::Unstaged,
+                relative_path: PathBuf::from(path),
+            },
+            file: changed_file(path, GitFileStatus::Modified),
+            lines: lines
+                .into_iter()
+                .enumerate()
+                .map(|(index, (kind, text))| orcashell_git::DiffLineView {
+                    kind,
+                    old_lineno: Some((index + 1) as u32),
+                    new_lineno: Some((index + 1) as u32),
+                    text: text.to_string(),
+                    highlights: None,
+                    inline_changes: None,
+                })
+                .collect(),
+        }
+    }
+
+    fn feed_file_summary(
+        path: &str,
+        section: DiffSectionKind,
+        status: GitFileStatus,
+    ) -> FeedEventFileSummary {
+        FeedEventFileSummary {
+            relative_path: PathBuf::from(path),
+            staged: matches!(section, DiffSectionKind::Staged),
+            unstaged: matches!(section, DiffSectionKind::Unstaged),
+            status,
+            is_binary: false,
+            insertions: 3,
+            deletions: 1,
+        }
+    }
+
+    fn feed_event_file(
+        scope_root: &str,
+        generation: u64,
+        section: DiffSectionKind,
+        path: &str,
+        line_count: usize,
+    ) -> CapturedDiffFile {
+        CapturedDiffFile {
+            selection: DiffSelectionKey {
+                section,
+                relative_path: PathBuf::from(path),
+            },
+            file: changed_file(path, GitFileStatus::Modified),
+            document: file_document_with_lines(scope_root, generation, path, line_count),
+        }
+    }
+
+    fn feed_failure(path: &str, section: DiffSectionKind, message: &str) -> CapturedDiffFailure {
+        CapturedDiffFailure {
+            selection: DiffSelectionKey {
+                section,
+                relative_path: PathBuf::from(path),
+            },
+            relative_path: PathBuf::from(path),
+            message: message.into(),
+        }
+    }
+
+    fn captured_event(
+        files: Vec<CapturedDiffFile>,
+        failed_files: Vec<CapturedDiffFailure>,
+        truncated: bool,
+    ) -> CapturedEventDiff {
+        let total_rendered_lines = files.iter().map(|file| file.document.lines.len()).sum();
+        let total_rendered_bytes = files
+            .iter()
+            .flat_map(|file| file.document.lines.iter())
+            .map(|line| line.text.len())
+            .sum();
+        CapturedEventDiff {
+            files,
+            failed_files,
+            truncated,
+            total_rendered_lines,
+            total_rendered_bytes,
+        }
+    }
+
+    fn feed_event(
+        kind: FeedEventKind,
+        files: Vec<FeedEventFileSummary>,
+        capture: CapturedEventDiff,
+    ) -> FeedEventData {
+        FeedEventData {
+            kind,
+            changed_file_count: files.len(),
+            insertions: files.iter().map(|file| file.insertions).sum(),
+            deletions: files.iter().map(|file| file.deletions).sum(),
+            files,
+            capture,
+        }
+    }
+
+    fn feed_layer(
+        scope_root: &str,
+        generation: u64,
+        section: DiffSectionKind,
+        path: &str,
+        line_count: usize,
+    ) -> FeedLayerSnapshot {
+        FeedLayerSnapshot {
+            selection: DiffSelectionKey {
+                section,
+                relative_path: PathBuf::from(path),
+            },
+            file: changed_file(path, GitFileStatus::Modified),
+            state: FeedLayerState::Ready(file_document_with_lines(
+                scope_root, generation, path, line_count,
+            )),
+        }
+    }
+
+    fn feed_capture_result(
+        generation: u64,
+        layers: Vec<FeedLayerSnapshot>,
+        event: Option<FeedEventData>,
+    ) -> FeedCaptureResult {
+        FeedCaptureResult {
+            current_capture: FeedScopeCapture { generation, layers },
+            event,
         }
     }
 
@@ -4024,6 +4973,1200 @@ mod tests {
         assert_eq!(
             ws.diff_tabs[&scope_root].index.requested_generation,
             Some(2)
+        );
+    }
+
+    #[test]
+    fn live_diff_feed_open_dedupes_by_project_and_tracks_current_scopes() {
+        let mut ws = WorkspaceState::new();
+        ws.projects
+            .push(project("proj-1", tabs(vec![term("t1"), term("t2")], 0)));
+        ws.terminal_git_scopes
+            .insert("t1".into(), PathBuf::from("/tmp/repo-a"));
+        ws.terminal_git_scopes
+            .insert("t2".into(), PathBuf::from("/tmp/repo-b"));
+
+        assert!(ws.open_or_focus_live_diff_stream_tab_internal("proj-1"));
+        assert!(ws.open_or_focus_live_diff_stream_tab_internal("proj-1"));
+
+        assert_eq!(ws.auxiliary_tabs.len(), 1);
+        assert_eq!(
+            ws.active_auxiliary_tab_id.as_deref(),
+            Some("aux-live-diff-proj-1")
+        );
+        assert_eq!(
+            ws.live_diff_feed_state("proj-1")
+                .map(|feed| feed.tracked_scope_count()),
+            Some(2)
+        );
+        assert_eq!(ws.auxiliary_tabs[0].title, "Live Feed: proj-1");
+    }
+
+    #[test]
+    fn closing_live_diff_auxiliary_tab_discards_feed_state() {
+        let mut ws = WorkspaceState::new();
+        ws.projects
+            .push(project("proj-1", tabs(vec![term("t1")], 0)));
+
+        assert!(ws.open_or_focus_live_diff_stream_tab_internal("proj-1"));
+        assert!(ws.live_diff_feed_state("proj-1").is_some());
+
+        assert!(ws.close_auxiliary_tab_internal("aux-live-diff-proj-1"));
+        assert!(ws.live_diff_feed_state("proj-1").is_none());
+        assert!(ws.auxiliary_tabs.is_empty());
+    }
+
+    #[test]
+    fn live_diff_feed_scope_membership_updates_on_scope_attach_and_detach() {
+        let mut ws = WorkspaceState::new();
+        ws.projects
+            .push(project("proj-1", tabs(vec![term("t1")], 0)));
+
+        assert!(ws.open_or_focus_live_diff_stream_tab_internal("proj-1"));
+        assert_eq!(
+            ws.live_diff_feed_state("proj-1")
+                .map(|feed| feed.tracked_scope_count()),
+            Some(0)
+        );
+
+        ws.attach_terminal_scope("t1", PathBuf::from("/tmp/repo-a"));
+        assert_eq!(
+            ws.live_diff_feed_state("proj-1")
+                .map(|feed| feed.tracked_scope_count()),
+            Some(1)
+        );
+
+        ws.detach_terminal_scope("t1");
+        assert_eq!(
+            ws.live_diff_feed_state("proj-1")
+                .map(|feed| feed.tracked_scope_count()),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn live_diff_feed_bootstraps_dirty_scope_only() {
+        let mut ws = WorkspaceState::new();
+        let scope_root = PathBuf::from("/tmp/repo");
+        ws.projects
+            .push(project("proj-1", tabs(vec![term("t1")], 0)));
+        ws.terminal_git_scopes
+            .insert("t1".into(), scope_root.clone());
+        ws.git_scopes
+            .insert(scope_root.clone(), snapshot_with("/tmp/repo", 1, "main"));
+        assert!(ws.open_or_focus_live_diff_stream_tab_internal("proj-1"));
+
+        ws.apply_live_feed_capture_update(
+            "proj-1",
+            scope_root.clone(),
+            1,
+            1,
+            Ok(feed_capture_result(1, Vec::new(), None)),
+        );
+        assert_eq!(
+            ws.live_diff_feed_state("proj-1")
+                .map(|feed| feed.entries.len()),
+            Some(0)
+        );
+
+        ws.git_scopes
+            .insert(scope_root.clone(), snapshot_with("/tmp/repo", 2, "main"));
+        ws.refresh_live_feeds_for_scope_if_stale(&scope_root, 2);
+        ws.apply_live_feed_capture_update(
+            "proj-1",
+            scope_root,
+            2,
+            2,
+            Ok(feed_capture_result(
+                2,
+                vec![feed_layer(
+                    "/tmp/repo",
+                    2,
+                    DiffSectionKind::Unstaged,
+                    "a.rs",
+                    2,
+                )],
+                Some(feed_event(
+                    FeedEventKind::LiveDelta,
+                    vec![feed_file_summary(
+                        "a.rs",
+                        DiffSectionKind::Unstaged,
+                        GitFileStatus::Modified,
+                    )],
+                    captured_event(
+                        vec![feed_event_file(
+                            "/tmp/repo",
+                            2,
+                            DiffSectionKind::Unstaged,
+                            "a.rs",
+                            2,
+                        )],
+                        Vec::new(),
+                        false,
+                    ),
+                )),
+            )),
+        );
+
+        let feed = ws.live_diff_feed_state("proj-1").unwrap();
+        assert_eq!(feed.entries.len(), 1);
+        assert_eq!(feed.entries[0].origin, FeedEntryOrigin::LiveDelta);
+        assert!(matches!(
+            feed.entries[0].capture_state,
+            FeedCaptureState::Ready(CapturedEventDiff { ref files, .. }) if files.len() == 1
+        ));
+    }
+
+    #[test]
+    fn live_diff_feed_ignores_stale_request_revisions() {
+        let mut ws = WorkspaceState::new();
+        let scope_root = PathBuf::from("/tmp/repo");
+        ws.projects
+            .push(project("proj-1", tabs(vec![term("t1")], 0)));
+        ws.terminal_git_scopes
+            .insert("t1".into(), scope_root.clone());
+        ws.git_scopes
+            .insert(scope_root.clone(), snapshot_with("/tmp/repo", 2, "main"));
+        assert!(ws.open_or_focus_live_diff_stream_tab_internal("proj-1"));
+
+        {
+            let scope_state = ws
+                .live_diff_feeds
+                .get_mut("proj-1")
+                .and_then(|feed| feed.tracked_scopes.get_mut(&scope_root))
+                .unwrap();
+            scope_state.latest_request_revision = 2;
+        }
+
+        ws.apply_live_feed_capture_update(
+            "proj-1",
+            scope_root,
+            2,
+            1,
+            Ok(feed_capture_result(
+                2,
+                vec![feed_layer(
+                    "/tmp/repo",
+                    2,
+                    DiffSectionKind::Unstaged,
+                    "a.rs",
+                    1,
+                )],
+                Some(feed_event(
+                    FeedEventKind::BootstrapSnapshot,
+                    vec![feed_file_summary(
+                        "a.rs",
+                        DiffSectionKind::Unstaged,
+                        GitFileStatus::Modified,
+                    )],
+                    captured_event(
+                        vec![feed_event_file(
+                            "/tmp/repo",
+                            2,
+                            DiffSectionKind::Unstaged,
+                            "a.rs",
+                            1,
+                        )],
+                        Vec::new(),
+                        false,
+                    ),
+                )),
+            )),
+        );
+
+        assert_eq!(
+            ws.live_diff_feed_state("proj-1")
+                .map(|feed| feed.entries.len()),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn live_diff_feed_dirty_to_clean_appends_ready_clean_event() {
+        let mut ws = WorkspaceState::new();
+        let scope_root = PathBuf::from("/tmp/repo");
+        ws.projects
+            .push(project("proj-1", tabs(vec![term("t1")], 0)));
+        ws.terminal_git_scopes
+            .insert("t1".into(), scope_root.clone());
+        ws.git_scopes
+            .insert(scope_root.clone(), snapshot_with("/tmp/repo", 2, "main"));
+        assert!(ws.open_or_focus_live_diff_stream_tab_internal("proj-1"));
+
+        ws.apply_live_feed_capture_update(
+            "proj-1",
+            scope_root.clone(),
+            2,
+            1,
+            Ok(feed_capture_result(
+                2,
+                vec![feed_layer(
+                    "/tmp/repo",
+                    2,
+                    DiffSectionKind::Unstaged,
+                    "a.rs",
+                    2,
+                )],
+                Some(feed_event(
+                    FeedEventKind::BootstrapSnapshot,
+                    vec![feed_file_summary(
+                        "a.rs",
+                        DiffSectionKind::Unstaged,
+                        GitFileStatus::Modified,
+                    )],
+                    captured_event(
+                        vec![feed_event_file(
+                            "/tmp/repo",
+                            2,
+                            DiffSectionKind::Unstaged,
+                            "a.rs",
+                            2,
+                        )],
+                        Vec::new(),
+                        false,
+                    ),
+                )),
+            )),
+        );
+        ws.git_scopes
+            .insert(scope_root.clone(), snapshot_with("/tmp/repo", 3, "main"));
+        ws.refresh_live_feeds_for_scope_if_stale(&scope_root, 3);
+        ws.apply_live_feed_capture_update(
+            "proj-1",
+            scope_root,
+            3,
+            2,
+            Ok(feed_capture_result(
+                3,
+                Vec::new(),
+                Some(feed_event(
+                    FeedEventKind::LiveDelta,
+                    Vec::new(),
+                    captured_event(Vec::new(), Vec::new(), false),
+                )),
+            )),
+        );
+
+        let feed = ws.live_diff_feed_state("proj-1").unwrap();
+        assert_eq!(feed.entries.len(), 2);
+        let clean_entry = &feed.entries[1];
+        assert_eq!(clean_entry.origin, FeedEntryOrigin::LiveDelta);
+        assert_eq!(clean_entry.changed_file_count, 0);
+        assert!(matches!(
+            clean_entry.capture_state,
+            FeedCaptureState::Ready(CapturedEventDiff {
+                ref files,
+                ref failed_files,
+                truncated: false,
+                total_rendered_lines: 0,
+                total_rendered_bytes: 0,
+            }) if files.is_empty() && failed_files.is_empty()
+        ));
+    }
+
+    #[test]
+    fn live_diff_feed_retention_prunes_oldest_entries() {
+        let mut ws = WorkspaceState::new();
+        let scope_root = PathBuf::from("/tmp/repo");
+        ws.projects
+            .push(project("proj-1", tabs(vec![term("t1")], 0)));
+        ws.terminal_git_scopes
+            .insert("t1".into(), scope_root.clone());
+        ws.git_scopes
+            .insert(scope_root.clone(), snapshot_with("/tmp/repo", 1, "main"));
+        assert!(ws.open_or_focus_live_diff_stream_tab_internal("proj-1"));
+
+        let event = feed_event(
+            FeedEventKind::LiveDelta,
+            vec![feed_file_summary(
+                "a.rs",
+                DiffSectionKind::Unstaged,
+                GitFileStatus::Modified,
+            )],
+            captured_event(
+                vec![feed_event_file(
+                    "/tmp/repo",
+                    1,
+                    DiffSectionKind::Unstaged,
+                    "a.rs",
+                    1,
+                )],
+                Vec::new(),
+                false,
+            ),
+        );
+
+        for generation in 1..=2_001 {
+            ws.append_live_feed_entry("proj-1", &scope_root, generation, &event);
+        }
+
+        let feed = ws.live_diff_feed_state("proj-1").unwrap();
+        assert_eq!(feed.entries.len(), 2_000);
+        assert_eq!(feed.entries.front().map(|entry| entry.id), Some(2));
+        assert_eq!(feed.entries.back().map(|entry| entry.id), Some(2_001));
+    }
+
+    #[test]
+    fn live_diff_feed_capture_result_maps_truncated_events() {
+        let mut ws = WorkspaceState::new();
+        let scope_root = PathBuf::from("/tmp/repo");
+        ws.projects
+            .push(project("proj-1", tabs(vec![term("t1")], 0)));
+        ws.terminal_git_scopes
+            .insert("t1".into(), scope_root.clone());
+        ws.git_scopes
+            .insert(scope_root.clone(), snapshot_with("/tmp/repo", 2, "main"));
+        assert!(ws.open_or_focus_live_diff_stream_tab_internal("proj-1"));
+
+        ws.apply_live_feed_capture_update(
+            "proj-1",
+            scope_root,
+            2,
+            1,
+            Ok(feed_capture_result(
+                2,
+                vec![feed_layer(
+                    "/tmp/repo",
+                    2,
+                    DiffSectionKind::Unstaged,
+                    "a.rs",
+                    FEED_EVENT_LINE_CAP,
+                )],
+                Some(feed_event(
+                    FeedEventKind::BootstrapSnapshot,
+                    vec![feed_file_summary(
+                        "a.rs",
+                        DiffSectionKind::Unstaged,
+                        GitFileStatus::Modified,
+                    )],
+                    captured_event(
+                        vec![feed_event_file(
+                            "/tmp/repo",
+                            2,
+                            DiffSectionKind::Unstaged,
+                            "a.rs",
+                            FEED_EVENT_LINE_CAP,
+                        )],
+                        Vec::new(),
+                        true,
+                    ),
+                )),
+            )),
+        );
+
+        let feed = ws.live_diff_feed_state("proj-1").unwrap();
+        assert!(matches!(
+            &feed.entries[0].capture_state,
+            FeedCaptureState::Truncated(CapturedEventDiff { files, total_rendered_lines, .. })
+                if files.len() == 1 && *total_rendered_lines == FEED_EVENT_LINE_CAP
+        ));
+    }
+
+    #[test]
+    fn live_diff_feed_capture_result_maps_all_failures_to_failed_state() {
+        let mut ws = WorkspaceState::new();
+        let scope_root = PathBuf::from("/tmp/repo");
+        ws.projects
+            .push(project("proj-1", tabs(vec![term("t1")], 0)));
+        ws.terminal_git_scopes
+            .insert("t1".into(), scope_root.clone());
+        ws.git_scopes
+            .insert(scope_root.clone(), snapshot_with("/tmp/repo", 2, "main"));
+        assert!(ws.open_or_focus_live_diff_stream_tab_internal("proj-1"));
+
+        ws.apply_live_feed_capture_update(
+            "proj-1",
+            scope_root,
+            2,
+            1,
+            Ok(feed_capture_result(
+                2,
+                vec![FeedLayerSnapshot {
+                    selection: DiffSelectionKey {
+                        section: DiffSectionKind::Unstaged,
+                        relative_path: PathBuf::from("a.rs"),
+                    },
+                    file: changed_file("a.rs", GitFileStatus::Modified),
+                    state: FeedLayerState::Unavailable {
+                        message: "capture failed".into(),
+                    },
+                }],
+                Some(feed_event(
+                    FeedEventKind::BootstrapSnapshot,
+                    vec![feed_file_summary(
+                        "a.rs",
+                        DiffSectionKind::Unstaged,
+                        GitFileStatus::Modified,
+                    )],
+                    captured_event(
+                        Vec::new(),
+                        vec![feed_failure(
+                            "a.rs",
+                            DiffSectionKind::Unstaged,
+                            "capture failed",
+                        )],
+                        false,
+                    ),
+                )),
+            )),
+        );
+
+        let feed = ws.live_diff_feed_state("proj-1").unwrap();
+        assert!(matches!(
+            feed.entries[0].capture_state,
+            FeedCaptureState::Failed { ref message } if message.contains("1 file")
+        ));
+    }
+
+    #[test]
+    fn live_diff_feed_scope_error_persists_until_failing_scope_recovers() {
+        let mut ws = WorkspaceState::new();
+        let scope_root_a = PathBuf::from("/tmp/repo-a");
+        let scope_root_b = PathBuf::from("/tmp/repo-b");
+        ws.projects
+            .push(project("proj-1", tabs(vec![term("t1"), term("t2")], 0)));
+        ws.terminal_git_scopes
+            .insert("t1".into(), scope_root_a.clone());
+        ws.terminal_git_scopes
+            .insert("t2".into(), scope_root_b.clone());
+        ws.git_scopes.insert(
+            scope_root_a.clone(),
+            snapshot_with("/tmp/repo-a", 2, "main"),
+        );
+        ws.git_scopes.insert(
+            scope_root_b.clone(),
+            snapshot_with("/tmp/repo-b", 2, "main"),
+        );
+        assert!(ws.open_or_focus_live_diff_stream_tab_internal("proj-1"));
+
+        ws.apply_live_feed_capture_update("proj-1", scope_root_a.clone(), 2, 1, Err("boom".into()));
+        assert!(ws
+            .live_diff_feed_state("proj-1")
+            .and_then(|feed| feed.latest_scope_error())
+            .is_some_and(|error| error.contains("/tmp/repo-a") && error.contains("boom")));
+
+        ws.apply_live_feed_capture_update(
+            "proj-1",
+            scope_root_b,
+            2,
+            1,
+            Ok(feed_capture_result(
+                2,
+                vec![feed_layer(
+                    "/tmp/repo-b",
+                    2,
+                    DiffSectionKind::Unstaged,
+                    "b.rs",
+                    1,
+                )],
+                Some(feed_event(
+                    FeedEventKind::BootstrapSnapshot,
+                    vec![feed_file_summary(
+                        "b.rs",
+                        DiffSectionKind::Unstaged,
+                        GitFileStatus::Modified,
+                    )],
+                    captured_event(
+                        vec![feed_event_file(
+                            "/tmp/repo-b",
+                            2,
+                            DiffSectionKind::Unstaged,
+                            "b.rs",
+                            1,
+                        )],
+                        Vec::new(),
+                        false,
+                    ),
+                )),
+            )),
+        );
+        assert!(ws
+            .live_diff_feed_state("proj-1")
+            .and_then(|feed| feed.latest_scope_error())
+            .is_some_and(|error| error.contains("/tmp/repo-a") && error.contains("boom")));
+
+        ws.git_scopes.insert(
+            scope_root_a.clone(),
+            snapshot_with("/tmp/repo-a", 3, "main"),
+        );
+        ws.refresh_live_feeds_for_scope_if_stale(&scope_root_a, 3);
+        ws.apply_live_feed_capture_update(
+            "proj-1",
+            scope_root_a,
+            3,
+            2,
+            Ok(feed_capture_result(
+                3,
+                vec![feed_layer(
+                    "/tmp/repo-a",
+                    3,
+                    DiffSectionKind::Unstaged,
+                    "a.rs",
+                    1,
+                )],
+                Some(feed_event(
+                    FeedEventKind::BootstrapSnapshot,
+                    vec![feed_file_summary(
+                        "a.rs",
+                        DiffSectionKind::Unstaged,
+                        GitFileStatus::Modified,
+                    )],
+                    captured_event(
+                        vec![feed_event_file(
+                            "/tmp/repo-a",
+                            3,
+                            DiffSectionKind::Unstaged,
+                            "a.rs",
+                            1,
+                        )],
+                        Vec::new(),
+                        false,
+                    ),
+                )),
+            )),
+        );
+        assert_eq!(
+            ws.live_diff_feed_state("proj-1")
+                .and_then(|feed| feed.latest_scope_error()),
+            None
+        );
+    }
+
+    #[test]
+    fn live_diff_feed_requeues_newer_generation_after_older_response() {
+        let mut ws = WorkspaceState::new();
+        let scope_root = PathBuf::from("/tmp/repo");
+        ws.projects
+            .push(project("proj-1", tabs(vec![term("t1")], 0)));
+        ws.terminal_git_scopes
+            .insert("t1".into(), scope_root.clone());
+        ws.git_scopes
+            .insert(scope_root.clone(), snapshot_with("/tmp/repo", 2, "main"));
+        assert!(ws.open_or_focus_live_diff_stream_tab_internal("proj-1"));
+        ws.git_scopes
+            .insert(scope_root.clone(), snapshot_with("/tmp/repo", 3, "main"));
+        ws.refresh_live_feeds_for_scope_if_stale(&scope_root, 3);
+
+        ws.apply_live_feed_capture_update(
+            "proj-1",
+            scope_root.clone(),
+            2,
+            1,
+            Ok(feed_capture_result(
+                2,
+                vec![feed_layer(
+                    "/tmp/repo",
+                    2,
+                    DiffSectionKind::Unstaged,
+                    "a.rs",
+                    1,
+                )],
+                Some(feed_event(
+                    FeedEventKind::BootstrapSnapshot,
+                    vec![feed_file_summary(
+                        "a.rs",
+                        DiffSectionKind::Unstaged,
+                        GitFileStatus::Modified,
+                    )],
+                    captured_event(
+                        vec![feed_event_file(
+                            "/tmp/repo",
+                            2,
+                            DiffSectionKind::Unstaged,
+                            "a.rs",
+                            1,
+                        )],
+                        Vec::new(),
+                        false,
+                    ),
+                )),
+            )),
+        );
+        assert!(ws
+            .live_diff_feeds
+            .get("proj-1")
+            .and_then(|feed| feed.tracked_scopes.get(&scope_root))
+            .is_some_and(|scope_state| {
+                scope_state.pending_refresh && scope_state.latest_request_revision == 2
+            }));
+
+        ws.apply_live_feed_capture_update(
+            "proj-1",
+            scope_root,
+            3,
+            2,
+            Ok(feed_capture_result(
+                3,
+                Vec::new(),
+                Some(feed_event(
+                    FeedEventKind::LiveDelta,
+                    Vec::new(),
+                    captured_event(Vec::new(), Vec::new(), false),
+                )),
+            )),
+        );
+        let feed = ws.live_diff_feed_state("proj-1").unwrap();
+        assert_eq!(feed.entries.len(), 2);
+        assert_eq!(feed.entries[0].generation, 2);
+        assert_eq!(feed.entries[1].generation, 3);
+    }
+
+    #[test]
+    fn live_diff_feed_paused_follow_accumulates_unread_entries() {
+        let mut ws = WorkspaceState::new();
+        let scope_root = PathBuf::from("/tmp/repo");
+        ws.projects
+            .push(project("proj-1", tabs(vec![term("t1")], 0)));
+        ws.terminal_git_scopes
+            .insert("t1".into(), scope_root.clone());
+        ws.git_scopes
+            .insert(scope_root.clone(), snapshot_with("/tmp/repo", 1, "main"));
+        assert!(ws.open_or_focus_live_diff_stream_tab_internal("proj-1"));
+        assert!(ws.set_live_diff_feed_follow_state("proj-1", false));
+
+        let event = feed_event(
+            FeedEventKind::LiveDelta,
+            vec![feed_file_summary(
+                "a.rs",
+                DiffSectionKind::Unstaged,
+                GitFileStatus::Modified,
+            )],
+            captured_event(
+                vec![feed_event_file(
+                    "/tmp/repo",
+                    1,
+                    DiffSectionKind::Unstaged,
+                    "a.rs",
+                    1,
+                )],
+                Vec::new(),
+                false,
+            ),
+        );
+        ws.append_live_feed_entry("proj-1", &scope_root, 1, &event);
+        ws.append_live_feed_entry("proj-1", &scope_root, 2, &event);
+
+        let feed = ws.live_diff_feed_state("proj-1").unwrap();
+        assert!(!feed.live_follow);
+        assert_eq!(feed.unread_count, 2);
+    }
+
+    #[test]
+    fn live_diff_feed_resume_clears_unread_entries() {
+        let mut ws = WorkspaceState::new();
+        let scope_root = PathBuf::from("/tmp/repo");
+        ws.projects
+            .push(project("proj-1", tabs(vec![term("t1")], 0)));
+        ws.terminal_git_scopes
+            .insert("t1".into(), scope_root.clone());
+        ws.git_scopes
+            .insert(scope_root.clone(), snapshot_with("/tmp/repo", 1, "main"));
+        assert!(ws.open_or_focus_live_diff_stream_tab_internal("proj-1"));
+        assert!(ws.set_live_diff_feed_follow_state("proj-1", false));
+
+        ws.append_live_feed_entry(
+            "proj-1",
+            &scope_root,
+            1,
+            &feed_event(
+                FeedEventKind::LiveDelta,
+                vec![feed_file_summary(
+                    "a.rs",
+                    DiffSectionKind::Unstaged,
+                    GitFileStatus::Modified,
+                )],
+                captured_event(
+                    vec![feed_event_file(
+                        "/tmp/repo",
+                        1,
+                        DiffSectionKind::Unstaged,
+                        "a.rs",
+                        1,
+                    )],
+                    Vec::new(),
+                    false,
+                ),
+            ),
+        );
+        assert!(ws.resume_live_diff_feed("proj-1"));
+
+        let feed = ws.live_diff_feed_state("proj-1").unwrap();
+        assert!(feed.live_follow);
+        assert_eq!(feed.unread_count, 0);
+    }
+
+    #[test]
+    fn live_diff_feed_select_entry_opens_and_closes_detail_pane() {
+        let mut ws = WorkspaceState::new();
+        let scope_root = PathBuf::from("/tmp/repo");
+        ws.projects
+            .push(project("proj-1", tabs(vec![term("t1")], 0)));
+        ws.terminal_git_scopes
+            .insert("t1".into(), scope_root.clone());
+        ws.git_scopes
+            .insert(scope_root.clone(), snapshot_with("/tmp/repo", 1, "main"));
+        assert!(ws.open_or_focus_live_diff_stream_tab_internal("proj-1"));
+
+        ws.append_live_feed_entry(
+            "proj-1",
+            &scope_root,
+            1,
+            &feed_event(
+                FeedEventKind::LiveDelta,
+                vec![feed_file_summary(
+                    "a.rs",
+                    DiffSectionKind::Unstaged,
+                    GitFileStatus::Modified,
+                )],
+                captured_event(
+                    vec![feed_event_file(
+                        "/tmp/repo",
+                        1,
+                        DiffSectionKind::Unstaged,
+                        "a.rs",
+                        1,
+                    )],
+                    Vec::new(),
+                    false,
+                ),
+            ),
+        );
+
+        assert!(ws.select_feed_entry("proj-1", 1));
+        let feed = ws.live_diff_feed_state("proj-1").unwrap();
+        assert_eq!(feed.selected_entry_id, Some(1));
+        assert!(feed.detail_pane_open);
+
+        assert!(ws.close_feed_detail_pane("proj-1"));
+        let feed = ws.live_diff_feed_state("proj-1").unwrap();
+        assert_eq!(feed.selected_entry_id, None);
+        assert!(!feed.detail_pane_open);
+    }
+
+    #[test]
+    fn live_diff_feed_open_diff_routes_scope_and_preferred_file() {
+        let mut ws = WorkspaceState::new();
+        let scope_root = PathBuf::from("/tmp/repo");
+        ws.git_scopes.insert(
+            scope_root.clone(),
+            snapshot_with("/tmp/repo", 4, "feature/live"),
+        );
+
+        let preferred_file = DiffSelectionKey {
+            section: DiffSectionKind::Unstaged,
+            relative_path: PathBuf::from("src/live.rs"),
+        };
+        assert!(ws.open_diff_tab_for_scope_and_file(&scope_root, Some(preferred_file.clone())));
+
+        let diff_tab = ws.diff_tab_state(&scope_root).unwrap();
+        assert_eq!(diff_tab.selected_file.as_ref(), Some(&preferred_file));
+        assert!(diff_tab.index.loading);
+        assert_eq!(diff_tab.index.requested_generation, Some(4));
+    }
+
+    #[test]
+    fn live_diff_feed_open_diff_missing_scope_sets_workspace_error() {
+        let mut ws = WorkspaceState::new();
+        let scope_root = PathBuf::from("/tmp/missing");
+
+        assert!(!ws.open_diff_tab_for_scope_and_file(&scope_root, None));
+        assert_eq!(
+            ws.workspace_banner()
+                .map(|banner| (&banner.kind, banner.message.as_str())),
+            Some((
+                &WorkspaceBannerKind::Error,
+                "The diff scope /tmp/missing is no longer available."
+            ))
+        );
+    }
+
+    #[test]
+    fn focus_terminal_by_id_selects_exact_terminal() {
+        let mut ws = WorkspaceState::new();
+        ws.projects
+            .push(project("proj-1", tabs(vec![term("t1"), term("t2")], 0)));
+        ws.terminal_runtime
+            .insert("t1".into(), runtime_state(Some(NotificationTier::Urgent)));
+        ws.terminal_runtime.insert(
+            "t2".into(),
+            runtime_state(Some(NotificationTier::Informational)),
+        );
+
+        assert!(ws.focus_terminal_by_id("t2"));
+        assert_eq!(ws.active_project_id.as_deref(), Some("proj-1"));
+        assert!(ws.focus.is_focused("proj-1", &[1]));
+        assert_eq!(ws.pending_focus_terminal_id.as_deref(), Some("t2"));
+        assert_eq!(
+            ws.terminal_notification_tier("t1"),
+            Some(NotificationTier::Urgent)
+        );
+        assert_eq!(ws.terminal_notification_tier("t2"), None);
+    }
+
+    #[test]
+    fn focus_terminal_by_id_missing_terminal_sets_workspace_error() {
+        let mut ws = WorkspaceState::new();
+
+        assert!(!ws.focus_terminal_by_id("missing"));
+        assert_eq!(
+            ws.workspace_banner()
+                .map(|banner| (&banner.kind, banner.message.as_str())),
+            Some((
+                &WorkspaceBannerKind::Error,
+                "The source terminal missing is no longer available."
+            ))
+        );
+    }
+
+    #[test]
+    fn live_diff_feed_resolves_managed_worktree_provenance() {
+        let mut ws = workspace_with_store();
+        let scope_root = PathBuf::from("/tmp/repo-worktree");
+        ws.projects
+            .push(project("proj-1", tabs(vec![term("t1")], 0)));
+        ws.terminal_git_scopes
+            .insert("t1".into(), scope_root.clone());
+        ws.git_scopes.insert(
+            scope_root.clone(),
+            snapshot_with("/tmp/repo-worktree", 1, "feature/live"),
+        );
+        assert!(ws.open_or_focus_live_diff_stream_tab_internal("proj-1"));
+
+        {
+            let mut store = ws.services.store.lock();
+            store
+                .as_mut()
+                .unwrap()
+                .save_worktree(&StoredWorktree {
+                    id: "wt-1".into(),
+                    project_id: "proj-1".into(),
+                    repo_root: PathBuf::from("/tmp/repo-root"),
+                    path: scope_root.clone(),
+                    worktree_name: "agent-a".into(),
+                    branch_name: "feature/live".into(),
+                    source_ref: "main".into(),
+                    primary_terminal_id: Some("t1".into()),
+                })
+                .unwrap();
+        }
+
+        ws.append_live_feed_entry(
+            "proj-1",
+            &scope_root,
+            1,
+            &feed_event(
+                FeedEventKind::LiveDelta,
+                vec![feed_file_summary(
+                    "a.rs",
+                    DiffSectionKind::Unstaged,
+                    GitFileStatus::Modified,
+                )],
+                captured_event(
+                    vec![feed_event_file(
+                        "/tmp/repo-worktree",
+                        1,
+                        DiffSectionKind::Unstaged,
+                        "a.rs",
+                        1,
+                    )],
+                    Vec::new(),
+                    false,
+                ),
+            ),
+        );
+
+        let entry = &ws.live_diff_feed_state("proj-1").unwrap().entries[0];
+        assert_eq!(entry.scope_kind, FeedScopeKind::ManagedWorktree);
+        assert_eq!(entry.worktree_name.as_deref(), Some("agent-a"));
+        assert_eq!(entry.source_terminal_id.as_deref(), Some("t1"));
+    }
+
+    #[test]
+    fn closing_live_diff_feed_discards_pending_refresh_and_ignores_late_results() {
+        let mut ws = WorkspaceState::new();
+        let scope_root = PathBuf::from("/tmp/repo");
+        ws.projects
+            .push(project("proj-1", tabs(vec![term("t1")], 0)));
+        ws.terminal_git_scopes
+            .insert("t1".into(), scope_root.clone());
+        ws.git_scopes
+            .insert(scope_root.clone(), snapshot_with("/tmp/repo", 2, "main"));
+        assert!(ws.open_or_focus_live_diff_stream_tab_internal("proj-1"));
+        assert!(ws
+            .live_diff_feeds
+            .get("proj-1")
+            .and_then(|feed| feed.tracked_scopes.get(&scope_root))
+            .is_some_and(|scope_state| scope_state.pending_refresh));
+
+        assert!(ws.close_auxiliary_tab_internal("aux-live-diff-proj-1"));
+        assert!(ws.live_diff_feed_state("proj-1").is_none());
+
+        ws.apply_live_feed_capture_update(
+            "proj-1",
+            scope_root,
+            2,
+            1,
+            Ok(feed_capture_result(
+                1,
+                vec![feed_layer(
+                    "/tmp/repo",
+                    2,
+                    DiffSectionKind::Unstaged,
+                    "a.rs",
+                    1,
+                )],
+                Some(feed_event(
+                    FeedEventKind::BootstrapSnapshot,
+                    vec![feed_file_summary(
+                        "a.rs",
+                        DiffSectionKind::Unstaged,
+                        GitFileStatus::Modified,
+                    )],
+                    captured_event(
+                        vec![feed_event_file(
+                            "/tmp/repo",
+                            2,
+                            DiffSectionKind::Unstaged,
+                            "a.rs",
+                            1,
+                        )],
+                        Vec::new(),
+                        false,
+                    ),
+                )),
+            )),
+        );
+        assert!(ws.live_diff_feed_state("proj-1").is_none());
+    }
+
+    #[test]
+    fn feed_preview_layout_single_file_can_use_full_budget() {
+        let preview = WorkspaceState::build_feed_preview_layout(&CapturedEventDiff {
+            files: vec![CapturedDiffFile {
+                selection: DiffSelectionKey {
+                    section: DiffSectionKind::Unstaged,
+                    relative_path: PathBuf::from("a.rs"),
+                },
+                file: changed_file("a.rs", GitFileStatus::Modified),
+                document: file_document_with_lines("/tmp/repo", 2, "a.rs", 40),
+            }],
+            failed_files: Vec::new(),
+            truncated: false,
+            total_rendered_lines: 40,
+            total_rendered_bytes: 400,
+        });
+
+        assert_eq!(preview.files.len(), 1);
+        assert_eq!(preview.files[0].lines.len(), FEED_PREVIEW_LINE_BUDGET);
+    }
+
+    #[test]
+    fn feed_preview_layout_skips_file_and_hunk_headers() {
+        let preview = WorkspaceState::build_feed_preview_layout(&CapturedEventDiff {
+            files: vec![CapturedDiffFile {
+                selection: DiffSelectionKey {
+                    section: DiffSectionKind::Unstaged,
+                    relative_path: PathBuf::from("a.rs"),
+                },
+                file: changed_file("a.rs", GitFileStatus::Modified),
+                document: file_document_with_kinds(
+                    2,
+                    "a.rs",
+                    vec![
+                        (
+                            orcashell_git::DiffLineKind::FileHeader,
+                            "diff --git a/a.rs b/a.rs",
+                        ),
+                        (orcashell_git::DiffLineKind::HunkHeader, "@@ -1,2 +1,2 @@"),
+                        (orcashell_git::DiffLineKind::Deletion, "old line"),
+                        (orcashell_git::DiffLineKind::Addition, "new line"),
+                    ],
+                ),
+            }],
+            failed_files: Vec::new(),
+            truncated: false,
+            total_rendered_lines: 4,
+            total_rendered_bytes: 64,
+        });
+
+        assert_eq!(preview.files.len(), 1);
+        assert_eq!(
+            preview.files[0]
+                .lines
+                .iter()
+                .map(|line| line.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                orcashell_git::DiffLineKind::Deletion,
+                orcashell_git::DiffLineKind::Addition,
+            ]
+        );
+    }
+
+    #[test]
+    fn feed_preview_layout_evenly_distributes_budget_across_visible_files() {
+        let preview = WorkspaceState::build_feed_preview_layout(&CapturedEventDiff {
+            files: ["a.rs", "b.rs", "c.rs", "d.rs"]
+                .into_iter()
+                .map(|path| CapturedDiffFile {
+                    selection: DiffSelectionKey {
+                        section: DiffSectionKind::Unstaged,
+                        relative_path: PathBuf::from(path),
+                    },
+                    file: changed_file(path, GitFileStatus::Modified),
+                    document: file_document_with_lines("/tmp/repo", 2, path, 20),
+                })
+                .collect(),
+            failed_files: Vec::new(),
+            truncated: false,
+            total_rendered_lines: 80,
+            total_rendered_bytes: 800,
+        });
+
+        assert_eq!(
+            preview
+                .files
+                .iter()
+                .map(|file| file.lines.len())
+                .collect::<Vec<_>>(),
+            vec![6, 6, 6]
+        );
+    }
+
+    #[test]
+    fn feed_preview_layout_evenly_distributes_budget_across_two_files() {
+        let preview = WorkspaceState::build_feed_preview_layout(&CapturedEventDiff {
+            files: ["a.rs", "b.rs"]
+                .into_iter()
+                .map(|path| CapturedDiffFile {
+                    selection: DiffSelectionKey {
+                        section: DiffSectionKind::Unstaged,
+                        relative_path: PathBuf::from(path),
+                    },
+                    file: changed_file(path, GitFileStatus::Modified),
+                    document: file_document_with_lines("/tmp/repo", 2, path, 20),
+                })
+                .collect(),
+            failed_files: Vec::new(),
+            truncated: false,
+            total_rendered_lines: 40,
+            total_rendered_bytes: 400,
+        });
+
+        assert_eq!(
+            preview
+                .files
+                .iter()
+                .map(|file| file.lines.len())
+                .collect::<Vec<_>>(),
+            vec![9, 9]
+        );
+    }
+
+    #[test]
+    fn feed_preview_layout_evenly_distributes_budget_across_three_files() {
+        let preview = WorkspaceState::build_feed_preview_layout(&CapturedEventDiff {
+            files: ["a.rs", "b.rs", "c.rs"]
+                .into_iter()
+                .map(|path| CapturedDiffFile {
+                    selection: DiffSelectionKey {
+                        section: DiffSectionKind::Unstaged,
+                        relative_path: PathBuf::from(path),
+                    },
+                    file: changed_file(path, GitFileStatus::Modified),
+                    document: file_document_with_lines("/tmp/repo", 2, path, 20),
+                })
+                .collect(),
+            failed_files: Vec::new(),
+            truncated: false,
+            total_rendered_lines: 60,
+            total_rendered_bytes: 600,
+        });
+
+        assert_eq!(
+            preview
+                .files
+                .iter()
+                .map(|file| file.lines.len())
+                .collect::<Vec<_>>(),
+            vec![6, 6, 6]
+        );
+    }
+
+    #[test]
+    fn feed_preview_layout_redistributes_budget_from_short_files() {
+        let preview = WorkspaceState::build_feed_preview_layout(&CapturedEventDiff {
+            files: vec![
+                CapturedDiffFile {
+                    selection: DiffSelectionKey {
+                        section: DiffSectionKind::Unstaged,
+                        relative_path: PathBuf::from("short.rs"),
+                    },
+                    file: changed_file("short.rs", GitFileStatus::Modified),
+                    document: file_document_with_lines("/tmp/repo", 2, "short.rs", 1),
+                },
+                CapturedDiffFile {
+                    selection: DiffSelectionKey {
+                        section: DiffSectionKind::Unstaged,
+                        relative_path: PathBuf::from("long-a.rs"),
+                    },
+                    file: changed_file("long-a.rs", GitFileStatus::Modified),
+                    document: file_document_with_lines("/tmp/repo", 2, "long-a.rs", 20),
+                },
+                CapturedDiffFile {
+                    selection: DiffSelectionKey {
+                        section: DiffSectionKind::Unstaged,
+                        relative_path: PathBuf::from("long-b.rs"),
+                    },
+                    file: changed_file("long-b.rs", GitFileStatus::Modified),
+                    document: file_document_with_lines("/tmp/repo", 2, "long-b.rs", 20),
+                },
+            ],
+            failed_files: Vec::new(),
+            truncated: false,
+            total_rendered_lines: 41,
+            total_rendered_bytes: 410,
+        });
+
+        assert_eq!(
+            preview
+                .files
+                .iter()
+                .map(|file| file.lines.len())
+                .collect::<Vec<_>>(),
+            vec![1, 9, 8]
+        );
+    }
+
+    #[test]
+    fn feed_preview_layout_limits_visible_files_and_tracks_hidden_names() {
+        let preview = WorkspaceState::build_feed_preview_layout(&CapturedEventDiff {
+            files: ["a.rs", "b.rs", "c.rs", "d.rs", "e.rs", "f.rs"]
+                .into_iter()
+                .map(|path| CapturedDiffFile {
+                    selection: DiffSelectionKey {
+                        section: DiffSectionKind::Unstaged,
+                        relative_path: PathBuf::from(path),
+                    },
+                    file: changed_file(path, GitFileStatus::Modified),
+                    document: file_document_with_lines("/tmp/repo", 2, path, 10),
+                })
+                .collect(),
+            failed_files: Vec::new(),
+            truncated: false,
+            total_rendered_lines: 60,
+            total_rendered_bytes: 600,
+        });
+
+        assert_eq!(preview.files.len(), FEED_PREVIEW_FILE_CAP);
+        assert_eq!(preview.hidden_file_count, 3);
+        assert_eq!(
+            preview.hidden_file_names,
+            vec![
+                PathBuf::from("d.rs"),
+                PathBuf::from("e.rs"),
+                PathBuf::from("f.rs")
+            ]
         );
     }
 
@@ -4276,6 +6419,112 @@ mod tests {
         );
         assert!(file_state.loading);
         assert!(file_state.error.is_none());
+    }
+
+    #[test]
+    fn refresh_diff_theme_requeues_selected_file_when_old_request_is_in_flight() {
+        let mut ws = WorkspaceState::new();
+        let scope_root = PathBuf::from("/tmp/repo");
+        let selection = DiffSelectionKey {
+            section: DiffSectionKind::Unstaged,
+            relative_path: PathBuf::from("src/lib.rs"),
+        };
+        ws.git_scopes
+            .insert(scope_root.clone(), snapshot_with("/tmp/repo", 7, "main"));
+        ws.diff_tabs.insert(
+            scope_root.clone(),
+            DiffTabState {
+                scope_root: scope_root.clone(),
+                tree_width: 300.0,
+                index: super::DiffIndexState {
+                    document: Some(diff_document(
+                        "/tmp/repo",
+                        7,
+                        "main",
+                        vec![changed_file("src/lib.rs", GitFileStatus::Modified)],
+                    )),
+                    error: None,
+                    loading: false,
+                    requested_generation: Some(7),
+                },
+                selected_file: Some(selection.clone()),
+                file: super::DiffFileState {
+                    document: Some(file_document("/tmp/repo", 7, "src/lib.rs")),
+                    error: Some("stale".into()),
+                    loading: true,
+                    requested_generation: Some(7),
+                    requested_selection: Some(selection.clone()),
+                },
+                ..DiffTabState::new(scope_root.clone())
+            },
+        );
+
+        ws.refresh_diff_theme_for(ThemeId::Light);
+
+        let file = &ws.diff_tabs[&scope_root].file;
+        assert!(file.document.is_none());
+        assert!(file.error.is_none());
+        assert!(file.loading);
+        assert_eq!(file.requested_generation, Some(7));
+        assert_eq!(file.requested_selection.as_ref(), Some(&selection));
+    }
+
+    #[test]
+    fn refresh_diff_theme_rehighlights_saved_live_feed_captures() {
+        let mut ws = WorkspaceState::new();
+        let project_id = "proj-1".to_string();
+        let scope_root = PathBuf::from("/tmp/repo");
+
+        let mut feed = ChangeFeedState::new(project_id.clone());
+        feed.entries.push_back(ChangeFeedEntry {
+            id: 1,
+            observed_at: SystemTime::UNIX_EPOCH,
+            origin: FeedEntryOrigin::LiveDelta,
+            scope_root: scope_root.clone(),
+            branch_name: "main".into(),
+            scope_kind: FeedScopeKind::ProjectRoot,
+            worktree_name: None,
+            source_terminal_id: None,
+            generation: 7,
+            changed_file_count: 1,
+            insertions: 1,
+            deletions: 0,
+            files: vec![feed_file_summary(
+                "src/lib.rs",
+                DiffSectionKind::Unstaged,
+                GitFileStatus::Modified,
+            )],
+            capture_state: FeedCaptureState::Ready(CapturedEventDiff {
+                files: vec![CapturedDiffFile {
+                    selection: DiffSelectionKey {
+                        section: DiffSectionKind::Unstaged,
+                        relative_path: PathBuf::from("src/lib.rs"),
+                    },
+                    file: changed_file("src/lib.rs", GitFileStatus::Modified),
+                    document: file_document_with_kinds(
+                        7,
+                        "src/lib.rs",
+                        vec![(
+                            orcashell_git::DiffLineKind::Context,
+                            "fn themed() { let value = 1; }",
+                        )],
+                    ),
+                }],
+                failed_files: Vec::new(),
+                truncated: false,
+                total_rendered_lines: 1,
+                total_rendered_bytes: 29,
+            }),
+        });
+        ws.live_diff_feeds.insert(project_id, feed);
+
+        ws.refresh_diff_theme_for(ThemeId::Light);
+
+        let entry = &ws.live_diff_feeds["proj-1"].entries[0];
+        let FeedCaptureState::Ready(captured) = &entry.capture_state else {
+            panic!("expected ready capture");
+        };
+        assert!(captured.files[0].document.lines[0].highlights.is_some());
     }
 
     #[test]

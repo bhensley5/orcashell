@@ -24,6 +24,7 @@ actions!(
         ToggleSidebar,
         AddProject,
         ToggleSettings,
+        CheckForUpdates,
         NewWindow,
         QuitApp,
     ]

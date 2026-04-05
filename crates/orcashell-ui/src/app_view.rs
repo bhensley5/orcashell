@@ -1,13 +1,16 @@
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use async_channel::bounded;
 use gpui::*;
 use parking_lot::Mutex;
 
 use crate::context_menu::{ContextMenuEvent, ContextMenuItem, ContextMenuOverlay};
 use crate::diff_explorer::DiffExplorerView;
+use crate::live_diff_stream::LiveDiffStreamView;
 use crate::pane::resize::{self, ActiveDrag};
 use crate::pane::LayoutContainer;
 use crate::settings::AppSettings;
@@ -15,16 +18,38 @@ use crate::settings_view::SettingsView;
 use crate::sidebar::Sidebar;
 use crate::status_bar::StatusBar;
 use crate::theme;
+use crate::updater::{self, AvailableUpdate, UpdateCheckResult};
 use crate::window_tab_bar::WindowTabBar;
 use crate::workspace::actions::*;
 use crate::workspace::layout::LayoutNode;
 use crate::workspace::layout::SplitDirection;
-use crate::workspace::{AuxiliaryTabKind, WorkspaceServices, WorkspaceState};
+use crate::workspace::{
+    AuxiliaryTabKind, WorkspaceBanner, WorkspaceBannerKind, WorkspaceServices, WorkspaceState,
+};
 use orcashell_store::{Store, StoredProject, StoredWindow};
 
 /// Shared state for requesting a context menu from child components.
 /// Components write a menu request; OrcaAppView reads and renders it.
 pub type ContextMenuRequest = Rc<RefCell<Option<(Point<Pixels>, Vec<ContextMenuItem>)>>>;
+
+static STARTUP_UPDATE_CHECK_STARTED: AtomicBool = AtomicBool::new(false);
+const DISMISSED_UPDATE_VERSION_KEY: &str = "dismissed_update_version";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UpdateBannerKind {
+    Available,
+    Info,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UpdateBannerState {
+    kind: UpdateBannerKind,
+    message: String,
+    latest_version: Option<String>,
+    download_url: Option<String>,
+    release_notes_url: Option<String>,
+}
 
 pub struct OrcaAppView {
     window_id: i64,
@@ -36,7 +61,6 @@ pub struct OrcaAppView {
     #[allow(dead_code)]
     status_bar: Entity<StatusBar>,
     focus_handle: FocusHandle,
-    daemon_error: Option<String>,
     active_drag: ActiveDrag,
     context_menu: Option<Entity<ContextMenuOverlay>>,
     menu_request: ContextMenuRequest,
@@ -49,6 +73,11 @@ pub struct OrcaAppView {
     #[allow(dead_code)]
     settings_save_task: Option<Task<()>>,
     diff_views: std::collections::HashMap<std::path::PathBuf, Entity<DiffExplorerView>>,
+    live_diff_views: std::collections::HashMap<String, Entity<LiveDiffStreamView>>,
+    update_banner: Option<UpdateBannerState>,
+    update_check_in_flight: bool,
+    #[allow(dead_code)]
+    update_check_task: Option<Task<()>>,
 }
 
 /// Transfer GPUI keyboard focus to the currently focused terminal in the workspace.
@@ -86,6 +115,12 @@ impl OrcaAppView {
 
         let workspace = cx.new(|cx| {
             let mut ws = WorkspaceState::new_with_services(services);
+            if let Some(message) = daemon_error.clone() {
+                ws.workspace_banner = Some(WorkspaceBanner {
+                    kind: WorkspaceBannerKind::Error,
+                    message,
+                });
+            }
             if has_stored {
                 ws.restore_projects(stored_projects, active_project_id, cx);
             } else {
@@ -168,11 +203,17 @@ impl OrcaAppView {
                 }
                 cx.notify();
             });
+            for view in this.diff_views.values() {
+                view.update(cx, |v, cx| v.invalidate_theme_cache(cx));
+            }
+            for view in this.live_diff_views.values() {
+                view.update(cx, |v, cx| v.invalidate_theme_cache(cx));
+            }
             cx.notify();
         })
         .detach();
 
-        Self {
+        let mut this = Self {
             window_id,
             window_handle: None,
             workspace,
@@ -181,7 +222,6 @@ impl OrcaAppView {
             sidebar,
             status_bar,
             focus_handle,
-            daemon_error,
             active_drag,
             context_menu: None,
             menu_request,
@@ -191,7 +231,258 @@ impl OrcaAppView {
             settings_view: None,
             settings_save_task: None,
             diff_views: std::collections::HashMap::new(),
+            live_diff_views: std::collections::HashMap::new(),
+            update_banner: None,
+            update_check_in_flight: false,
+            update_check_task: None,
+        };
+        this.start_startup_update_check(cx);
+        this
+    }
+
+    fn start_startup_update_check(&mut self, cx: &mut Context<Self>) {
+        if STARTUP_UPDATE_CHECK_STARTED.swap(true, Ordering::SeqCst) {
+            return;
         }
+        self.trigger_update_check(false, cx);
+    }
+
+    fn trigger_update_check(&mut self, manual: bool, cx: &mut Context<Self>) {
+        if self.update_check_in_flight {
+            if manual {
+                self.update_banner = Some(UpdateBannerState {
+                    kind: UpdateBannerKind::Info,
+                    message: "Already checking for updates…".to_string(),
+                    latest_version: None,
+                    download_url: None,
+                    release_notes_url: None,
+                });
+                cx.notify();
+            }
+            return;
+        }
+
+        self.update_check_in_flight = true;
+        if manual {
+            self.update_banner = Some(UpdateBannerState {
+                kind: UpdateBannerKind::Info,
+                message: "Checking for updates…".to_string(),
+                latest_version: None,
+                download_url: None,
+                release_notes_url: None,
+            });
+            cx.notify();
+        }
+
+        let (tx, rx) = bounded::<UpdateCheckResult>(1);
+        std::thread::spawn(move || {
+            let result = updater::check_for_updates();
+            let _ = tx.send_blocking(result);
+        });
+
+        self.update_check_task = Some(cx.spawn(
+            async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                let Ok(result) = rx.recv().await else {
+                    return;
+                };
+                let _ = this.update(cx, |this, cx| {
+                    this.apply_update_check_result(result, manual, cx);
+                });
+            },
+        ));
+    }
+
+    fn apply_update_check_result(
+        &mut self,
+        result: UpdateCheckResult,
+        manual: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_check_in_flight = false;
+        self.update_check_task = None;
+
+        match result {
+            UpdateCheckResult::UpdateAvailable(update) => {
+                if !manual && self.is_update_dismissed(&update.latest_version) {
+                    self.update_banner = None;
+                    return;
+                }
+                self.update_banner = Some(Self::available_update_banner(update));
+                cx.notify();
+            }
+            UpdateCheckResult::UpToDate { current_version } => {
+                if manual {
+                    self.update_banner = Some(UpdateBannerState {
+                        kind: UpdateBannerKind::Info,
+                        message: format!("OrcaShell {current_version} is up to date."),
+                        latest_version: None,
+                        download_url: None,
+                        release_notes_url: None,
+                    });
+                    cx.notify();
+                }
+            }
+            UpdateCheckResult::Failed { message } => {
+                if manual {
+                    self.update_banner = Some(UpdateBannerState {
+                        kind: UpdateBannerKind::Error,
+                        message,
+                        latest_version: None,
+                        download_url: None,
+                        release_notes_url: None,
+                    });
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    fn available_update_banner(update: AvailableUpdate) -> UpdateBannerState {
+        UpdateBannerState {
+            kind: UpdateBannerKind::Available,
+            message: format!(
+                "OrcaShell {} is available. You’re running {}.",
+                update.latest_version, update.current_version
+            ),
+            latest_version: Some(update.latest_version),
+            download_url: Some(update.download_url),
+            release_notes_url: update.release_notes_url,
+        }
+    }
+
+    fn dismiss_update_banner(&mut self, cx: &mut Context<Self>) {
+        if let Some(latest_version) = self
+            .update_banner
+            .as_ref()
+            .and_then(|banner| banner.latest_version.as_deref())
+        {
+            self.persist_dismissed_update_version(latest_version);
+        }
+        if self.update_banner.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn is_update_dismissed(&self, latest_version: &str) -> bool {
+        let store_guard = self.store.lock();
+        let Some(store) = store_guard.as_ref() else {
+            return false;
+        };
+        match store.get_state(DISMISSED_UPDATE_VERSION_KEY) {
+            Ok(Some(value)) => value == latest_version,
+            Ok(None) => false,
+            Err(error) => {
+                tracing::warn!("Failed to read dismissed update version: {error}");
+                false
+            }
+        }
+    }
+
+    fn persist_dismissed_update_version(&self, latest_version: &str) {
+        let store_guard = self.store.lock();
+        let Some(store) = store_guard.as_ref() else {
+            return;
+        };
+        if let Err(error) = store.set_state(DISMISSED_UPDATE_VERSION_KEY, latest_version) {
+            tracing::warn!("Failed to persist dismissed update version: {error}");
+        }
+    }
+
+    fn render_update_banner(
+        &self,
+        palette: &theme::OrcaTheme,
+        cx: &mut Context<Self>,
+    ) -> Option<Div> {
+        let banner = self.update_banner.clone()?;
+        let (bg_color, border_color, text_color, button_border, button_bg) = match banner.kind {
+            UpdateBannerKind::Available => (
+                theme::with_alpha(palette.ORCA_BLUE, 0x12),
+                theme::with_alpha(palette.ORCA_BLUE, 0x30),
+                palette.PATCH,
+                palette.ORCA_BLUE,
+                theme::with_alpha(palette.ORCA_BLUE, 0x18),
+            ),
+            UpdateBannerKind::Info => (
+                theme::with_alpha(palette.STATUS_AMBER, 0x12),
+                theme::with_alpha(palette.STATUS_AMBER, 0x30),
+                palette.STATUS_AMBER,
+                palette.STATUS_AMBER,
+                theme::with_alpha(palette.STATUS_AMBER, 0x12),
+            ),
+            UpdateBannerKind::Error => (
+                theme::with_alpha(palette.STATUS_CORAL, 0x12),
+                theme::with_alpha(palette.STATUS_CORAL, 0x30),
+                palette.STATUS_CORAL,
+                palette.STATUS_CORAL,
+                theme::with_alpha(palette.STATUS_CORAL, 0x12),
+            ),
+        };
+
+        let download_url = banner.download_url.clone();
+        let release_notes_url = banner.release_notes_url.clone();
+
+        let button = |id: &'static str, label: &'static str| {
+            div()
+                .id(id)
+                .cursor_pointer()
+                .px(px(8.0))
+                .py(px(3.0))
+                .border_1()
+                .border_color(rgb(button_border))
+                .bg(rgba(button_bg))
+                .text_color(rgb(palette.PATCH))
+                .text_size(px(11.0))
+                .child(label)
+        };
+
+        let mut bar = div()
+            .w_full()
+            .px(px(8.0))
+            .py(px(6.0))
+            .bg(rgba(bg_color))
+            .border_b_1()
+            .border_color(rgba(border_color))
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_color(rgb(text_color))
+                    .text_size(px(11.0))
+                    .child(banner.message),
+            );
+
+        if let Some(url) = download_url {
+            bar = bar.child(button("update-download", "Download").on_click(
+                move |_event, _window, _cx| {
+                    let _ = orcashell_platform::open_url(&url);
+                },
+            ));
+        }
+
+        if let Some(url) = release_notes_url {
+            bar = bar.child(button("update-release-notes", "Release Notes").on_click(
+                move |_event, _window, _cx| {
+                    let _ = orcashell_platform::open_url(&url);
+                },
+            ));
+        }
+
+        Some(
+            bar.child(
+                div()
+                    .id("update-banner-close")
+                    .cursor_pointer()
+                    .text_color(rgb(palette.FOG))
+                    .text_size(px(11.0))
+                    .child("\u{2715}")
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.dismiss_update_banner(cx);
+                    })),
+            ),
+        )
     }
 
     /// Set the window handle after `cx.open_window()` returns. Needed for per-window
@@ -337,11 +628,41 @@ impl OrcaAppView {
             .iter()
             .filter_map(|tab| match &tab.kind {
                 AuxiliaryTabKind::Diff { scope_root } => Some(scope_root.clone()),
-                AuxiliaryTabKind::Settings => None,
+                AuxiliaryTabKind::Settings | AuxiliaryTabKind::LiveDiffStream { .. } => None,
             })
             .collect();
         self.diff_views
             .retain(|scope_root, _| open_diff_scopes.contains(scope_root));
+    }
+
+    fn ensure_live_diff_view(
+        &mut self,
+        project_id: &str,
+        cx: &mut Context<Self>,
+    ) -> Entity<LiveDiffStreamView> {
+        self.live_diff_views
+            .entry(project_id.to_string())
+            .or_insert_with(|| {
+                let ws = self.workspace.clone();
+                let project_id = project_id.to_string();
+                cx.new(|cx| LiveDiffStreamView::new(ws, project_id, cx))
+            })
+            .clone()
+    }
+
+    fn prune_closed_live_diff_views(&mut self, cx: &App) {
+        let open_project_ids: std::collections::HashSet<_> = self
+            .workspace
+            .read(cx)
+            .auxiliary_tabs()
+            .iter()
+            .filter_map(|tab| match &tab.kind {
+                AuxiliaryTabKind::LiveDiffStream { project_id } => Some(project_id.clone()),
+                AuxiliaryTabKind::Diff { .. } | AuxiliaryTabKind::Settings => None,
+            })
+            .collect();
+        self.live_diff_views
+            .retain(|project_id, _| open_project_ids.contains(project_id));
     }
 
     /// Returns a focus handle for the focused terminal in the workspace.
@@ -381,6 +702,7 @@ impl OrcaAppView {
 impl Render for OrcaAppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.prune_closed_diff_views(cx);
+        self.prune_closed_live_diff_views(cx);
         let palette = theme::active(cx);
 
         let workspace = self.workspace.clone();
@@ -527,7 +849,10 @@ impl Render for OrcaAppView {
                         focus_active_terminal(&ws, window, cx);
                     }
                 }
-            });
+            })
+            .on_action(cx.listener(|this, _: &CheckForUpdates, _window, cx| {
+                this.trigger_update_check(true, cx);
+            }));
 
         // Register Cmd+1-9 direct tab switching
         macro_rules! register_goto_tab {
@@ -573,63 +898,6 @@ impl Render for OrcaAppView {
                 }
             });
 
-        // Show daemon error bar if daemon failed to start
-        if let Some(ref err) = self.daemon_error {
-            container = container.child(
-                div()
-                    .w_full()
-                    .px(px(8.0))
-                    .py(px(2.0))
-                    .bg(rgb(palette.DEEP))
-                    .flex_shrink_0()
-                    .child(
-                        div()
-                            .text_color(rgb(palette.FOG))
-                            .text_size(px(11.0))
-                            .child(err.clone()),
-                    ),
-            );
-        }
-
-        if let Some(banner) = self.workspace.read(cx).workspace_banner().cloned() {
-            let ws_clear = self.workspace.clone();
-            let text_color = match banner.kind {
-                crate::workspace::WorkspaceBannerKind::Warning => rgb(palette.STATUS_AMBER),
-                crate::workspace::WorkspaceBannerKind::Error => rgb(palette.STATUS_CORAL),
-            };
-            container = container.child(
-                div()
-                    .w_full()
-                    .px(px(8.0))
-                    .py(px(4.0))
-                    .bg(rgb(palette.DEEP))
-                    .border_b_1()
-                    .border_color(rgb(palette.SURFACE))
-                    .flex()
-                    .items_center()
-                    .gap(px(8.0))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_color(text_color)
-                            .text_size(px(11.0))
-                            .child(banner.message),
-                    )
-                    .child(
-                        div()
-                            .id("workspace-error-close")
-                            .cursor_pointer()
-                            .text_color(rgb(palette.FOG))
-                            .text_size(px(11.0))
-                            .child("\u{2715}")
-                            .on_click(move |_event, _window, cx| {
-                                ws_clear.update(cx, |ws, cx| ws.clear_workspace_banner(cx));
-                            }),
-                    ),
-            );
-        }
-
         let content_area = match active_auxiliary_tab.as_ref().map(|tab| &tab.kind) {
             Some(crate::workspace::AuxiliaryTabKind::Settings) => {
                 let view = self.ensure_settings_view(cx);
@@ -639,10 +907,72 @@ impl Render for OrcaAppView {
                 let view = self.ensure_diff_view(scope_root, cx);
                 div().flex_1().min_h_0().child(view)
             }
+            Some(crate::workspace::AuxiliaryTabKind::LiveDiffStream { project_id }) => {
+                let view = self.ensure_live_diff_view(project_id, cx);
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .flex()
+                    .flex_col()
+                    .child(view)
+            }
             None => div()
                 .flex_1()
                 .min_h_0()
                 .child(self.layout_container.clone()),
+        };
+
+        let workspace_banner = self.workspace.read(cx).workspace_banner().cloned();
+        let update_banner = self.render_update_banner(&palette, cx);
+
+        let content_area = if workspace_banner.is_some() || update_banner.is_some() {
+            let mut wrapped = div().flex_1().min_h_0().flex().flex_col();
+            if let Some(banner) = workspace_banner {
+                let ws_clear = self.workspace.clone();
+                let text_color = match banner.kind {
+                    crate::workspace::WorkspaceBannerKind::Warning => rgb(palette.STATUS_AMBER),
+                    crate::workspace::WorkspaceBannerKind::Error => rgb(palette.STATUS_CORAL),
+                };
+                wrapped = wrapped.child(
+                    div()
+                        .w_full()
+                        .px(px(8.0))
+                        .py(px(4.0))
+                        .bg(rgb(palette.DEEP))
+                        .border_b_1()
+                        .border_color(rgb(palette.SURFACE))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_color(text_color)
+                                .text_size(px(11.0))
+                                .child(banner.message),
+                        )
+                        .child(
+                            div()
+                                .id("workspace-error-close")
+                                .cursor_pointer()
+                                .text_color(rgb(palette.FOG))
+                                .text_size(px(11.0))
+                                .child("\u{2715}")
+                                .on_click(move |_event, _window, cx| {
+                                    ws_clear.update(cx, |ws, cx| ws.clear_workspace_banner(cx));
+                                }),
+                        ),
+                );
+            }
+            if let Some(banner) = update_banner {
+                wrapped = wrapped.child(banner);
+            }
+            wrapped.child(content_area)
+        } else {
+            content_area
         };
 
         // Main content: sidebar (full height) + tab bar + layout/settings area

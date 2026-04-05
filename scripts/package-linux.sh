@@ -7,6 +7,8 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BINARY="$REPO_ROOT/target/release/orcashell"
 CLI_BINARY="$REPO_ROOT/target/release/orcash"
+VERSION="${ORCASHELL_RELEASE_VERSION:-$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//')}"
+VERSION="${VERSION:-0.0.0}"
 
 if [ ! -f "$BINARY" ]; then
     echo "Error: orcashell binary not found at $BINARY"
@@ -69,6 +71,6 @@ echo "Installed to $PREFIX (make sure $PREFIX/bin is on your PATH)"
 INSTALL
 chmod +x "$STAGING/install.sh"
 
-tar -czf "$REPO_ROOT/target/orcashell-linux-x86_64.tar.gz" -C "$REPO_ROOT/target" orcashell-linux
+tar -czf "$REPO_ROOT/target/orcashell-${VERSION}-linux-x86_64.tar.gz" -C "$REPO_ROOT/target" orcashell-linux
 
-echo "Built: target/orcashell-linux-x86_64.tar.gz"
+echo "Built: target/orcashell-${VERSION}-linux-x86_64.tar.gz"

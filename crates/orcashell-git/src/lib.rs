@@ -17,6 +17,9 @@ pub const MAX_RENDERED_DIFF_LINES: usize = 10_000;
 pub const MAX_RENDERED_DIFF_BYTES: usize = 1024 * 1024;
 pub const OVERSIZE_DIFF_MESSAGE: &str = "Diff too large to render in OrcaShell";
 pub const BINARY_DIFF_MESSAGE: &str = "Binary file; diff body unavailable";
+pub const FEED_EVENT_FILE_CAP: usize = 16;
+pub const FEED_EVENT_LINE_CAP: usize = 2_000;
+pub const FEED_EVENT_BYTE_CAP: usize = 256 * 1024;
 
 // ── Core data types ──────────────────────────────────────────────────
 
@@ -139,6 +142,96 @@ pub struct DiffDocument {
     pub unstaged_files: Vec<ChangedFile>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeedEventKind {
+    BootstrapSnapshot,
+    LiveDelta,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedEventFileSummary {
+    pub relative_path: PathBuf,
+    pub staged: bool,
+    pub unstaged: bool,
+    pub status: GitFileStatus,
+    pub is_binary: bool,
+    pub insertions: usize,
+    pub deletions: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedEventFile {
+    pub selection: DiffSelectionKey,
+    pub file: ChangedFile,
+    pub document: FileDiffDocument,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedEventFailure {
+    pub selection: DiffSelectionKey,
+    pub relative_path: PathBuf,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedCapturedEvent {
+    pub files: Vec<FeedEventFile>,
+    pub failed_files: Vec<FeedEventFailure>,
+    pub truncated: bool,
+    pub total_rendered_lines: usize,
+    pub total_rendered_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FeedLayerState {
+    Ready(FileDiffDocument),
+    Unavailable { message: String },
+}
+
+impl FeedLayerState {
+    /// Compare two layer states by content only, ignoring the `generation` field
+    /// on `FileDiffDocument`. This prevents every dirty file from appearing as
+    /// "changed" in live delta events just because the snapshot generation advanced.
+    fn content_eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Ready(a), Self::Ready(b)) => {
+                a.selection == b.selection && a.file == b.file && a.lines == b.lines
+            }
+            (Self::Unavailable { message: a }, Self::Unavailable { message: b }) => a == b,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedLayerSnapshot {
+    pub selection: DiffSelectionKey,
+    pub file: ChangedFile,
+    pub state: FeedLayerState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedScopeCapture {
+    pub generation: u64,
+    pub layers: Vec<FeedLayerSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedEventData {
+    pub kind: FeedEventKind,
+    pub changed_file_count: usize,
+    pub insertions: usize,
+    pub deletions: usize,
+    pub files: Vec<FeedEventFileSummary>,
+    pub capture: FeedCapturedEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedCaptureResult {
+    pub current_capture: FeedScopeCapture,
+    pub event: Option<FeedEventData>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedWorktree {
     pub id: String,
@@ -244,6 +337,41 @@ pub fn load_file_diff(
         selection.section,
         selection.relative_path.display()
     ))
+}
+
+pub fn capture_feed_event(
+    path: &Path,
+    generation: u64,
+    previous: Option<&FeedScopeCapture>,
+    theme_id: ThemeId,
+) -> Result<FeedCaptureResult> {
+    let discovered = discover_repo(path)?;
+    let staged_diff = build_staged_diff(&discovered.repo)?;
+    let unstaged_diff = build_unstaged_diff(&discovered.repo)?;
+    let current_capture =
+        capture_feed_scope_from_split(&staged_diff, &unstaged_diff, generation, theme_id)?;
+    let event = derive_feed_event(previous, &current_capture, theme_id)?;
+    Ok(FeedCaptureResult {
+        current_capture,
+        event,
+    })
+}
+
+pub fn rehighlight_file_diff_document(document: &mut FileDiffDocument, theme_id: ThemeId) {
+    for line in &mut document.lines {
+        line.highlights = None;
+    }
+    attach_syntax_highlights(
+        &mut document.lines,
+        &document.selection.relative_path,
+        theme_id,
+    );
+}
+
+pub fn rehighlight_captured_feed_event(captured: &mut FeedCapturedEvent, theme_id: ThemeId) {
+    for file in &mut captured.files {
+        rehighlight_file_diff_document(&mut file.document, theme_id);
+    }
 }
 
 // ── Tracking status ──────────────────────────────────────────────────
@@ -1068,9 +1196,11 @@ fn snapshot_summary_from_split(
         content_fingerprint: snapshot_content_fingerprint_split(
             scope,
             &branch,
+            staged_diff,
+            unstaged_diff,
             staged_files,
             unstaged_files,
-        ),
+        )?,
         branch_name: branch,
         is_worktree: scope.is_worktree,
         worktree_name: scope.worktree_name.clone(),
@@ -1099,9 +1229,11 @@ fn collect_changed_files(diff: &Diff<'_>) -> Result<Vec<ChangedFile>> {
 fn snapshot_content_fingerprint_split(
     scope: &GitScope,
     branch_name: &str,
+    staged_diff: &Diff<'_>,
+    unstaged_diff: &Diff<'_>,
     staged_files: &[ChangedFile],
     unstaged_files: &[ChangedFile],
-) -> u64 {
+) -> Result<u64> {
     let mut fingerprint = 0xcbf29ce484222325u64;
     fingerprint_bytes(&mut fingerprint, branch_name.as_bytes());
     fingerprint_u8(&mut fingerprint, scope.is_worktree as u8);
@@ -1113,25 +1245,30 @@ fn snapshot_content_fingerprint_split(
     // Staged section discriminant + files
     fingerprint_u8(&mut fingerprint, 0x01);
     fingerprint_usize(&mut fingerprint, staged_files.len());
-    for file in staged_files {
-        fingerprint_changed_file(&mut fingerprint, file);
-    }
+    fingerprint_diff_content(&mut fingerprint, staged_diff)?;
     // Unstaged section discriminant + files
     fingerprint_u8(&mut fingerprint, 0x02);
     fingerprint_usize(&mut fingerprint, unstaged_files.len());
-    for file in unstaged_files {
-        fingerprint_changed_file(&mut fingerprint, file);
-    }
-    fingerprint
+    fingerprint_diff_content(&mut fingerprint, unstaged_diff)?;
+    Ok(fingerprint)
 }
 
-fn fingerprint_changed_file(fingerprint: &mut u64, file: &ChangedFile) {
-    let relative_path = file.relative_path.to_string_lossy();
-    fingerprint_bytes(fingerprint, relative_path.as_bytes());
-    fingerprint_u8(fingerprint, git_file_status_code(file.status));
-    fingerprint_u8(fingerprint, file.is_binary as u8);
-    fingerprint_usize(fingerprint, file.insertions);
-    fingerprint_usize(fingerprint, file.deletions);
+fn fingerprint_diff_content(fingerprint: &mut u64, diff: &Diff<'_>) -> Result<()> {
+    for (idx, delta) in diff.deltas().enumerate() {
+        let file = changed_file_from_delta(diff, idx, delta)
+            .with_context(|| format!("failed to fingerprint changed file at diff index {idx}"))?;
+        let relative_path = file.relative_path.to_string_lossy();
+        fingerprint_bytes(fingerprint, relative_path.as_bytes());
+        fingerprint_u8(fingerprint, git_file_status_code(file.status));
+        fingerprint_u8(fingerprint, file.is_binary as u8);
+        fingerprint_usize(fingerprint, file.insertions);
+        fingerprint_usize(fingerprint, file.deletions);
+        for line in render_diff_lines(diff, idx, &file)? {
+            fingerprint_u8(fingerprint, diff_line_kind_code(line.kind));
+            fingerprint_bytes(fingerprint, line.text.as_bytes());
+        }
+    }
+    Ok(())
 }
 
 fn fingerprint_bytes(fingerprint: &mut u64, bytes: &[u8]) {
@@ -1160,6 +1297,17 @@ fn git_file_status_code(status: GitFileStatus) -> u8 {
         GitFileStatus::Typechange => 5,
         GitFileStatus::Untracked => 6,
         GitFileStatus::Conflicted => 7,
+    }
+}
+
+fn diff_line_kind_code(kind: DiffLineKind) -> u8 {
+    match kind {
+        DiffLineKind::FileHeader => 1,
+        DiffLineKind::HunkHeader => 2,
+        DiffLineKind::Context => 3,
+        DiffLineKind::Addition => 4,
+        DiffLineKind::Deletion => 5,
+        DiffLineKind::BinaryNotice => 6,
     }
 }
 
@@ -1226,6 +1374,621 @@ fn render_diff_lines(diff: &Diff<'_>, idx: usize, file: &ChangedFile) -> Result<
     }
 
     Ok(lines)
+}
+
+fn capture_feed_scope_from_split(
+    staged_diff: &Diff<'_>,
+    unstaged_diff: &Diff<'_>,
+    generation: u64,
+    theme_id: ThemeId,
+) -> Result<FeedScopeCapture> {
+    let mut layers =
+        capture_feed_layers(staged_diff, DiffSectionKind::Staged, generation, theme_id)?;
+    layers.extend(capture_feed_layers(
+        unstaged_diff,
+        DiffSectionKind::Unstaged,
+        generation,
+        theme_id,
+    )?);
+    layers.sort_by(|left, right| {
+        feed_selection_sort_key(&left.selection).cmp(&feed_selection_sort_key(&right.selection))
+    });
+    Ok(FeedScopeCapture { generation, layers })
+}
+
+fn capture_feed_layers(
+    diff: &Diff<'_>,
+    section: DiffSectionKind,
+    generation: u64,
+    theme_id: ThemeId,
+) -> Result<Vec<FeedLayerSnapshot>> {
+    let mut layers = Vec::new();
+    for (idx, delta) in diff.deltas().enumerate() {
+        let file = changed_file_from_delta(diff, idx, delta)
+            .with_context(|| format!("failed to capture feed layer at diff index {idx}"))?;
+        let selection = DiffSelectionKey {
+            section,
+            relative_path: file.relative_path.clone(),
+        };
+        let state = match render_diff_lines(diff, idx, &file) {
+            Ok(mut lines) => {
+                if !file.is_binary {
+                    attach_syntax_highlights(&mut lines, &selection.relative_path, theme_id);
+                    attach_inline_changes(&mut lines);
+                }
+                FeedLayerState::Ready(FileDiffDocument {
+                    generation,
+                    selection: selection.clone(),
+                    file: file.clone(),
+                    lines,
+                })
+            }
+            Err(error) => FeedLayerState::Unavailable {
+                message: error.to_string(),
+            },
+        };
+        layers.push(FeedLayerSnapshot {
+            selection,
+            file,
+            state,
+        });
+    }
+    Ok(layers)
+}
+
+fn derive_feed_event(
+    previous: Option<&FeedScopeCapture>,
+    current: &FeedScopeCapture,
+    theme_id: ThemeId,
+) -> Result<Option<FeedEventData>> {
+    match previous {
+        None => {
+            if current.layers.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(build_bootstrap_feed_event(current)))
+            }
+        }
+        Some(previous) => build_live_delta_event(previous, current, theme_id),
+    }
+}
+
+fn build_bootstrap_feed_event(current: &FeedScopeCapture) -> FeedEventData {
+    let summaries = summarize_feed_layers(current.layers.iter().collect());
+    let (insertions, deletions) = count_feed_scope_changes(current);
+    let capture = build_feed_capture_from_layers(
+        current.layers.iter().collect(),
+        FeedEventKind::BootstrapSnapshot,
+    );
+    FeedEventData {
+        kind: FeedEventKind::BootstrapSnapshot,
+        changed_file_count: summaries.len(),
+        insertions,
+        deletions,
+        files: summaries.into_iter().take(FEED_EVENT_FILE_CAP).collect(),
+        capture,
+    }
+}
+
+fn build_live_delta_event(
+    previous: &FeedScopeCapture,
+    current: &FeedScopeCapture,
+    theme_id: ThemeId,
+) -> Result<Option<FeedEventData>> {
+    let previous_layers = previous
+        .layers
+        .iter()
+        .map(|layer| (layer.selection.clone(), layer))
+        .collect::<HashMap<_, _>>();
+    let current_layers = current
+        .layers
+        .iter()
+        .map(|layer| (layer.selection.clone(), layer))
+        .collect::<HashMap<_, _>>();
+
+    let mut keys = previous_layers
+        .keys()
+        .chain(current_layers.keys())
+        .cloned()
+        .collect::<Vec<_>>();
+    keys.sort_by(|left, right| feed_selection_sort_key(left).cmp(&feed_selection_sort_key(right)));
+    keys.dedup();
+
+    let mut summaries = Vec::new();
+    let mut event_files = Vec::new();
+    let mut failed_files = Vec::new();
+    let mut total_rendered_lines = 0usize;
+    let mut total_rendered_bytes = 0usize;
+    let mut truncated = false;
+    let mut insertions = 0usize;
+    let mut deletions = 0usize;
+
+    for selection in keys {
+        let previous_layer = previous_layers.get(&selection).copied();
+        let current_layer = current_layers.get(&selection).copied();
+        if !feed_layer_changed(previous_layer, current_layer) {
+            continue;
+        }
+
+        let file = current_layer
+            .map(|layer| layer.file.clone())
+            .or_else(|| previous_layer.map(|layer| layer.file.clone()))
+            .expect("union key must resolve to at least one layer");
+        summaries.push(feed_summary_from_layers(
+            previous_layer,
+            current_layer,
+            &file,
+        ));
+
+        match build_delta_file_document(
+            previous_layer,
+            current_layer,
+            current.generation,
+            theme_id,
+        )? {
+            DeltaFileOutcome::Document(document) => {
+                let (document_insertions, document_deletions) = count_document_changes(&document);
+                insertions += document_insertions;
+                deletions += document_deletions;
+                if event_files.len() >= FEED_EVENT_FILE_CAP {
+                    truncated = true;
+                    continue;
+                }
+                let remaining_lines = FEED_EVENT_LINE_CAP.saturating_sub(total_rendered_lines);
+                let remaining_bytes = FEED_EVENT_BYTE_CAP.saturating_sub(total_rendered_bytes);
+                let (document, used_lines, used_bytes, document_truncated) =
+                    truncate_feed_file_document(&document, remaining_lines, remaining_bytes);
+                if !document.lines.is_empty() || document.file.is_binary {
+                    total_rendered_lines += used_lines;
+                    total_rendered_bytes += used_bytes;
+                    truncated |= document_truncated;
+                    event_files.push(FeedEventFile {
+                        selection: selection.clone(),
+                        file: document.file.clone(),
+                        document,
+                    });
+                }
+                if total_rendered_lines >= FEED_EVENT_LINE_CAP
+                    || total_rendered_bytes >= FEED_EVENT_BYTE_CAP
+                {
+                    truncated = true;
+                }
+            }
+            DeltaFileOutcome::Unavailable(message) => {
+                failed_files.push(FeedEventFailure {
+                    selection: selection.clone(),
+                    relative_path: selection.relative_path.clone(),
+                    message,
+                });
+            }
+            DeltaFileOutcome::NoContent => {}
+        }
+    }
+
+    if summaries.is_empty() {
+        return Ok(None);
+    }
+
+    let capture = FeedCapturedEvent {
+        files: event_files,
+        failed_files,
+        truncated,
+        total_rendered_lines,
+        total_rendered_bytes,
+    };
+    Ok(Some(FeedEventData {
+        kind: FeedEventKind::LiveDelta,
+        changed_file_count: summaries.len(),
+        insertions,
+        deletions,
+        files: summaries.into_iter().take(FEED_EVENT_FILE_CAP).collect(),
+        capture,
+    }))
+}
+
+fn summarize_feed_layers(layers: Vec<&FeedLayerSnapshot>) -> Vec<FeedEventFileSummary> {
+    let mut ordered = Vec::new();
+    let mut positions = HashMap::<PathBuf, usize>::new();
+
+    for layer in layers {
+        if let Some(index) = positions.get(&layer.selection.relative_path).copied() {
+            let summary: &mut FeedEventFileSummary = &mut ordered[index];
+            match layer.selection.section {
+                DiffSectionKind::Staged => summary.staged = true,
+                DiffSectionKind::Unstaged => summary.unstaged = true,
+            }
+            summary.status = layer.file.status;
+            summary.is_binary = layer.file.is_binary;
+            summary.insertions = layer.file.insertions;
+            summary.deletions = layer.file.deletions;
+        } else {
+            let mut summary = FeedEventFileSummary {
+                relative_path: layer.selection.relative_path.clone(),
+                staged: false,
+                unstaged: false,
+                status: layer.file.status,
+                is_binary: layer.file.is_binary,
+                insertions: layer.file.insertions,
+                deletions: layer.file.deletions,
+            };
+            match layer.selection.section {
+                DiffSectionKind::Staged => summary.staged = true,
+                DiffSectionKind::Unstaged => summary.unstaged = true,
+            }
+            positions.insert(summary.relative_path.clone(), ordered.len());
+            ordered.push(summary);
+        }
+    }
+
+    ordered
+}
+
+fn feed_summary_from_layers(
+    previous: Option<&FeedLayerSnapshot>,
+    current: Option<&FeedLayerSnapshot>,
+    file: &ChangedFile,
+) -> FeedEventFileSummary {
+    let mut summary = FeedEventFileSummary {
+        relative_path: file.relative_path.clone(),
+        staged: false,
+        unstaged: false,
+        status: file.status,
+        is_binary: file.is_binary,
+        insertions: file.insertions,
+        deletions: file.deletions,
+    };
+    for layer in [previous, current].into_iter().flatten() {
+        match layer.selection.section {
+            DiffSectionKind::Staged => summary.staged = true,
+            DiffSectionKind::Unstaged => summary.unstaged = true,
+        }
+        summary.status = layer.file.status;
+        summary.is_binary = layer.file.is_binary;
+        summary.insertions = layer.file.insertions;
+        summary.deletions = layer.file.deletions;
+    }
+    summary
+}
+
+fn build_feed_capture_from_layers(
+    layers: Vec<&FeedLayerSnapshot>,
+    _kind: FeedEventKind,
+) -> FeedCapturedEvent {
+    let mut files = Vec::new();
+    let mut failed_files = Vec::new();
+    let mut total_rendered_lines = 0usize;
+    let mut total_rendered_bytes = 0usize;
+    let mut truncated = false;
+
+    for layer in layers {
+        match &layer.state {
+            FeedLayerState::Ready(document) => {
+                if files.len() >= FEED_EVENT_FILE_CAP {
+                    truncated = true;
+                    continue;
+                }
+                let remaining_lines = FEED_EVENT_LINE_CAP.saturating_sub(total_rendered_lines);
+                let remaining_bytes = FEED_EVENT_BYTE_CAP.saturating_sub(total_rendered_bytes);
+                let (document, used_lines, used_bytes, document_truncated) =
+                    truncate_feed_file_document(document, remaining_lines, remaining_bytes);
+                total_rendered_lines += used_lines;
+                total_rendered_bytes += used_bytes;
+                truncated |= document_truncated;
+                if !document.lines.is_empty() || document.file.is_binary {
+                    files.push(FeedEventFile {
+                        selection: layer.selection.clone(),
+                        file: layer.file.clone(),
+                        document,
+                    });
+                }
+            }
+            FeedLayerState::Unavailable { message } => failed_files.push(FeedEventFailure {
+                selection: layer.selection.clone(),
+                relative_path: layer.selection.relative_path.clone(),
+                message: message.clone(),
+            }),
+        }
+        if total_rendered_lines >= FEED_EVENT_LINE_CAP
+            || total_rendered_bytes >= FEED_EVENT_BYTE_CAP
+        {
+            truncated = true;
+        }
+    }
+
+    FeedCapturedEvent {
+        files,
+        failed_files,
+        truncated,
+        total_rendered_lines,
+        total_rendered_bytes,
+    }
+}
+
+fn feed_layer_changed(
+    previous: Option<&FeedLayerSnapshot>,
+    current: Option<&FeedLayerSnapshot>,
+) -> bool {
+    match (previous, current) {
+        (None, None) => false,
+        (Some(_), None) | (None, Some(_)) => true,
+        (Some(previous), Some(current)) => {
+            previous.file != current.file || !previous.state.content_eq(&current.state)
+        }
+    }
+}
+
+enum DeltaFileOutcome {
+    Document(FileDiffDocument),
+    Unavailable(String),
+    NoContent,
+}
+
+fn build_delta_file_document(
+    previous: Option<&FeedLayerSnapshot>,
+    current: Option<&FeedLayerSnapshot>,
+    generation: u64,
+    theme_id: ThemeId,
+) -> Result<DeltaFileOutcome> {
+    let selection = current
+        .map(|layer| layer.selection.clone())
+        .or_else(|| previous.map(|layer| layer.selection.clone()))
+        .expect("delta layer must exist on one side");
+    let file = current
+        .map(|layer| layer.file.clone())
+        .or_else(|| previous.map(|layer| layer.file.clone()))
+        .expect("delta file metadata must exist on one side");
+
+    let lines = match (
+        previous.map(|layer| &layer.state),
+        current.map(|layer| &layer.state),
+    ) {
+        (
+            Some(FeedLayerState::Unavailable { message }),
+            Some(FeedLayerState::Unavailable { .. }),
+        )
+        | (Some(FeedLayerState::Unavailable { message }), None)
+        | (None, Some(FeedLayerState::Unavailable { message }))
+        | (Some(FeedLayerState::Ready(_)), Some(FeedLayerState::Unavailable { message }))
+        | (Some(FeedLayerState::Unavailable { message }), Some(FeedLayerState::Ready(_))) => {
+            return Ok(DeltaFileOutcome::Unavailable(format!(
+                "Historical event payload unavailable for {} [{}]: {message}",
+                selection.relative_path.display(),
+                feed_section_label(selection.section),
+            )));
+        }
+        (None, Some(FeedLayerState::Ready(document))) => document
+            .lines
+            .iter()
+            .map(delta_view_line_from_added)
+            .collect::<Vec<_>>(),
+        (Some(FeedLayerState::Ready(document)), None) => document
+            .lines
+            .iter()
+            .map(delta_view_line_from_removed)
+            .collect::<Vec<_>>(),
+        (Some(FeedLayerState::Ready(previous)), Some(FeedLayerState::Ready(current))) => {
+            diff_feed_documents(previous, current)
+        }
+        (None, None) => Vec::new(),
+    };
+
+    if lines.is_empty() {
+        return Ok(DeltaFileOutcome::NoContent);
+    }
+
+    let mut document = FileDiffDocument {
+        generation,
+        selection: selection.clone(),
+        file: file.clone(),
+        lines,
+    };
+    if !file.is_binary {
+        attach_syntax_highlights(&mut document.lines, &selection.relative_path, theme_id);
+        attach_inline_changes(&mut document.lines);
+    }
+    Ok(DeltaFileOutcome::Document(document))
+}
+
+fn diff_feed_documents(
+    previous: &FileDiffDocument,
+    current: &FileDiffDocument,
+) -> Vec<DiffLineView> {
+    let mut input = imara_diff::intern::InternedInput::default();
+    let before = previous
+        .lines
+        .iter()
+        .map(|line| format!("{}\u{0}{}", diff_line_kind_code(line.kind), line.text))
+        .collect::<Vec<_>>();
+    let after = current
+        .lines
+        .iter()
+        .map(|line| format!("{}\u{0}{}", diff_line_kind_code(line.kind), line.text))
+        .collect::<Vec<_>>();
+
+    input.update_before(before.iter().map(String::as_str));
+    input.update_after(after.iter().map(String::as_str));
+
+    let mut ranges = Vec::<(Range<u32>, Range<u32>)>::new();
+    imara_diff::diff(
+        imara_diff::Algorithm::Histogram,
+        &input,
+        |before: Range<u32>, after: Range<u32>| {
+            ranges.push((before, after));
+        },
+    );
+
+    let mut lines = Vec::new();
+    for (before, after) in ranges {
+        for idx in before.start..before.end {
+            lines.push(delta_view_line_from_removed(&previous.lines[idx as usize]));
+        }
+        for idx in after.start..after.end {
+            lines.push(delta_view_line_from_added(&current.lines[idx as usize]));
+        }
+    }
+    lines
+}
+
+fn delta_view_line_from_added(line: &DiffLineView) -> DiffLineView {
+    let (old_lineno, new_lineno) = event_line_numbers_for_added(line);
+    DiffLineView {
+        kind: added_event_kind(line.kind),
+        old_lineno,
+        new_lineno,
+        text: line.text.clone(),
+        highlights: None,
+        inline_changes: None,
+    }
+}
+
+fn delta_view_line_from_removed(line: &DiffLineView) -> DiffLineView {
+    let (old_lineno, new_lineno) = event_line_numbers_for_removed(line);
+    DiffLineView {
+        kind: removed_event_kind(line.kind),
+        old_lineno,
+        new_lineno,
+        text: line.text.clone(),
+        highlights: None,
+        inline_changes: None,
+    }
+}
+
+fn added_event_kind(kind: DiffLineKind) -> DiffLineKind {
+    kind
+}
+
+fn removed_event_kind(kind: DiffLineKind) -> DiffLineKind {
+    match kind {
+        DiffLineKind::Addition => DiffLineKind::Deletion,
+        DiffLineKind::Deletion => DiffLineKind::Addition,
+        DiffLineKind::FileHeader => DiffLineKind::FileHeader,
+        DiffLineKind::HunkHeader => DiffLineKind::HunkHeader,
+        DiffLineKind::Context => DiffLineKind::Context,
+        DiffLineKind::BinaryNotice => DiffLineKind::BinaryNotice,
+    }
+}
+
+fn event_line_numbers_for_added(line: &DiffLineView) -> (Option<u32>, Option<u32>) {
+    match line.kind {
+        DiffLineKind::Addition => (None, line.new_lineno.or(line.old_lineno)),
+        DiffLineKind::Deletion => (line.old_lineno.or(line.new_lineno), None),
+        DiffLineKind::Context => (line.old_lineno, line.new_lineno),
+        DiffLineKind::FileHeader | DiffLineKind::HunkHeader | DiffLineKind::BinaryNotice => {
+            (line.old_lineno, line.new_lineno)
+        }
+    }
+}
+
+fn event_line_numbers_for_removed(line: &DiffLineView) -> (Option<u32>, Option<u32>) {
+    match line.kind {
+        DiffLineKind::Addition => (line.new_lineno.or(line.old_lineno), None),
+        DiffLineKind::Deletion => (None, line.old_lineno.or(line.new_lineno)),
+        DiffLineKind::Context => (line.old_lineno, line.new_lineno),
+        DiffLineKind::FileHeader | DiffLineKind::HunkHeader | DiffLineKind::BinaryNotice => {
+            (line.old_lineno, line.new_lineno)
+        }
+    }
+}
+
+fn truncate_feed_file_document(
+    document: &FileDiffDocument,
+    remaining_lines: usize,
+    remaining_bytes: usize,
+) -> (FileDiffDocument, usize, usize, bool) {
+    if document.file.is_binary {
+        return (document.clone(), 0, 0, false);
+    }
+
+    let mut used_lines = 0usize;
+    let mut used_bytes = 0usize;
+    let mut kept_lines = Vec::new();
+    let mut truncated = false;
+
+    for line in &document.lines {
+        let line_bytes = line.text.len();
+        if used_lines >= remaining_lines || used_bytes + line_bytes > remaining_bytes {
+            truncated = true;
+            break;
+        }
+        kept_lines.push(line.clone());
+        used_lines += 1;
+        used_bytes += line_bytes;
+    }
+
+    if kept_lines.len() < document.lines.len() {
+        truncated = true;
+    }
+
+    (
+        FileDiffDocument {
+            generation: document.generation,
+            selection: document.selection.clone(),
+            file: document.file.clone(),
+            lines: kept_lines,
+        },
+        used_lines,
+        used_bytes,
+        truncated,
+    )
+}
+
+#[cfg(test)]
+fn count_capture_changes(capture: &FeedCapturedEvent) -> (usize, usize) {
+    let mut insertions = 0usize;
+    let mut deletions = 0usize;
+    for file in &capture.files {
+        let (file_insertions, file_deletions) = count_document_changes(&file.document);
+        insertions += file_insertions;
+        deletions += file_deletions;
+    }
+    (insertions, deletions)
+}
+
+fn count_feed_scope_changes(capture: &FeedScopeCapture) -> (usize, usize) {
+    let mut insertions = 0usize;
+    let mut deletions = 0usize;
+    for layer in &capture.layers {
+        let FeedLayerState::Ready(document) = &layer.state else {
+            continue;
+        };
+        let (document_insertions, document_deletions) = count_document_changes(document);
+        insertions += document_insertions;
+        deletions += document_deletions;
+    }
+    (insertions, deletions)
+}
+
+fn count_document_changes(document: &FileDiffDocument) -> (usize, usize) {
+    let mut insertions = 0usize;
+    let mut deletions = 0usize;
+    for line in &document.lines {
+        match line.kind {
+            DiffLineKind::Addition => insertions += 1,
+            DiffLineKind::Deletion => deletions += 1,
+            DiffLineKind::FileHeader
+            | DiffLineKind::HunkHeader
+            | DiffLineKind::Context
+            | DiffLineKind::BinaryNotice => {}
+        }
+    }
+    (insertions, deletions)
+}
+
+fn feed_selection_sort_key(selection: &DiffSelectionKey) -> (u8, &Path) {
+    (
+        match selection.section {
+            DiffSectionKind::Staged => 0,
+            DiffSectionKind::Unstaged => 1,
+        },
+        selection.relative_path.as_path(),
+    )
+}
+
+fn feed_section_label(section: DiffSectionKind) -> &'static str {
+    match section {
+        DiffSectionKind::Staged => "staged",
+        DiffSectionKind::Unstaged => "unstaged",
+    }
 }
 
 fn estimated_patch_line_count(patch: &Patch<'_>) -> Result<usize> {
@@ -3489,6 +4252,293 @@ mod tests {
         }];
         attach_inline_changes(&mut lines);
         assert!(lines[0].inline_changes.is_none());
+    }
+
+    #[test]
+    fn added_event_kind_preserves_non_body_lines() {
+        assert_eq!(
+            added_event_kind(DiffLineKind::FileHeader),
+            DiffLineKind::FileHeader
+        );
+        assert_eq!(
+            added_event_kind(DiffLineKind::HunkHeader),
+            DiffLineKind::HunkHeader
+        );
+        assert_eq!(
+            added_event_kind(DiffLineKind::Context),
+            DiffLineKind::Context
+        );
+        assert_eq!(
+            added_event_kind(DiffLineKind::Addition),
+            DiffLineKind::Addition
+        );
+        assert_eq!(
+            added_event_kind(DiffLineKind::Deletion),
+            DiffLineKind::Deletion
+        );
+    }
+
+    #[test]
+    fn removed_event_kind_inverts_only_patch_body_lines() {
+        assert_eq!(
+            removed_event_kind(DiffLineKind::Addition),
+            DiffLineKind::Deletion
+        );
+        assert_eq!(
+            removed_event_kind(DiffLineKind::Deletion),
+            DiffLineKind::Addition
+        );
+        assert_eq!(
+            removed_event_kind(DiffLineKind::FileHeader),
+            DiffLineKind::FileHeader
+        );
+        assert_eq!(
+            removed_event_kind(DiffLineKind::HunkHeader),
+            DiffLineKind::HunkHeader
+        );
+        assert_eq!(
+            removed_event_kind(DiffLineKind::Context),
+            DiffLineKind::Context
+        );
+    }
+
+    #[test]
+    fn delta_view_line_from_added_preserves_relevant_line_numbers() {
+        let added = DiffLineView {
+            kind: DiffLineKind::Addition,
+            old_lineno: None,
+            new_lineno: Some(12),
+            text: "+alpha".into(),
+            highlights: None,
+            inline_changes: None,
+        };
+        let deletion = DiffLineView {
+            kind: DiffLineKind::Deletion,
+            old_lineno: Some(8),
+            new_lineno: None,
+            text: "-beta".into(),
+            highlights: None,
+            inline_changes: None,
+        };
+
+        let added_event = delta_view_line_from_added(&added);
+        assert_eq!(added_event.old_lineno, None);
+        assert_eq!(added_event.new_lineno, Some(12));
+
+        let deletion_event = delta_view_line_from_added(&deletion);
+        assert_eq!(deletion_event.old_lineno, Some(8));
+        assert_eq!(deletion_event.new_lineno, None);
+    }
+
+    #[test]
+    fn delta_view_line_from_removed_remaps_line_numbers_to_output_side() {
+        let prior_addition = DiffLineView {
+            kind: DiffLineKind::Addition,
+            old_lineno: None,
+            new_lineno: Some(21),
+            text: "+gamma".into(),
+            highlights: None,
+            inline_changes: None,
+        };
+        let prior_deletion = DiffLineView {
+            kind: DiffLineKind::Deletion,
+            old_lineno: Some(34),
+            new_lineno: None,
+            text: "-delta".into(),
+            highlights: None,
+            inline_changes: None,
+        };
+
+        let removed_added_event = delta_view_line_from_removed(&prior_addition);
+        assert_eq!(removed_added_event.kind, DiffLineKind::Deletion);
+        assert_eq!(removed_added_event.old_lineno, Some(21));
+        assert_eq!(removed_added_event.new_lineno, None);
+
+        let removed_deletion_event = delta_view_line_from_removed(&prior_deletion);
+        assert_eq!(removed_deletion_event.kind, DiffLineKind::Addition);
+        assert_eq!(removed_deletion_event.old_lineno, None);
+        assert_eq!(removed_deletion_event.new_lineno, Some(34));
+    }
+
+    #[test]
+    fn count_capture_changes_ignores_metadata_lines_in_event_deltas() {
+        let capture = FeedCapturedEvent {
+            files: vec![FeedEventFile {
+                selection: DiffSelectionKey {
+                    section: DiffSectionKind::Unstaged,
+                    relative_path: PathBuf::from("docs/internal/delivery/Working-Set.md"),
+                },
+                file: ChangedFile {
+                    relative_path: PathBuf::from("docs/internal/delivery/Working-Set.md"),
+                    status: GitFileStatus::Modified,
+                    is_binary: false,
+                    insertions: 1,
+                    deletions: 0,
+                },
+                document: FileDiffDocument {
+                    generation: 2,
+                    selection: DiffSelectionKey {
+                        section: DiffSectionKind::Unstaged,
+                        relative_path: PathBuf::from("docs/internal/delivery/Working-Set.md"),
+                    },
+                    file: ChangedFile {
+                        relative_path: PathBuf::from("docs/internal/delivery/Working-Set.md"),
+                        status: GitFileStatus::Modified,
+                        is_binary: false,
+                        insertions: 1,
+                        deletions: 0,
+                    },
+                    lines: vec![
+                        DiffLineView {
+                            kind: DiffLineKind::FileHeader,
+                            old_lineno: None,
+                            new_lineno: None,
+                            text: "diff --git a/docs/internal/delivery/Working-Set.md b/docs/internal/delivery/Working-Set.md".into(),
+                            highlights: None,
+                            inline_changes: None,
+                        },
+                        DiffLineView {
+                            kind: DiffLineKind::HunkHeader,
+                            old_lineno: None,
+                            new_lineno: None,
+                            text: "@@ -8,4 +8,5 @@".into(),
+                            highlights: None,
+                            inline_changes: None,
+                        },
+                        DiffLineView {
+                            kind: DiffLineKind::Context,
+                            old_lineno: Some(8),
+                            new_lineno: Some(8),
+                            text: "- **Tracked Between-Phase Work:** existing text".into(),
+                            highlights: None,
+                            inline_changes: None,
+                        },
+                        DiffLineView {
+                            kind: DiffLineKind::Addition,
+                            old_lineno: None,
+                            new_lineno: Some(9),
+                            text: "+ **Live Feed Test Note:** Temporary text edit added on April 3, 2026 to exercise the delta-based live feed.".into(),
+                            highlights: None,
+                            inline_changes: None,
+                        },
+                    ],
+                },
+            }],
+            failed_files: Vec::new(),
+            truncated: false,
+            total_rendered_lines: 4,
+            total_rendered_bytes: 0,
+        };
+
+        assert_eq!(count_capture_changes(&capture), (1, 0));
+    }
+
+    #[test]
+    fn bootstrap_feed_event_counts_full_changes_even_when_capture_truncates() {
+        let total_lines = FEED_EVENT_LINE_CAP + 5;
+        let current = FeedScopeCapture {
+            generation: 7,
+            layers: vec![FeedLayerSnapshot {
+                selection: DiffSelectionKey {
+                    section: DiffSectionKind::Unstaged,
+                    relative_path: PathBuf::from("src/live.rs"),
+                },
+                file: ChangedFile {
+                    relative_path: PathBuf::from("src/live.rs"),
+                    status: GitFileStatus::Modified,
+                    is_binary: false,
+                    insertions: total_lines,
+                    deletions: 0,
+                },
+                state: FeedLayerState::Ready(FileDiffDocument {
+                    generation: 7,
+                    selection: DiffSelectionKey {
+                        section: DiffSectionKind::Unstaged,
+                        relative_path: PathBuf::from("src/live.rs"),
+                    },
+                    file: ChangedFile {
+                        relative_path: PathBuf::from("src/live.rs"),
+                        status: GitFileStatus::Modified,
+                        is_binary: false,
+                        insertions: total_lines,
+                        deletions: 0,
+                    },
+                    lines: (0..total_lines)
+                        .map(|ix| DiffLineView {
+                            kind: DiffLineKind::Addition,
+                            old_lineno: None,
+                            new_lineno: Some((ix + 1) as u32),
+                            text: format!("added line {ix}\n"),
+                            highlights: None,
+                            inline_changes: None,
+                        })
+                        .collect(),
+                }),
+            }],
+        };
+
+        let event = build_bootstrap_feed_event(&current);
+        assert_eq!(event.insertions, total_lines);
+        assert_eq!(event.deletions, 0);
+        assert!(event.capture.truncated);
+        assert_eq!(event.capture.total_rendered_lines, FEED_EVENT_LINE_CAP);
+    }
+
+    #[test]
+    fn live_delta_event_counts_full_changes_even_when_capture_truncates() {
+        let total_lines = FEED_EVENT_LINE_CAP + 5;
+        let previous = FeedScopeCapture {
+            generation: 6,
+            layers: Vec::new(),
+        };
+        let current = FeedScopeCapture {
+            generation: 7,
+            layers: vec![FeedLayerSnapshot {
+                selection: DiffSelectionKey {
+                    section: DiffSectionKind::Unstaged,
+                    relative_path: PathBuf::from("src/live.rs"),
+                },
+                file: ChangedFile {
+                    relative_path: PathBuf::from("src/live.rs"),
+                    status: GitFileStatus::Modified,
+                    is_binary: false,
+                    insertions: total_lines,
+                    deletions: 0,
+                },
+                state: FeedLayerState::Ready(FileDiffDocument {
+                    generation: 7,
+                    selection: DiffSelectionKey {
+                        section: DiffSectionKind::Unstaged,
+                        relative_path: PathBuf::from("src/live.rs"),
+                    },
+                    file: ChangedFile {
+                        relative_path: PathBuf::from("src/live.rs"),
+                        status: GitFileStatus::Modified,
+                        is_binary: false,
+                        insertions: total_lines,
+                        deletions: 0,
+                    },
+                    lines: (0..total_lines)
+                        .map(|ix| DiffLineView {
+                            kind: DiffLineKind::Addition,
+                            old_lineno: None,
+                            new_lineno: Some((ix + 1) as u32),
+                            text: format!("added line {ix}\n"),
+                            highlights: None,
+                            inline_changes: None,
+                        })
+                        .collect(),
+                }),
+            }],
+        };
+
+        let event = build_live_delta_event(&previous, &current, ThemeId::Dark)
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.insertions, total_lines);
+        assert_eq!(event.deletions, 0);
+        assert!(event.capture.truncated);
+        assert_eq!(event.capture.total_rendered_lines, FEED_EVENT_LINE_CAP);
     }
 
     #[test]

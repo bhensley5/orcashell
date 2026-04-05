@@ -547,6 +547,21 @@ pub fn key_input_to_bytes(input: &KeyInput, mode: TermMode) -> Option<Vec<u8>> {
 
     let legacy_mods = kitty_modifier_mask(&keystroke.modifiers);
 
+    // macOS Terminal-style word motion: Option+Left/Right sends Meta-b / Meta-f
+    // for shell line editing instead of xterm modified-arrow sequences.
+    if cfg!(target_os = "macos")
+        && keystroke.modifiers.alt
+        && !keystroke.modifiers.control
+        && !keystroke.modifiers.shift
+        && !keystroke.modifiers.platform
+    {
+        match keystroke.key.as_str() {
+            "left" => return Some(b"\x1bb".to_vec()),
+            "right" => return Some(b"\x1bf".to_vec()),
+            _ => {}
+        }
+    }
+
     // Handle special keys first
     match keystroke.key.as_str() {
         "space" => {
@@ -904,12 +919,27 @@ mod tests {
             Some(b"\x1b[1;5C".to_vec())
         );
 
-        // Alt+Left → \x1b[1;3D
+        // On macOS, Option+Left/Right follows Terminal-style word motion.
+        // On Linux/Windows, Alt+Arrow keeps xterm modified-arrow behavior.
         let alt_left = Keystroke::parse("alt-left").unwrap();
-        assert_eq!(
-            keystroke_to_bytes(&alt_left, mode),
-            Some(b"\x1b[1;3D".to_vec())
-        );
+        let alt_right = Keystroke::parse("alt-right").unwrap();
+
+        if cfg!(target_os = "macos") {
+            assert_eq!(keystroke_to_bytes(&alt_left, mode), Some(b"\x1bb".to_vec()));
+            assert_eq!(
+                keystroke_to_bytes(&alt_right, mode),
+                Some(b"\x1bf".to_vec())
+            );
+        } else {
+            assert_eq!(
+                keystroke_to_bytes(&alt_left, mode),
+                Some(b"\x1b[1;3D".to_vec())
+            );
+            assert_eq!(
+                keystroke_to_bytes(&alt_right, mode),
+                Some(b"\x1b[1;3C".to_vec())
+            );
+        }
 
         // Unmodified arrows still work normally
         let up = Keystroke::parse("up").unwrap();

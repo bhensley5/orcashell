@@ -289,9 +289,11 @@ impl Render for LiveDiffStreamView {
             }
         }
 
-        let content_body = if detail_pane_open && self.detail_view.is_some() {
+        let content_body = if let (true, Some(detail_view)) =
+            (detail_pane_open, self.detail_view.as_ref())
+        {
             // Render the detail view instead of the feed list.
-            let detail_view = self.detail_view.as_ref().unwrap().clone();
+            let detail_view = detail_view.clone();
             div()
                 .flex_1()
                 .min_h_0()

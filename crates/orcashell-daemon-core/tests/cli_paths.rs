@@ -4,9 +4,7 @@ use orcashell_protocol::framing::{read_frame, write_frame};
 use orcashell_protocol::messages::{ClientCommand, DaemonResponse, Envelope};
 use orcashell_protocol::version::ProtocolVersion;
 use std::io;
-use std::thread;
 use std::time::Duration;
-use std::time::Instant;
 
 fn test_endpoint(dir: &std::path::Path, name: &str) -> IpcEndpoint {
     #[cfg(unix)]
@@ -37,55 +35,6 @@ fn start_daemon_or_skip(endpoint: &IpcEndpoint) -> Option<DaemonServer> {
     }
 }
 
-fn is_transient_ipc_error(error: &io::Error) -> bool {
-    matches!(
-        error.kind(),
-        io::ErrorKind::NotFound
-            | io::ErrorKind::ConnectionRefused
-            | io::ErrorKind::TimedOut
-            | io::ErrorKind::BrokenPipe
-            | io::ErrorKind::UnexpectedEof
-    )
-}
-
-fn send_envelope_with_retry(
-    endpoint: &IpcEndpoint,
-    envelope: &Envelope<ClientCommand>,
-) -> io::Result<Envelope<DaemonResponse>> {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let json = serde_json::to_string(envelope).unwrap();
-
-    loop {
-        match IpcStream::connect(endpoint, Duration::from_secs(5)) {
-            Ok(mut stream) => {
-                if let Err(e) = write_frame(&mut stream, json.as_bytes()) {
-                    if is_transient_ipc_error(&e) && Instant::now() < deadline {
-                        thread::sleep(Duration::from_millis(10));
-                        continue;
-                    }
-                    return Err(e);
-                }
-
-                let response_bytes = match read_frame(&mut stream) {
-                    Ok(bytes) => bytes,
-                    Err(e) if is_transient_ipc_error(&e) && Instant::now() < deadline => {
-                        thread::sleep(Duration::from_millis(10));
-                        continue;
-                    }
-                    Err(e) => return Err(e),
-                };
-                let response_str = std::str::from_utf8(&response_bytes).unwrap();
-                let response = serde_json::from_str(response_str).unwrap();
-                return Ok(response);
-            }
-            Err(e) if is_transient_ipc_error(&e) && Instant::now() < deadline => {
-                thread::sleep(Duration::from_millis(10));
-            }
-            Err(e) => return Err(e),
-        }
-    }
-}
-
 #[test]
 fn connect_failure_on_missing_endpoint() {
     let endpoint = IpcEndpoint::new(
@@ -108,7 +57,10 @@ fn version_mismatch_from_client_perspective() {
     let Some(_daemon) = start_daemon_or_skip(&endpoint) else {
         return;
     };
+    std::thread::sleep(Duration::from_millis(100));
 
+    // Send with incompatible version
+    let mut stream = IpcStream::connect(&endpoint, Duration::from_secs(5)).unwrap();
     let envelope = Envelope {
         protocol_version: ProtocolVersion {
             major: 99,
@@ -116,7 +68,12 @@ fn version_mismatch_from_client_perspective() {
         },
         payload: ClientCommand::DaemonStatus,
     };
-    let response = send_envelope_with_retry(&endpoint, &envelope).unwrap();
+    let json = serde_json::to_string(&envelope).unwrap();
+    write_frame(&mut stream, json.as_bytes()).unwrap();
+
+    let response_bytes = read_frame(&mut stream).unwrap();
+    let response_str = std::str::from_utf8(&response_bytes).unwrap();
+    let response: Envelope<DaemonResponse> = serde_json::from_str(response_str).unwrap();
 
     // Daemon should return an error payload
     match response.payload {

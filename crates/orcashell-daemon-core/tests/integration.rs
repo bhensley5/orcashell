@@ -4,9 +4,7 @@ use orcashell_protocol::framing::{read_frame, write_frame};
 use orcashell_protocol::messages::{ClientCommand, DaemonResponse, Envelope};
 use orcashell_protocol::version::{ProtocolVersion, CURRENT_PROTOCOL_VERSION};
 use std::io;
-use std::thread;
 use std::time::Duration;
-use std::time::Instant;
 
 fn test_endpoint(dir: &std::path::Path, name: &str) -> IpcEndpoint {
     #[cfg(unix)]
@@ -37,52 +35,17 @@ fn start_daemon_or_skip(endpoint: &IpcEndpoint) -> Option<DaemonServer> {
     }
 }
 
-fn is_transient_ipc_error(error: &io::Error) -> bool {
-    matches!(
-        error.kind(),
-        io::ErrorKind::NotFound
-            | io::ErrorKind::ConnectionRefused
-            | io::ErrorKind::TimedOut
-            | io::ErrorKind::BrokenPipe
-            | io::ErrorKind::UnexpectedEof
-    )
-}
-
 fn send_envelope(
     endpoint: &IpcEndpoint,
     envelope: &Envelope<ClientCommand>,
 ) -> Envelope<DaemonResponse> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut stream =
+        IpcStream::connect(endpoint, Duration::from_secs(5)).expect("failed to connect");
     let json = serde_json::to_string(envelope).unwrap();
-
-    loop {
-        match IpcStream::connect(endpoint, Duration::from_secs(5)) {
-            Ok(mut stream) => {
-                if let Err(e) = write_frame(&mut stream, json.as_bytes()) {
-                    if is_transient_ipc_error(&e) && Instant::now() < deadline {
-                        thread::sleep(Duration::from_millis(10));
-                        continue;
-                    }
-                    panic!("failed to write request: {e}");
-                }
-
-                let response_bytes = match read_frame(&mut stream) {
-                    Ok(bytes) => bytes,
-                    Err(e) if is_transient_ipc_error(&e) && Instant::now() < deadline => {
-                        thread::sleep(Duration::from_millis(10));
-                        continue;
-                    }
-                    Err(e) => panic!("failed to read response: {e}"),
-                };
-                let response_str = std::str::from_utf8(&response_bytes).unwrap();
-                return serde_json::from_str(response_str).unwrap();
-            }
-            Err(e) if is_transient_ipc_error(&e) && Instant::now() < deadline => {
-                thread::sleep(Duration::from_millis(10));
-            }
-            Err(e) => panic!("failed to connect: {e}"),
-        }
-    }
+    write_frame(&mut stream, json.as_bytes()).unwrap();
+    let response_bytes = read_frame(&mut stream).unwrap();
+    let response_str = std::str::from_utf8(&response_bytes).unwrap();
+    serde_json::from_str(response_str).unwrap()
 }
 
 #[test]
@@ -93,6 +56,9 @@ fn daemon_status_roundtrip() {
     let Some(_daemon) = start_daemon_or_skip(&endpoint) else {
         return;
     };
+
+    // Give the listener thread a moment to start
+    std::thread::sleep(Duration::from_millis(100));
 
     let request = Envelope {
         protocol_version: CURRENT_PROTOCOL_VERSION,
@@ -129,6 +95,7 @@ fn protocol_version_mismatch_returns_error() {
     let Some(_daemon) = start_daemon_or_skip(&endpoint) else {
         return;
     };
+    std::thread::sleep(Duration::from_millis(100));
 
     let request = Envelope {
         protocol_version: ProtocolVersion {
@@ -163,6 +130,7 @@ fn stale_socket_cleanup() {
     let Some(_daemon) = start_daemon_or_skip(&endpoint) else {
         return;
     };
+    std::thread::sleep(Duration::from_millis(100));
 
     // Verify the daemon works
     let request = Envelope {
@@ -185,6 +153,7 @@ fn daemon_double_start_detection() {
     let Some(_daemon1) = start_daemon_or_skip(&endpoint) else {
         return;
     };
+    std::thread::sleep(Duration::from_millis(100));
 
     // Second start should fail with AddrInUse
     match DaemonServer::start(&endpoint) {

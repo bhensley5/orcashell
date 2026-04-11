@@ -269,6 +269,7 @@ impl Sidebar {
             let project_name = project.name.clone();
             let ws_proj_drop = self.workspace.clone();
             let terminal_ids = project.layout.collect_terminal_ids();
+            let project_tab_count = project.layout.tab_count().unwrap_or(0);
             let project_has_git = terminal_ids
                 .iter()
                 .any(|terminal_id| ws.terminal_is_git_backed(terminal_id));
@@ -467,6 +468,7 @@ impl Sidebar {
                 let git_snapshot = ws.terminal_git_snapshot(tid).cloned();
                 let term_path = project.layout.find_terminal_path(tid);
                 let tab_index = term_path.as_ref().and_then(|p| p.first().copied());
+                let show_close_button = project_tab_count > 1 && tab_index.is_some();
                 let is_term_focused = ws
                     .focus
                     .is_focused(&project.id, &term_path.clone().unwrap_or_default());
@@ -715,6 +717,43 @@ impl Sidebar {
                             );
                     }
                     term_row = term_row.child(term_details);
+                    if show_close_button {
+                        let ws_close = self.workspace.clone();
+                        let pid_for_close = pid.clone();
+                        let tab_index = tab_index.unwrap();
+                        term_row = term_row.child(
+                            div()
+                                .id(ElementId::Name(format!("sidebar-close-{}", tid).into()))
+                                .ml(px(4.0))
+                                .mt(px(1.0))
+                                .w(px(16.0))
+                                .h(px(16.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .flex_shrink_0()
+                                .rounded(px(3.0))
+                                .text_size(px(12.0))
+                                .text_color(rgb(palette.FOG))
+                                .hover(|s| s.text_color(rgb(palette.BONE)).bg(rgb(palette.SURFACE)))
+                                .tooltip(move |_window, cx| {
+                                    cx.new(|_| SidebarTooltipView {
+                                        label: "Close Tab".into(),
+                                    })
+                                    .into()
+                                })
+                                .child("\u{2715}")
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .on_click(move |_event, _window, cx| {
+                                    cx.stop_propagation();
+                                    ws_close.update(cx, |ws, cx| {
+                                        ws.close_specific_tab(&pid_for_close, tab_index, cx);
+                                    });
+                                }),
+                        );
+                    }
                 }
 
                 let tid_for_dblclick = tid.clone();

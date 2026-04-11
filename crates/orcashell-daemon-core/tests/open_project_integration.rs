@@ -5,7 +5,9 @@ use orcashell_protocol::messages::{ClientCommand, DaemonResponse, Envelope, Open
 use orcashell_protocol::version::CURRENT_PROTOCOL_VERSION;
 use std::io;
 use std::path::PathBuf;
+use std::thread;
 use std::time::Duration;
+use std::time::Instant;
 
 fn test_endpoint(dir: &std::path::Path, name: &str) -> IpcEndpoint {
     #[cfg(unix)]
@@ -36,17 +38,52 @@ fn start_daemon_or_skip(endpoint: &IpcEndpoint) -> Option<DaemonServer> {
     }
 }
 
+fn is_transient_ipc_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::NotFound
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::UnexpectedEof
+    )
+}
+
 fn send_envelope(
     endpoint: &IpcEndpoint,
     envelope: &Envelope<ClientCommand>,
 ) -> Envelope<DaemonResponse> {
-    let mut stream =
-        IpcStream::connect(endpoint, Duration::from_secs(5)).expect("failed to connect");
+    let deadline = Instant::now() + Duration::from_secs(5);
     let json = serde_json::to_string(envelope).unwrap();
-    write_frame(&mut stream, json.as_bytes()).unwrap();
-    let response_bytes = read_frame(&mut stream).unwrap();
-    let response_str = std::str::from_utf8(&response_bytes).unwrap();
-    serde_json::from_str(response_str).unwrap()
+
+    loop {
+        match IpcStream::connect(endpoint, Duration::from_secs(5)) {
+            Ok(mut stream) => {
+                if let Err(e) = write_frame(&mut stream, json.as_bytes()) {
+                    if is_transient_ipc_error(&e) && Instant::now() < deadline {
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    panic!("failed to write request: {e}");
+                }
+
+                let response_bytes = match read_frame(&mut stream) {
+                    Ok(bytes) => bytes,
+                    Err(e) if is_transient_ipc_error(&e) && Instant::now() < deadline => {
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(e) => panic!("failed to read response: {e}"),
+                };
+                let response_str = std::str::from_utf8(&response_bytes).unwrap();
+                return serde_json::from_str(response_str).unwrap();
+            }
+            Err(e) if is_transient_ipc_error(&e) && Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => panic!("failed to connect: {e}"),
+        }
+    }
 }
 
 /// Non-absolute path → DaemonResponse::Error
@@ -58,7 +95,6 @@ fn open_project_relative_path_rejected() {
     let Some(daemon) = start_daemon_or_skip(&endpoint) else {
         return;
     };
-    std::thread::sleep(Duration::from_millis(100));
 
     let request = Envelope {
         protocol_version: CURRENT_PROTOCOL_VERSION,
@@ -92,7 +128,6 @@ fn open_project_nonexistent_path_rejected() {
     let Some(daemon) = start_daemon_or_skip(&endpoint) else {
         return;
     };
-    std::thread::sleep(Duration::from_millis(100));
 
     let request = Envelope {
         protocol_version: CURRENT_PROTOCOL_VERSION,
@@ -129,7 +164,6 @@ fn open_project_valid_dir_enqueues_with_disposition() {
     let Some(daemon) = start_daemon_or_skip(&endpoint) else {
         return;
     };
-    std::thread::sleep(Duration::from_millis(100));
 
     let target_dir = dir.path().to_str().unwrap().to_string();
 

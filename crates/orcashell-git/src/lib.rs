@@ -1,14 +1,18 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::fs;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use git2::{
-    BranchType, Commit, Delta, Diff, DiffFindOptions, DiffLineType, DiffOptions, ErrorCode,
-    ObjectType, Oid, Patch, Reference, Repository, WorktreeAddOptions, WorktreePruneOptions,
+    ApplyLocation, ApplyOptions, BranchType, Commit, Delta, Diff, DiffFindOptions, DiffLineType,
+    DiffOptions, ErrorCode, MergeOptions, ObjectType, Patch, Reference, Repository,
+    RepositoryState, ResetType, Sort, StashFlags, Status, StatusOptions, StatusShow,
+    WorktreeAddOptions, WorktreePruneOptions,
 };
 
+pub use git2::Oid;
 use orcashell_store::ThemeId;
 pub use orcashell_syntax::HighlightedSpan;
 
@@ -20,6 +24,7 @@ pub const BINARY_DIFF_MESSAGE: &str = "Binary file; diff body unavailable";
 pub const FEED_EVENT_FILE_CAP: usize = 16;
 pub const FEED_EVENT_LINE_CAP: usize = 2_000;
 pub const FEED_EVENT_BYTE_CAP: usize = 256 * 1024;
+pub const MAX_GRAPH_COMMITS: usize = 1_500;
 
 // ── Core data types ──────────────────────────────────────────────────
 
@@ -38,12 +43,57 @@ pub struct GitSnapshotSummary {
     pub generation: u64,
     pub content_fingerprint: u64,
     pub branch_name: String,
+    pub remotes: Vec<String>,
     pub is_worktree: bool,
     pub worktree_name: Option<String>,
     pub changed_files: usize,
     pub insertions: usize,
     pub deletions: usize,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotLoadErrorKind {
+    NotRepository,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotLoadError {
+    kind: SnapshotLoadErrorKind,
+    message: String,
+}
+
+impl SnapshotLoadError {
+    pub fn not_repository(message: impl Into<String>) -> Self {
+        Self {
+            kind: SnapshotLoadErrorKind::NotRepository,
+            message: message.into(),
+        }
+    }
+
+    pub fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            kind: SnapshotLoadErrorKind::Unavailable,
+            message: message.into(),
+        }
+    }
+
+    pub fn kind(&self) -> SnapshotLoadErrorKind {
+        self.kind
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl fmt::Display for SnapshotLoadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for SnapshotLoadError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GitFileStatus {
@@ -73,6 +123,10 @@ pub enum DiffLineKind {
     Addition,
     Deletion,
     BinaryNotice,
+    ConflictMarker,
+    ConflictOurs,
+    ConflictBase,
+    ConflictTheirs,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +147,7 @@ pub struct DiffLineView {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DiffSectionKind {
+    Conflicted,
     Staged,
     Unstaged,
 }
@@ -113,15 +168,245 @@ pub struct GitTrackingStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MergeOutcome {
     AlreadyMerged,
-    FastForward { new_head: Oid },
-    MergeCommit { merge_oid: Oid },
-    Blocked { reason: String },
+    FastForward {
+        new_head: Oid,
+    },
+    MergeCommit {
+        merge_oid: Oid,
+    },
+    Conflicted {
+        affected_scope: PathBuf,
+        conflicted_files: Vec<PathBuf>,
+    },
+    Blocked {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpstreamInfo {
     pub remote: String,
     pub upstream_branch: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BranchCheckoutOutcome {
+    SwitchedLocal {
+        branch_name: String,
+    },
+    SwitchedTracking {
+        local_branch_name: String,
+        remote_full_ref: String,
+        created: bool,
+    },
+    Blocked {
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CreateLocalBranchOutcome {
+    CreatedAndCheckedOut {
+        source_branch_name: String,
+        branch_name: String,
+    },
+    Blocked {
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeleteLocalBranchOutcome {
+    Deleted { branch_name: String },
+    Blocked { reason: String },
+}
+
+// ── Repository graph documents ──────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryGraphDocument {
+    pub scope_root: PathBuf,
+    pub repo_root: PathBuf,
+    pub head: HeadState,
+    pub local_branches: Vec<LocalBranchEntry>,
+    pub remote_branches: Vec<RemoteBranchEntry>,
+    pub commits: Vec<CommitGraphNode>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeadState {
+    Branch { name: String, oid: Oid },
+    Detached { oid: Oid },
+    Unborn,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalBranchEntry {
+    pub name: String,
+    pub full_ref: String,
+    pub target: Oid,
+    pub is_head: bool,
+    pub upstream: Option<BranchTrackingInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchTrackingInfo {
+    pub remote_name: String,
+    pub remote_ref: String,
+    pub ahead: usize,
+    pub behind: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteBranchEntry {
+    pub remote_name: String,
+    pub short_name: String,
+    pub full_ref: String,
+    pub target: Oid,
+    pub tracked_by_local: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitGraphNode {
+    pub oid: Oid,
+    pub short_oid: String,
+    pub summary: String,
+    pub author_name: String,
+    pub authored_at_unix: i64,
+    pub parent_oids: Vec<Oid>,
+    pub primary_lane: u16,
+    pub row_lanes: Vec<GraphLaneSegment>,
+    pub ref_labels: Vec<CommitRefLabel>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraphLaneSegment {
+    pub lane: u16,
+    pub kind: GraphLaneKind,
+    pub target_lane: Option<u16>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphLaneKind {
+    Through,
+    Start,
+    End,
+    MergeFromLeft,
+    MergeFromRight,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitRefLabel {
+    pub name: String,
+    pub kind: CommitRefKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CommitRefKind {
+    Head,
+    LocalBranch,
+    RemoteBranch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitDetailDocument {
+    pub oid: Oid,
+    pub short_oid: String,
+    pub summary: String,
+    pub message_body: String,
+    pub author_name: String,
+    pub author_email: String,
+    pub authored_at_unix: i64,
+    pub committer_name: String,
+    pub committer_email: String,
+    pub committed_at_unix: i64,
+    pub parent_oids: Vec<Oid>,
+    pub changed_files: Vec<CommitChangedFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitChangedFile {
+    pub path: PathBuf,
+    pub status: CommitFileStatus,
+    pub additions: usize,
+    pub deletions: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommitFileStatus {
+    Added,
+    Modified,
+    Deleted,
+    Renamed { from: PathBuf },
+    Typechange,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitFileSelection {
+    pub commit_oid: Oid,
+    pub relative_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitFileDiffDocument {
+    pub commit_oid: Oid,
+    pub parent_oid: Option<Oid>,
+    pub selection: CommitFileSelection,
+    pub file: ChangedFile,
+    pub lines: Vec<DiffLineView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StashListDocument {
+    pub scope_root: PathBuf,
+    pub repo_root: PathBuf,
+    pub entries: Vec<StashEntrySummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StashEntrySummary {
+    pub stash_oid: Oid,
+    pub stash_index: usize,
+    pub label: String,
+    pub message: String,
+    pub committed_at_unix: i64,
+    pub includes_untracked: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StashDetailDocument {
+    pub stash_oid: Oid,
+    pub label: String,
+    pub message: String,
+    pub committed_at_unix: i64,
+    pub includes_untracked: bool,
+    pub files: Vec<ChangedFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StashFileSelection {
+    pub stash_oid: Oid,
+    pub relative_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StashFileDiffDocument {
+    pub stash_oid: Oid,
+    pub selection: StashFileSelection,
+    pub file: ChangedFile,
+    pub lines: Vec<DiffLineView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StashMutationOutcome {
+    Applied {
+        label: String,
+    },
+    Conflicted {
+        affected_scope: PathBuf,
+        conflicted_files: Vec<PathBuf>,
+    },
 }
 
 // ── Diff documents ───────────────────────────────────────────────────
@@ -132,14 +417,80 @@ pub struct FileDiffDocument {
     pub selection: DiffSelectionKey,
     pub file: ChangedFile,
     pub lines: Vec<DiffLineView>,
+    pub hunks: Vec<FileDiffHunk>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileDiffHunk {
+    pub hunk_index: usize,
+    pub old_start: u32,
+    pub old_lines: u32,
+    pub new_start: u32,
+    pub new_lines: u32,
+    pub header: String,
+    pub body_fingerprint: u64,
+    /// Inclusive start index in the diff pane's filtered line space
+    /// (file-header rows excluded).
+    pub line_start: usize,
+    /// Exclusive end index in the diff pane's filtered line space.
+    pub line_end: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscardHunkTarget {
+    pub hunk_index: usize,
+    pub body_fingerprint: u64,
+    pub old_start: u32,
+    pub old_lines: u32,
+    pub new_start: u32,
+    pub new_lines: u32,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiscardMutationOutcome {
+    Applied,
+    Blocked { reason: String },
+}
+
+impl FileDiffDocument {
+    pub fn discard_hunk_target(&self, hunk_index: usize) -> Option<DiscardHunkTarget> {
+        discard_hunk_target_from_lines(&self.lines, &self.hunks, hunk_index)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeState {
+    pub can_complete: bool,
+    pub can_abort: bool,
+    pub conflicted_file_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffDocument {
     pub snapshot: GitSnapshotSummary,
     pub tracking: GitTrackingStatus,
+    pub merge_state: Option<MergeState>,
+    pub repo_state_warning: Option<String>,
+    pub conflicted_files: Vec<ChangedFile>,
     pub staged_files: Vec<ChangedFile>,
     pub unstaged_files: Vec<ChangedFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedConflictFile {
+    pub raw_text: String,
+    pub blocks: Vec<ParsedConflictBlock>,
+    pub has_base_sections: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedConflictBlock {
+    pub block_index: usize,
+    pub ours: Range<usize>,
+    pub base: Option<Range<usize>>,
+    pub theirs: Range<usize>,
+    pub whole_block: Range<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -256,12 +607,20 @@ pub fn discover_scope(path: &Path) -> Result<GitScope> {
 
 // ── Snapshot and diff index loading ──────────────────────────────────
 
-pub fn load_snapshot(path: &Path, generation: u64) -> Result<GitSnapshotSummary> {
-    let discovered = discover_repo(path)?;
-    let staged_diff = build_staged_diff(&discovered.repo)?;
-    let unstaged_diff = build_unstaged_diff(&discovered.repo)?;
-    let staged_files = collect_changed_files(&staged_diff)?;
-    let unstaged_files = collect_changed_files(&unstaged_diff)?;
+pub fn load_snapshot(
+    path: &Path,
+    generation: u64,
+) -> std::result::Result<GitSnapshotSummary, SnapshotLoadError> {
+    let discovered = discover_repo(path)
+        .map_err(|error| SnapshotLoadError::not_repository(error.to_string()))?;
+    let staged_diff = build_staged_diff(&discovered.repo)
+        .map_err(|error| SnapshotLoadError::unavailable(error.to_string()))?;
+    let unstaged_diff = build_unstaged_diff(&discovered.repo)
+        .map_err(|error| SnapshotLoadError::unavailable(error.to_string()))?;
+    let staged_files = collect_changed_files(&staged_diff, None)
+        .map_err(|error| SnapshotLoadError::unavailable(error.to_string()))?;
+    let unstaged_files = collect_changed_files(&unstaged_diff, None)
+        .map_err(|error| SnapshotLoadError::unavailable(error.to_string()))?;
     snapshot_summary_from_split(
         &discovered.scope,
         &discovered.repo,
@@ -271,15 +630,31 @@ pub fn load_snapshot(path: &Path, generation: u64) -> Result<GitSnapshotSummary>
         &unstaged_files,
         generation,
     )
+    .map_err(|error| SnapshotLoadError::unavailable(error.to_string()))
 }
 
 pub fn load_diff_index(path: &Path, generation: u64) -> Result<DiffDocument> {
     let discovered = discover_repo(path)?;
     let staged_diff = build_staged_diff(&discovered.repo)?;
     let unstaged_diff = build_unstaged_diff(&discovered.repo)?;
-    let staged_files = collect_changed_files(&staged_diff)?;
-    let unstaged_files = collect_changed_files(&unstaged_diff)?;
+    let conflicted_paths = collect_conflicted_paths(&discovered.repo)?;
+    let conflicted_path_set = conflicted_paths.iter().cloned().collect::<HashSet<_>>();
+    let conflicted_files = conflicted_paths
+        .into_iter()
+        .map(conflicted_changed_file)
+        .collect::<Vec<_>>();
+    let staged_files = collect_changed_files(&staged_diff, Some(&conflicted_path_set))?;
+    let unstaged_files = collect_changed_files(&unstaged_diff, Some(&conflicted_path_set))?;
     let tracking = compute_tracking_status(&discovered.repo)?;
+    let repo_state = discovered.repo.state();
+    let merge_state = match repo_state {
+        RepositoryState::Merge => Some(MergeState {
+            can_complete: conflicted_files.is_empty() && unstaged_files.is_empty(),
+            can_abort: true,
+            conflicted_file_count: conflicted_files.len(),
+        }),
+        _ => None,
+    };
     let snapshot = snapshot_summary_from_split(
         &discovered.scope,
         &discovered.repo,
@@ -293,6 +668,9 @@ pub fn load_diff_index(path: &Path, generation: u64) -> Result<DiffDocument> {
     Ok(DiffDocument {
         snapshot,
         tracking,
+        merge_state,
+        repo_state_warning: repo_state_warning(repo_state),
+        conflicted_files,
         staged_files,
         unstaged_files,
     })
@@ -306,18 +684,26 @@ pub fn load_file_diff(
 ) -> Result<FileDiffDocument> {
     let discovered = discover_repo(path)?;
     let diff = match selection.section {
+        DiffSectionKind::Conflicted => {
+            bail!("conflicted file diff view is not available via the normal diff loader yet");
+        }
         DiffSectionKind::Staged => build_staged_diff(&discovered.repo)?,
         DiffSectionKind::Unstaged => build_unstaged_diff(&discovered.repo)?,
     };
 
+    let include_hunks = selection.section == DiffSectionKind::Unstaged;
     for (idx, delta) in diff.deltas().enumerate() {
-        let candidate = changed_file_from_delta(&diff, idx, delta)
-            .with_context(|| format!("failed to build changed-file entry at diff index {idx}"))?;
-        if candidate.relative_path != selection.relative_path {
+        let relative_path =
+            delta_path(&delta).context("diff delta did not contain a path for file diff")?;
+        if relative_path != selection.relative_path {
             continue;
         }
 
-        let mut lines = render_diff_lines(&diff, idx, &candidate)?;
+        let rendered = render_selected_diff_entry(&diff, idx, delta, include_hunks)
+            .with_context(|| format!("failed to render file diff entry at diff index {idx}"))?;
+        let mut lines = rendered.lines;
+        let candidate = rendered.file;
+        let hunks = rendered.hunks;
 
         if !candidate.is_binary {
             attach_syntax_highlights(&mut lines, &selection.relative_path, theme_id);
@@ -329,6 +715,7 @@ pub fn load_file_diff(
             selection: selection.clone(),
             file: candidate,
             lines,
+            hunks,
         });
     }
 
@@ -337,6 +724,271 @@ pub fn load_file_diff(
         selection.section,
         selection.relative_path.display()
     ))
+}
+
+pub fn load_repository_graph(path: &Path) -> Result<RepositoryGraphDocument> {
+    let discovered = discover_repo(path)?;
+    let repo = &discovered.repo;
+    let head = resolve_head_state(repo)?;
+    let local_branches = load_local_branch_entries(repo)?;
+    let remote_branches = load_remote_branch_entries(repo, &local_branches)?;
+    let ref_labels = build_commit_ref_labels(&head, &local_branches, &remote_branches);
+    let (commits, truncated) = load_commit_graph_nodes(repo, &head, &ref_labels)?;
+
+    Ok(RepositoryGraphDocument {
+        scope_root: discovered.scope.scope_root,
+        repo_root: discovered.scope.repo_root,
+        head,
+        local_branches,
+        remote_branches,
+        commits,
+        truncated,
+    })
+}
+
+pub fn load_commit_detail(path: &Path, oid: Oid) -> Result<CommitDetailDocument> {
+    let discovered = discover_repo(path)?;
+    let repo = &discovered.repo;
+    let commit = repo
+        .find_commit(oid)
+        .with_context(|| format!("failed to find commit {}", short_oid(oid)))?;
+    let parent_oids = commit_parent_oids(&commit)?;
+
+    let commit_tree = commit.tree().context("failed to read commit tree")?;
+    let first_parent = if commit.parent_count() > 0 {
+        Some(
+            commit
+                .parent(0)
+                .context("failed to read first parent commit")?,
+        )
+    } else {
+        None
+    };
+    let parent_tree = first_parent
+        .as_ref()
+        .map(|parent| parent.tree().context("failed to read parent commit tree"))
+        .transpose()?;
+
+    let mut opts = DiffOptions::new();
+    opts.include_typechange(true).ignore_submodules(true);
+
+    let mut diff = repo
+        .diff_tree_to_tree(parent_tree.as_ref(), Some(&commit_tree), Some(&mut opts))
+        .context("failed to diff commit against its first parent")?;
+
+    let mut find_opts = DiffFindOptions::new();
+    find_opts.renames(true);
+    diff.find_similar(Some(&mut find_opts))
+        .context("failed to run rename detection on commit detail diff")?;
+
+    let mut changed_files = Vec::new();
+    for (idx, delta) in diff.deltas().enumerate() {
+        changed_files.push(
+            commit_changed_file_from_delta(&diff, idx, delta).with_context(|| {
+                format!(
+                    "failed to build commit detail entry for {} at diff index {idx}",
+                    short_oid(oid)
+                )
+            })?,
+        );
+    }
+    changed_files.sort_by(|left, right| left.path.cmp(&right.path));
+
+    let author = commit.author();
+    let committer = commit.committer();
+    Ok(CommitDetailDocument {
+        oid,
+        short_oid: short_oid(oid),
+        summary: commit.summary().unwrap_or("").to_string(),
+        message_body: commit.body().unwrap_or("").to_string(),
+        author_name: author.name().unwrap_or("").to_string(),
+        author_email: author.email().unwrap_or("").to_string(),
+        authored_at_unix: author.when().seconds(),
+        committer_name: committer.name().unwrap_or("").to_string(),
+        committer_email: committer.email().unwrap_or("").to_string(),
+        committed_at_unix: committer.when().seconds(),
+        parent_oids,
+        changed_files,
+    })
+}
+
+pub fn load_commit_file_diff(
+    path: &Path,
+    commit_oid: Oid,
+    relative_path: &Path,
+    theme_id: ThemeId,
+) -> Result<CommitFileDiffDocument> {
+    let discovered = discover_repo(path)?;
+    let repo = &discovered.repo;
+    let commit = repo
+        .find_commit(commit_oid)
+        .with_context(|| format!("failed to find commit {}", short_oid(commit_oid)))?;
+
+    let commit_tree = commit.tree().context("failed to read commit tree")?;
+    let first_parent = if commit.parent_count() > 0 {
+        Some(
+            commit
+                .parent(0)
+                .context("failed to read first parent commit")?,
+        )
+    } else {
+        None
+    };
+    let parent_oid = first_parent.as_ref().map(|parent| parent.id());
+    let parent_tree = first_parent
+        .as_ref()
+        .map(|parent| parent.tree().context("failed to read parent commit tree"))
+        .transpose()?;
+
+    let mut opts = DiffOptions::new();
+    opts.include_typechange(true).ignore_submodules(true);
+
+    let mut diff = repo
+        .diff_tree_to_tree(parent_tree.as_ref(), Some(&commit_tree), Some(&mut opts))
+        .context("failed to diff commit against its first parent")?;
+
+    let mut find_opts = DiffFindOptions::new();
+    find_opts.renames(true);
+    diff.find_similar(Some(&mut find_opts))
+        .context("failed to run rename detection on commit file diff")?;
+
+    for (idx, delta) in diff.deltas().enumerate() {
+        let candidate = changed_file_from_delta(&diff, idx, delta)
+            .with_context(|| format!("failed to build changed-file entry at diff index {idx}"))?;
+        if candidate.relative_path != relative_path {
+            continue;
+        }
+
+        let mut lines = render_diff_lines(&diff, idx, &candidate)?;
+        if !candidate.is_binary {
+            attach_syntax_highlights(&mut lines, &candidate.relative_path, theme_id);
+            attach_inline_changes(&mut lines);
+        }
+
+        return Ok(CommitFileDiffDocument {
+            commit_oid,
+            parent_oid,
+            selection: CommitFileSelection {
+                commit_oid,
+                relative_path: relative_path.to_path_buf(),
+            },
+            file: candidate,
+            lines,
+        });
+    }
+
+    Err(anyhow!(
+        "commit diff entry not found for {} path {}",
+        short_oid(commit_oid),
+        relative_path.display()
+    ))
+}
+
+pub fn list_stashes(path: &Path) -> Result<StashListDocument> {
+    let mut discovered = discover_repo(path)?;
+    let entries = load_stash_entry_summaries(&mut discovered.repo)?;
+    Ok(StashListDocument {
+        scope_root: discovered.scope.scope_root,
+        repo_root: discovered.scope.repo_root,
+        entries,
+    })
+}
+
+pub fn load_stash_detail(path: &Path, stash_oid: Oid) -> Result<StashDetailDocument> {
+    let mut discovered = discover_repo(path)?;
+    let repo = &mut discovered.repo;
+    let entry = resolve_stash_entry(repo, stash_oid)?;
+    let stash_commit = repo
+        .find_commit(stash_oid)
+        .with_context(|| format!("failed to find stash {}", short_oid(stash_oid)))?;
+    let files = load_stash_changed_files(repo, &stash_commit)?;
+
+    Ok(StashDetailDocument {
+        stash_oid,
+        label: entry.label,
+        message: entry.message,
+        committed_at_unix: entry.committed_at_unix,
+        includes_untracked: entry.includes_untracked,
+        files,
+    })
+}
+
+pub fn load_stash_file_diff(
+    path: &Path,
+    stash_oid: Oid,
+    relative_path: &Path,
+    theme_id: ThemeId,
+) -> Result<StashFileDiffDocument> {
+    let mut discovered = discover_repo(path)?;
+    let repo = &mut discovered.repo;
+    let stash_commit = repo
+        .find_commit(stash_oid)
+        .with_context(|| format!("failed to find stash {}", short_oid(stash_oid)))?;
+
+    if let Some(rendered) = render_stash_tracked_target(repo, &stash_commit, relative_path)? {
+        return Ok(build_stash_file_diff_document(
+            stash_oid,
+            relative_path,
+            rendered,
+            theme_id,
+        ));
+    }
+
+    if let Some(rendered) = render_stash_untracked_target(repo, &stash_commit, relative_path)? {
+        return Ok(build_stash_file_diff_document(
+            stash_oid,
+            relative_path,
+            rendered,
+            theme_id,
+        ));
+    }
+
+    Err(anyhow!(
+        "stash diff entry not found for {} path {}",
+        short_oid(stash_oid),
+        relative_path.display()
+    ))
+}
+
+pub fn create_stash(
+    path: &Path,
+    message: Option<&str>,
+    keep_index: bool,
+    include_untracked: bool,
+) -> Result<Oid> {
+    let mut discovered = discover_repo(path)?;
+    let repo = &mut discovered.repo;
+    let signature = repo
+        .signature()
+        .context("failed to resolve repository signature for stash")?;
+    let trimmed_message = message.map(str::trim).filter(|message| !message.is_empty());
+    let mut flags = StashFlags::empty();
+    if keep_index {
+        flags |= StashFlags::KEEP_INDEX;
+    }
+    if include_untracked {
+        flags |= StashFlags::INCLUDE_UNTRACKED;
+    }
+    repo.stash_save2(&signature, trimmed_message, Some(flags))
+        .context("failed to create stash")
+}
+
+pub fn apply_stash(path: &Path, stash_oid: Oid) -> Result<StashMutationOutcome> {
+    apply_stash_internal(path, stash_oid)
+}
+
+pub fn pop_stash(path: &Path, stash_oid: Oid) -> Result<StashMutationOutcome> {
+    pop_stash_internal(path, stash_oid)
+}
+
+pub fn drop_stash(path: &Path, stash_oid: Oid) -> Result<String> {
+    let mut discovered = discover_repo(path)?;
+    let target = resolve_raw_stash_entry(&mut discovered.repo, stash_oid)?;
+    discovered
+        .repo
+        .stash_drop(target.stash_index)
+        .with_context(|| format!("failed to drop {}", target.label()))?;
+    Ok(target.label())
 }
 
 pub fn capture_feed_event(
@@ -371,6 +1023,604 @@ pub fn rehighlight_file_diff_document(document: &mut FileDiffDocument, theme_id:
 pub fn rehighlight_captured_feed_event(captured: &mut FeedCapturedEvent, theme_id: ThemeId) {
     for file in &mut captured.files {
         rehighlight_file_diff_document(&mut file.document, theme_id);
+    }
+}
+
+pub fn parse_conflict_file_text(text: &str) -> Result<ParsedConflictFile> {
+    let lines = split_lines_inclusive(text);
+    let mut blocks = Vec::new();
+    let mut cursor = 0usize;
+    let mut line_index = 0usize;
+    let mut has_base_sections = false;
+
+    while line_index < lines.len() {
+        let line = lines[line_index];
+        if !line.starts_with("<<<<<<< ") {
+            cursor += line.len();
+            line_index += 1;
+            continue;
+        }
+
+        let block_start = cursor;
+        cursor += line.len();
+        line_index += 1;
+
+        let ours_start = cursor;
+        while line_index < lines.len()
+            && !lines[line_index].starts_with("||||||| ")
+            && !lines[line_index].starts_with("=======")
+        {
+            cursor += lines[line_index].len();
+            line_index += 1;
+        }
+        let ours_end = cursor;
+
+        let mut base = None;
+        if line_index < lines.len() && lines[line_index].starts_with("||||||| ") {
+            has_base_sections = true;
+            cursor += lines[line_index].len();
+            line_index += 1;
+            let base_start = cursor;
+            while line_index < lines.len() && !lines[line_index].starts_with("=======") {
+                cursor += lines[line_index].len();
+                line_index += 1;
+            }
+            base = Some(base_start..cursor);
+        }
+
+        if line_index >= lines.len() || !lines[line_index].starts_with("=======") {
+            bail!("invalid conflict marker set: missing separator");
+        }
+        cursor += lines[line_index].len();
+        line_index += 1;
+
+        let theirs_start = cursor;
+        while line_index < lines.len() && !lines[line_index].starts_with(">>>>>>> ") {
+            cursor += lines[line_index].len();
+            line_index += 1;
+        }
+        let theirs_end = cursor;
+
+        if line_index >= lines.len() || !lines[line_index].starts_with(">>>>>>> ") {
+            bail!("invalid conflict marker set: missing end marker");
+        }
+        cursor += lines[line_index].len();
+        line_index += 1;
+
+        blocks.push(ParsedConflictBlock {
+            block_index: blocks.len(),
+            ours: ours_start..ours_end,
+            base,
+            theirs: theirs_start..theirs_end,
+            whole_block: block_start..cursor,
+        });
+    }
+
+    Ok(ParsedConflictFile {
+        raw_text: text.to_string(),
+        blocks,
+        has_base_sections,
+    })
+}
+
+// ── Repository graph helpers ────────────────────────────────────────
+
+fn resolve_head_state(repo: &Repository) -> Result<HeadState> {
+    let head = match repo.head() {
+        Ok(head) => head,
+        Err(err) if matches!(err.code(), ErrorCode::UnbornBranch | ErrorCode::NotFound) => {
+            return Ok(HeadState::Unborn);
+        }
+        Err(err) => return Err(err.into()),
+    };
+
+    let Some(oid) = head.target() else {
+        return Ok(HeadState::Unborn);
+    };
+
+    if repo
+        .head_detached()
+        .context("failed to inspect HEAD detached state")?
+    {
+        return Ok(HeadState::Detached { oid });
+    }
+
+    let name = head
+        .shorthand()
+        .map(str::to_owned)
+        .or_else(|| head.name().map(str::to_owned))
+        .unwrap_or_else(|| "HEAD".to_string());
+    Ok(HeadState::Branch { name, oid })
+}
+
+fn load_local_branch_entries(repo: &Repository) -> Result<Vec<LocalBranchEntry>> {
+    let mut entries = Vec::new();
+    let branches = repo
+        .branches(Some(BranchType::Local))
+        .context("failed to enumerate local branches")?;
+
+    for branch in branches {
+        let (branch, _) = branch.context("failed to read local branch")?;
+        let Some(target) = branch.get().target() else {
+            continue;
+        };
+
+        let name = branch
+            .name()
+            .context("failed to read local branch name")?
+            .context("local branch missing UTF-8 name")?
+            .to_string();
+        let full_ref = branch
+            .get()
+            .name()
+            .context("local branch missing full ref name")?
+            .to_string();
+        let is_head = branch.is_head();
+        let upstream = branch_tracking_info(repo, &branch, target)?;
+
+        entries.push(LocalBranchEntry {
+            name,
+            full_ref,
+            target,
+            is_head,
+            upstream,
+        });
+    }
+
+    entries.sort_by(|left, right| {
+        right
+            .is_head
+            .cmp(&left.is_head)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(entries)
+}
+
+fn branch_tracking_info(
+    repo: &Repository,
+    branch: &git2::Branch<'_>,
+    local_oid: Oid,
+) -> Result<Option<BranchTrackingInfo>> {
+    let upstream = match branch.upstream() {
+        Ok(upstream) => upstream,
+        Err(err) if err.code() == ErrorCode::NotFound => return Ok(None),
+        Err(err) => return Err(err).context("failed to resolve branch upstream"),
+    };
+
+    let remote_ref = upstream
+        .get()
+        .name()
+        .context("upstream ref missing full ref name")?
+        .to_string();
+    let Some((remote_name, short_remote_ref)) = parse_remote_tracking_ref(&remote_ref) else {
+        return Ok(None);
+    };
+    let upstream_oid = upstream
+        .get()
+        .target()
+        .context("upstream tracking ref has no target")?;
+    let (ahead, behind) = repo
+        .graph_ahead_behind(local_oid, upstream_oid)
+        .context("failed to compute ahead/behind counts")?;
+
+    Ok(Some(BranchTrackingInfo {
+        remote_name,
+        remote_ref: short_remote_ref,
+        ahead,
+        behind,
+    }))
+}
+
+fn load_remote_branch_entries(
+    repo: &Repository,
+    local_branches: &[LocalBranchEntry],
+) -> Result<Vec<RemoteBranchEntry>> {
+    let mut tracked_by_local = HashMap::<String, String>::new();
+    for branch in local_branches {
+        let Some(upstream) = branch.upstream.as_ref() else {
+            continue;
+        };
+        let tracked_remote_ref = format!(
+            "refs/remotes/{}/{}",
+            upstream.remote_name, upstream.remote_ref
+        );
+        tracked_by_local
+            .entry(tracked_remote_ref)
+            .and_modify(|tracked| {
+                if branch.name < *tracked {
+                    *tracked = branch.name.clone();
+                }
+            })
+            .or_insert_with(|| branch.name.clone());
+    }
+
+    let mut entries = Vec::new();
+    let refs = repo
+        .references_glob("refs/remotes/*")
+        .context("failed to enumerate remote-tracking refs")?;
+
+    for reference in refs {
+        let reference = reference.context("failed to read remote-tracking ref")?;
+        if reference.symbolic_target().is_some() {
+            continue;
+        }
+
+        let Some(full_ref) = reference.name() else {
+            continue;
+        };
+        let Some((remote_name, short_name)) = parse_remote_tracking_ref(full_ref) else {
+            continue;
+        };
+        if short_name == "HEAD" {
+            continue;
+        }
+        let Some(target) = reference.target() else {
+            continue;
+        };
+
+        entries.push(RemoteBranchEntry {
+            remote_name,
+            short_name,
+            full_ref: full_ref.to_string(),
+            target,
+            tracked_by_local: tracked_by_local.get(full_ref).cloned(),
+        });
+    }
+
+    entries.sort_by(|left, right| {
+        left.remote_name
+            .cmp(&right.remote_name)
+            .then_with(|| left.short_name.cmp(&right.short_name))
+    });
+    Ok(entries)
+}
+
+fn parse_remote_tracking_ref(full_ref: &str) -> Option<(String, String)> {
+    let shorthand = full_ref.strip_prefix("refs/remotes/")?;
+    let (remote_name, short_name) = shorthand.split_once('/')?;
+    Some((remote_name.to_string(), short_name.to_string()))
+}
+
+fn build_commit_ref_labels(
+    head: &HeadState,
+    local_branches: &[LocalBranchEntry],
+    remote_branches: &[RemoteBranchEntry],
+) -> HashMap<Oid, Vec<CommitRefLabel>> {
+    let mut labels = HashMap::<Oid, Vec<CommitRefLabel>>::new();
+
+    match head {
+        HeadState::Branch { oid, .. } | HeadState::Detached { oid } => insert_commit_ref_label(
+            &mut labels,
+            *oid,
+            CommitRefLabel {
+                name: "HEAD".to_string(),
+                kind: CommitRefKind::Head,
+            },
+        ),
+        HeadState::Unborn => {}
+    }
+
+    for branch in local_branches {
+        insert_commit_ref_label(
+            &mut labels,
+            branch.target,
+            CommitRefLabel {
+                name: branch.name.clone(),
+                kind: CommitRefKind::LocalBranch,
+            },
+        );
+    }
+
+    for branch in remote_branches {
+        insert_commit_ref_label(
+            &mut labels,
+            branch.target,
+            CommitRefLabel {
+                name: format!("{}/{}", branch.remote_name, branch.short_name),
+                kind: CommitRefKind::RemoteBranch,
+            },
+        );
+    }
+
+    for labels_for_commit in labels.values_mut() {
+        labels_for_commit.sort_by(|left, right| {
+            commit_ref_kind_sort_key(left.kind)
+                .cmp(&commit_ref_kind_sort_key(right.kind))
+                .then_with(|| left.name.cmp(&right.name))
+        });
+    }
+
+    labels
+}
+
+fn insert_commit_ref_label(
+    labels: &mut HashMap<Oid, Vec<CommitRefLabel>>,
+    oid: Oid,
+    label: CommitRefLabel,
+) {
+    labels.entry(oid).or_default().push(label);
+}
+
+fn commit_ref_kind_sort_key(kind: CommitRefKind) -> u8 {
+    match kind {
+        CommitRefKind::Head => 0,
+        CommitRefKind::LocalBranch => 1,
+        CommitRefKind::RemoteBranch => 2,
+    }
+}
+
+fn load_commit_graph_nodes(
+    repo: &Repository,
+    head: &HeadState,
+    ref_labels: &HashMap<Oid, Vec<CommitRefLabel>>,
+) -> Result<(Vec<CommitGraphNode>, bool)> {
+    let mut tip_oids = Vec::new();
+    let mut seen = HashSet::new();
+
+    if let HeadState::Detached { oid } = head {
+        if seen.insert(*oid) {
+            tip_oids.push(*oid);
+        }
+    }
+
+    for oid in ref_labels.keys().copied() {
+        if seen.insert(oid) {
+            tip_oids.push(oid);
+        }
+    }
+
+    if tip_oids.is_empty() {
+        return Ok((Vec::new(), false));
+    }
+
+    let mut revwalk = repo.revwalk().context("failed to start git revwalk")?;
+    revwalk
+        .set_sorting(Sort::TOPOLOGICAL | Sort::TIME)
+        .context("failed to configure git revwalk sorting")?;
+    for oid in tip_oids {
+        revwalk
+            .push(oid)
+            .with_context(|| format!("failed to push revwalk tip {}", short_oid(oid)))?;
+    }
+
+    let mut commit_oids = Vec::new();
+    let mut truncated = false;
+    for next in revwalk {
+        let oid = next.context("failed to walk repository history")?;
+        commit_oids.push(oid);
+        if commit_oids.len() > MAX_GRAPH_COMMITS {
+            truncated = true;
+            commit_oids.truncate(MAX_GRAPH_COMMITS);
+            break;
+        }
+    }
+
+    let mut commits = Vec::with_capacity(commit_oids.len());
+    for oid in commit_oids {
+        let commit = repo
+            .find_commit(oid)
+            .with_context(|| format!("failed to load commit {}", short_oid(oid)))?;
+        let author = commit.author();
+        commits.push(CommitGraphNode {
+            oid,
+            short_oid: short_oid(oid),
+            summary: commit.summary().unwrap_or("").to_string(),
+            author_name: author.name().unwrap_or("").to_string(),
+            authored_at_unix: author.when().seconds(),
+            parent_oids: commit_parent_oids(&commit)?,
+            primary_lane: 0,
+            row_lanes: Vec::new(),
+            ref_labels: ref_labels.get(&oid).cloned().unwrap_or_default(),
+        });
+    }
+
+    populate_graph_lane_segments(&mut commits);
+    Ok((commits, truncated))
+}
+
+fn commit_parent_oids(commit: &Commit<'_>) -> Result<Vec<Oid>> {
+    let mut parent_oids = Vec::with_capacity(commit.parent_count());
+    for index in 0..commit.parent_count() {
+        parent_oids.push(commit.parent_id(index).with_context(|| {
+            format!(
+                "failed to read parent oid {index} for commit {}",
+                short_oid(commit.id())
+            )
+        })?);
+    }
+    Ok(parent_oids)
+}
+
+#[derive(Clone, Copy)]
+struct PendingLane {
+    lane: u16,
+    oid: Oid,
+}
+
+fn populate_graph_lane_segments(nodes: &mut [CommitGraphNode]) {
+    let visible_commits = nodes.iter().map(|node| node.oid).collect::<HashSet<_>>();
+    let mut active = Vec::<PendingLane>::new();
+
+    for node in nodes.iter_mut() {
+        let first_parent_visible = node
+            .parent_oids
+            .first()
+            .copied()
+            .filter(|oid| visible_commits.contains(oid));
+        let secondary_visible_parents = node
+            .parent_oids
+            .iter()
+            .skip(1)
+            .copied()
+            .filter(|oid| visible_commits.contains(oid))
+            .collect::<Vec<_>>();
+        let has_visible_parents =
+            first_parent_visible.is_some() || !secondary_visible_parents.is_empty();
+
+        let mut owned_lanes = Vec::new();
+        active.retain(|pending| {
+            if pending.oid == node.oid {
+                owned_lanes.push(pending.lane);
+                false
+            } else {
+                true
+            }
+        });
+        owned_lanes.sort_unstable();
+
+        let mut current_from_active = false;
+        let mut converging_lanes = Vec::new();
+        let current_lane = if let Some((lane, rest)) = owned_lanes.split_first() {
+            current_from_active = true;
+            converging_lanes.extend_from_slice(rest);
+            *lane
+        } else {
+            first_free_lane(&active)
+        };
+
+        let mut row_lanes = active
+            .iter()
+            .map(|pending| GraphLaneSegment {
+                lane: pending.lane,
+                kind: GraphLaneKind::Through,
+                target_lane: None,
+            })
+            .collect::<Vec<_>>();
+
+        let current_kind = if !has_visible_parents {
+            GraphLaneKind::End
+        } else if current_from_active {
+            GraphLaneKind::Through
+        } else {
+            GraphLaneKind::Start
+        };
+        row_lanes.push(GraphLaneSegment {
+            lane: current_lane,
+            kind: current_kind,
+            target_lane: None,
+        });
+
+        let mut reserved_lanes = active
+            .iter()
+            .map(|pending| pending.lane)
+            .collect::<HashSet<_>>();
+        reserved_lanes.insert(current_lane);
+
+        for lane in converging_lanes {
+            reserved_lanes.insert(lane);
+            row_lanes.push(GraphLaneSegment {
+                lane,
+                kind: merge_lane_kind(lane, current_lane),
+                target_lane: Some(current_lane),
+            });
+        }
+
+        if let Some(first_parent) = first_parent_visible {
+            active.push(PendingLane {
+                lane: current_lane,
+                oid: first_parent,
+            });
+        }
+
+        for parent_oid in secondary_visible_parents {
+            let parent_lane =
+                if let Some(existing) = active.iter().find(|pending| pending.oid == parent_oid) {
+                    existing.lane
+                } else {
+                    let lane = first_free_lane_with_reserved(&active, &reserved_lanes);
+                    active.push(PendingLane {
+                        lane,
+                        oid: parent_oid,
+                    });
+                    lane
+                };
+            reserved_lanes.insert(parent_lane);
+
+            row_lanes.push(GraphLaneSegment {
+                lane: parent_lane,
+                kind: merge_lane_kind(parent_lane, current_lane),
+                target_lane: Some(current_lane),
+            });
+        }
+
+        row_lanes.sort_by_key(|segment| segment.lane);
+        active.sort_by_key(|pending| pending.lane);
+        node.primary_lane = current_lane;
+        node.row_lanes = row_lanes;
+    }
+}
+
+fn first_free_lane(active: &[PendingLane]) -> u16 {
+    first_free_lane_with_reserved(active, &HashSet::new())
+}
+
+fn first_free_lane_with_reserved(active: &[PendingLane], reserved: &HashSet<u16>) -> u16 {
+    let mut lane = 0u16;
+    loop {
+        if !reserved.contains(&lane) && active.iter().all(|pending| pending.lane != lane) {
+            return lane;
+        }
+        lane = lane.saturating_add(1);
+    }
+}
+
+fn merge_lane_kind(parent_lane: u16, target_lane: u16) -> GraphLaneKind {
+    if parent_lane < target_lane {
+        GraphLaneKind::MergeFromLeft
+    } else {
+        GraphLaneKind::MergeFromRight
+    }
+}
+
+fn commit_changed_file_from_delta(
+    diff: &Diff<'_>,
+    idx: usize,
+    delta: git2::DiffDelta<'_>,
+) -> Result<CommitChangedFile> {
+    let path = commit_display_path_from_delta(&delta)?;
+    let status = commit_file_status_from_delta(delta)?;
+    let patch = Patch::from_diff(diff, idx).context("failed to create patch from diff")?;
+    let (additions, deletions) = if let Some(ref patch) = patch {
+        let (_, additions, deletions) =
+            patch.line_stats().context("failed to collect line stats")?;
+        (additions, deletions)
+    } else {
+        (0, 0)
+    };
+
+    Ok(CommitChangedFile {
+        path,
+        status,
+        additions,
+        deletions,
+    })
+}
+
+fn commit_display_path_from_delta(delta: &git2::DiffDelta<'_>) -> Result<PathBuf> {
+    match delta.status() {
+        Delta::Deleted => delta
+            .old_file()
+            .path()
+            .map(Path::to_path_buf)
+            .context("deleted diff delta did not contain an old path"),
+        _ => delta_path(delta).context("diff delta did not contain a path"),
+    }
+}
+
+fn commit_file_status_from_delta(delta: git2::DiffDelta<'_>) -> Result<CommitFileStatus> {
+    match delta.status() {
+        Delta::Added => Ok(CommitFileStatus::Added),
+        Delta::Modified | Delta::Copied | Delta::Unreadable => Ok(CommitFileStatus::Modified),
+        Delta::Deleted => Ok(CommitFileStatus::Deleted),
+        Delta::Renamed => Ok(CommitFileStatus::Renamed {
+            from: delta
+                .old_file()
+                .path()
+                .map(Path::to_path_buf)
+                .context("renamed diff delta missing old path")?,
+        }),
+        Delta::Typechange => Ok(CommitFileStatus::Typechange),
+        other => Err(anyhow!("unsupported commit diff status: {other:?}")),
     }
 }
 
@@ -515,6 +1765,121 @@ pub fn unstage_paths(path: &Path, paths: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
+pub fn discard_all_unstaged(path: &Path) -> Result<DiscardMutationOutcome> {
+    let discovered = discover_repo(path)?;
+    ensure_discard_repo_state(&discovered.repo)?;
+    let untracked_paths = collect_untracked_status_paths(&discovered.repo, &[])?;
+
+    let diff = build_unstaged_apply_diff(&discovered.repo, &[], true)?;
+    if diff.deltas().len() == 0 {
+        return Ok(DiscardMutationOutcome::Applied);
+    }
+
+    discovered
+        .repo
+        .apply(&diff, ApplyLocation::WorkDir, None)
+        .context("failed to discard unstaged changes")?;
+    remove_workdir_paths(&discovered.scope.scope_root, &untracked_paths)?;
+    Ok(DiscardMutationOutcome::Applied)
+}
+
+pub fn discard_unstaged_file(path: &Path, relative_path: &Path) -> Result<DiscardMutationOutcome> {
+    let discovered = discover_repo(path)?;
+    ensure_discard_repo_state(&discovered.repo)?;
+    let validated =
+        validate_and_normalize_paths(&discovered.scope.scope_root, &[relative_path.to_path_buf()])?;
+    let Some(relative_path) = validated.first() else {
+        bail!("no path provided to discard");
+    };
+    let untracked_paths = collect_untracked_status_paths(&discovered.repo, &validated)?;
+    match inspect_unstaged_target(&discovered.repo, relative_path)? {
+        UnstagedTargetInspection::Discardable => {}
+        UnstagedTargetInspection::BlockedUnsupportedStatus => {
+            return Ok(DiscardMutationOutcome::Blocked {
+                reason: "Discard File is unavailable for renamed or typechanged files.".to_string(),
+            });
+        }
+        UnstagedTargetInspection::Missing => {
+            bail!("no unstaged changes found for {}", relative_path.display());
+        }
+    }
+
+    let apply_diff = build_unstaged_apply_diff(&discovered.repo, &validated, true)?;
+    if apply_diff.deltas().len() == 0 {
+        bail!("no unstaged changes found for {}", relative_path.display());
+    }
+
+    discovered
+        .repo
+        .apply(&apply_diff, ApplyLocation::WorkDir, None)
+        .with_context(|| format!("failed to discard {}", relative_path.display()))?;
+    remove_workdir_paths(&discovered.scope.scope_root, &untracked_paths)?;
+    Ok(DiscardMutationOutcome::Applied)
+}
+
+pub fn discard_unstaged_hunk(
+    path: &Path,
+    relative_path: &Path,
+    target: &DiscardHunkTarget,
+) -> Result<DiscardMutationOutcome> {
+    let discovered = discover_repo(path)?;
+    let scope_root = &discovered.scope.scope_root;
+    ensure_discard_repo_state(&discovered.repo)?;
+    let validated = validate_and_normalize_paths(scope_root, &[relative_path.to_path_buf()])?;
+    let Some(relative_path) = validated.first() else {
+        bail!("no path provided to discard hunk");
+    };
+    match inspect_unstaged_target(&discovered.repo, relative_path)? {
+        UnstagedTargetInspection::Discardable => {}
+        UnstagedTargetInspection::BlockedUnsupportedStatus => {
+            return Ok(DiscardMutationOutcome::Blocked {
+                reason: "Discard Hunk is unavailable for renamed or typechanged files.".to_string(),
+            });
+        }
+        UnstagedTargetInspection::Missing => {
+            bail!("no unstaged changes found for {}", relative_path.display());
+        }
+    }
+    let Some(rendered) =
+        render_unstaged_target_with_path_filter(&discovered.repo, relative_path, true)?
+    else {
+        bail!("no unstaged changes found for {}", relative_path.display());
+    };
+    let file = rendered.file.clone();
+
+    let matched_hunk_index =
+        match resolve_hunk_discard_index(&rendered.lines, &rendered.hunks, target) {
+            Ok(index) => index,
+            Err(reason) => return Ok(DiscardMutationOutcome::Blocked { reason }),
+        };
+
+    let apply_diff = build_unstaged_apply_diff(&discovered.repo, &validated, true)?;
+    if apply_diff.deltas().len() == 0 {
+        bail!("no unstaged changes found for {}", relative_path.display());
+    }
+
+    let mut seen_hunks = 0usize;
+    let mut options = ApplyOptions::new();
+    options.hunk_callback(|_hunk| {
+        let should_apply = seen_hunks == matched_hunk_index;
+        seen_hunks += 1;
+        should_apply
+    });
+
+    discovered
+        .repo
+        .apply(&apply_diff, ApplyLocation::WorkDir, Some(&mut options))
+        .with_context(|| {
+            format!(
+                "failed to discard hunk {} in {}",
+                matched_hunk_index,
+                file.relative_path.display()
+            )
+        })?;
+    remove_empty_untracked_file(scope_root, &file.relative_path, file.status)?;
+    Ok(DiscardMutationOutcome::Applied)
+}
+
 pub fn commit_staged(path: &Path, message: &str) -> Result<Oid> {
     let message = message.trim();
     if message.is_empty() {
@@ -559,9 +1924,22 @@ pub fn commit_staged(path: &Path, message: &str) -> Result<Oid> {
 
 pub fn is_scope_clean(path: &Path) -> Result<bool> {
     let discovered = discover_repo(path)?;
-    let staged = build_staged_diff(&discovered.repo)?;
-    let unstaged = build_unstaged_diff(&discovered.repo)?;
-    Ok(staged.deltas().count() == 0 && unstaged.deltas().count() == 0)
+    is_repo_clean(&discovered.repo)
+}
+
+fn is_repo_clean(repo: &Repository) -> Result<bool> {
+    let mut options = StatusOptions::new();
+    options
+        .show(StatusShow::IndexAndWorkdir)
+        .include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .exclude_submodules(true);
+    let statuses = repo
+        .statuses(Some(&mut options))
+        .context("failed to scan repository status")?;
+    Ok(!statuses
+        .iter()
+        .any(|entry| status_is_uncommitted(entry.status())))
 }
 
 // ── Upstream info ────────────────────────────────────────────────────
@@ -605,6 +1983,309 @@ pub fn resolve_upstream_info(path: &Path) -> Result<UpstreamInfo> {
     Ok(UpstreamInfo {
         remote,
         upstream_branch,
+    })
+}
+
+pub fn checkout_local_branch(path: &Path, branch_name: &str) -> Result<BranchCheckoutOutcome> {
+    let discovered = discover_repo(path)?;
+    if let Some(reason) = branch_checkout_block_reason(&discovered.repo)? {
+        return Ok(BranchCheckoutOutcome::Blocked { reason });
+    }
+
+    let branch = match discovered.repo.find_branch(branch_name, BranchType::Local) {
+        Ok(branch) => branch,
+        Err(err) if err.code() == ErrorCode::NotFound => {
+            return Ok(BranchCheckoutOutcome::Blocked {
+                reason: format!("Local branch {branch_name} was not found."),
+            });
+        }
+        Err(err) => return Err(err).context("failed to resolve local branch"),
+    };
+
+    let full_ref = branch
+        .get()
+        .name()
+        .context("local branch missing full ref name")?
+        .to_string();
+
+    if current_head_ref_name(&discovered.repo)?.as_deref() == Some(full_ref.as_str()) {
+        return Ok(BranchCheckoutOutcome::Blocked {
+            reason: format!("Local branch {branch_name} is already current."),
+        });
+    }
+
+    if let Some(occupied_path) = find_checkout_holding_ref(
+        &discovered.scope.repo_root,
+        &discovered.scope.scope_root,
+        &full_ref,
+    )? {
+        return Ok(BranchCheckoutOutcome::Blocked {
+            reason: format!(
+                "Local branch {branch_name} is already checked out at {}.",
+                occupied_path.display()
+            ),
+        });
+    }
+
+    let target = branch
+        .get()
+        .target()
+        .context("local branch has no target commit")?;
+    let commit = discovered
+        .repo
+        .find_commit(target)
+        .context("failed to resolve local branch target commit")?;
+
+    switch_head_to_branch(&discovered.repo, &commit, &full_ref)?;
+
+    Ok(BranchCheckoutOutcome::SwitchedLocal {
+        branch_name: branch_name.to_string(),
+    })
+}
+
+pub fn checkout_remote_branch(path: &Path, remote_full_ref: &str) -> Result<BranchCheckoutOutcome> {
+    let discovered = discover_repo(path)?;
+    if let Some(reason) = branch_checkout_block_reason(&discovered.repo)? {
+        return Ok(BranchCheckoutOutcome::Blocked { reason });
+    }
+
+    let Some((remote_name, short_name)) = parse_remote_tracking_ref(remote_full_ref) else {
+        return Ok(BranchCheckoutOutcome::Blocked {
+            reason: format!(
+                "Remote branch {remote_full_ref} is not a concrete remote-tracking ref."
+            ),
+        });
+    };
+
+    let remote_ref = match discovered.repo.find_reference(remote_full_ref) {
+        Ok(reference) => reference,
+        Err(err) if err.code() == ErrorCode::NotFound => {
+            return Ok(BranchCheckoutOutcome::Blocked {
+                reason: format!(
+                    "Remote branch {remote_full_ref} was not found. Fetch to refresh remote-tracking refs."
+                ),
+            });
+        }
+        Err(err) => return Err(err).context("failed to resolve remote-tracking ref"),
+    };
+
+    if remote_ref.symbolic_target().is_some() {
+        return Ok(BranchCheckoutOutcome::Blocked {
+            reason: format!(
+                "Remote branch {remote_full_ref} is not a concrete remote-tracking ref."
+            ),
+        });
+    }
+
+    let mut created = false;
+    let local_branch_name = if let Some(existing) =
+        select_tracking_branch_for_remote(&discovered.repo, remote_full_ref, &short_name)?
+    {
+        existing
+    } else {
+        match discovered.repo.find_branch(&short_name, BranchType::Local) {
+            Ok(existing_branch) => {
+                let existing_upstream = local_branch_upstream_full_ref(&existing_branch)?;
+                if existing_upstream.as_deref() == Some(remote_full_ref) {
+                    short_name.clone()
+                } else {
+                    return Ok(BranchCheckoutOutcome::Blocked {
+                        reason: format!(
+                            "Local branch {short_name} already exists and does not track {remote_full_ref}."
+                        ),
+                    });
+                }
+            }
+            Err(err) if err.code() == ErrorCode::NotFound => {
+                let remote_target = remote_ref
+                    .target()
+                    .context("remote-tracking ref has no target commit")?;
+                let remote_commit = discovered
+                    .repo
+                    .find_commit(remote_target)
+                    .context("failed to resolve remote-tracking branch target commit")?;
+                let mut local_branch =
+                    discovered
+                        .repo
+                        .branch(&short_name, &remote_commit, false)
+                        .with_context(|| format!("failed to create local branch {short_name}"))?;
+                local_branch
+                    .set_upstream(Some(&format!("{remote_name}/{short_name}")))
+                    .with_context(|| {
+                        format!("failed to configure upstream for local branch {short_name}")
+                    })?;
+                created = true;
+                short_name.clone()
+            }
+            Err(err) => return Err(err).context("failed to inspect local branch collision"),
+        }
+    };
+
+    let local_branch = discovered
+        .repo
+        .find_branch(&local_branch_name, BranchType::Local)
+        .with_context(|| format!("failed to resolve local branch {local_branch_name}"))?;
+    let local_full_ref = local_branch
+        .get()
+        .name()
+        .context("local branch missing full ref name")?
+        .to_string();
+
+    if current_head_ref_name(&discovered.repo)?.as_deref() == Some(local_full_ref.as_str()) {
+        return Ok(BranchCheckoutOutcome::Blocked {
+            reason: format!("Local branch {local_branch_name} is already current."),
+        });
+    }
+
+    if let Some(occupied_path) = find_checkout_holding_ref(
+        &discovered.scope.repo_root,
+        &discovered.scope.scope_root,
+        &local_full_ref,
+    )? {
+        return Ok(BranchCheckoutOutcome::Blocked {
+            reason: format!(
+                "Local branch {local_branch_name} is already checked out at {}.",
+                occupied_path.display()
+            ),
+        });
+    }
+
+    let target = local_branch
+        .get()
+        .target()
+        .context("local tracking branch has no target commit")?;
+    let commit = discovered
+        .repo
+        .find_commit(target)
+        .with_context(|| format!("failed to resolve local branch {local_branch_name} target"))?;
+
+    switch_head_to_branch(&discovered.repo, &commit, &local_full_ref)?;
+
+    Ok(BranchCheckoutOutcome::SwitchedTracking {
+        local_branch_name,
+        remote_full_ref: remote_full_ref.to_string(),
+        created,
+    })
+}
+
+pub fn create_local_branch_from_local(
+    path: &Path,
+    source_branch_name: &str,
+    new_branch_name: &str,
+) -> Result<CreateLocalBranchOutcome> {
+    let discovered = discover_repo(path)?;
+    if let Some(reason) = branch_checkout_block_reason(&discovered.repo)? {
+        return Ok(CreateLocalBranchOutcome::Blocked { reason });
+    }
+
+    let new_branch_name = match validate_local_branch_name(new_branch_name) {
+        Ok(branch_name) => branch_name,
+        Err(reason) => {
+            return Ok(CreateLocalBranchOutcome::Blocked { reason });
+        }
+    };
+
+    let source_branch = match discovered
+        .repo
+        .find_branch(source_branch_name, BranchType::Local)
+    {
+        Ok(branch) => branch,
+        Err(err) if err.code() == ErrorCode::NotFound => {
+            return Ok(CreateLocalBranchOutcome::Blocked {
+                reason: format!("Local branch {source_branch_name} was not found."),
+            });
+        }
+        Err(err) => return Err(err).context("failed to resolve source local branch"),
+    };
+
+    if discovered
+        .repo
+        .find_branch(&new_branch_name, BranchType::Local)
+        .is_ok()
+    {
+        return Ok(CreateLocalBranchOutcome::Blocked {
+            reason: format!("Local branch {new_branch_name} already exists."),
+        });
+    }
+
+    let target = source_branch
+        .get()
+        .target()
+        .context("source local branch has no target commit")?;
+    let commit = discovered
+        .repo
+        .find_commit(target)
+        .context("failed to resolve source local branch target commit")?;
+
+    let branch = discovered
+        .repo
+        .branch(&new_branch_name, &commit, false)
+        .with_context(|| format!("failed to create local branch {new_branch_name}"))?;
+    let full_ref = branch
+        .get()
+        .name()
+        .context("created local branch missing full ref name")?
+        .to_string();
+
+    switch_head_to_branch(&discovered.repo, &commit, &full_ref)?;
+
+    Ok(CreateLocalBranchOutcome::CreatedAndCheckedOut {
+        source_branch_name: source_branch_name.to_string(),
+        branch_name: new_branch_name,
+    })
+}
+
+pub fn delete_local_branch(path: &Path, branch_name: &str) -> Result<DeleteLocalBranchOutcome> {
+    let discovered = discover_repo(path)?;
+    let mut branch = match discovered.repo.find_branch(branch_name, BranchType::Local) {
+        Ok(branch) => branch,
+        Err(err) if err.code() == ErrorCode::NotFound => {
+            return Ok(DeleteLocalBranchOutcome::Blocked {
+                reason: format!("Local branch {branch_name} was not found."),
+            });
+        }
+        Err(err) => return Err(err).context("failed to resolve local branch"),
+    };
+
+    let full_ref = branch
+        .get()
+        .name()
+        .context("local branch missing full ref name")?
+        .to_string();
+
+    if current_head_ref_name(&discovered.repo)?.as_deref() == Some(full_ref.as_str()) {
+        return Ok(DeleteLocalBranchOutcome::Blocked {
+            reason: format!("Cannot delete the current branch {branch_name}."),
+        });
+    }
+
+    if let Some(occupied_path) = find_checkout_holding_ref(
+        &discovered.scope.repo_root,
+        &discovered.scope.scope_root,
+        &full_ref,
+    )? {
+        return Ok(DeleteLocalBranchOutcome::Blocked {
+            reason: format!(
+                "Local branch {branch_name} is checked out at {}.",
+                occupied_path.display()
+            ),
+        });
+    }
+
+    if local_branch_requires_force_delete(&discovered.repo, &branch)? {
+        return Ok(DeleteLocalBranchOutcome::Blocked {
+            reason: format!(
+                "Local branch {branch_name} is not fully merged. Merge it or use the terminal to force-delete it."
+            ),
+        });
+    }
+
+    if let Err(err) = branch.delete() {
+        return Err(err).with_context(|| format!("failed to delete local branch {branch_name}"));
+    }
+
+    Ok(DeleteLocalBranchOutcome::Deleted {
+        branch_name: branch_name.to_string(),
     })
 }
 
@@ -690,9 +2371,11 @@ pub fn pull_integrate(path: &Path) -> Result<MergeOutcome> {
         .context("merge analysis failed")?;
 
     if merge_index.has_conflicts() {
-        return Ok(MergeOutcome::Blocked {
-            reason: "Pull would produce merge conflicts. Resolve in the terminal.".into(),
-        });
+        let upstream_annotated = repo
+            .find_annotated_commit(upstream_commit.id())
+            .context("failed to prepare upstream annotated commit")?;
+        enter_merge_state(repo, &upstream_annotated)?;
+        return merge_conflicted_outcome(repo, &discovered.scope.scope_root);
     }
 
     // Clean merge: write tree and create merge commit
@@ -721,6 +2404,71 @@ pub fn pull_integrate(path: &Path) -> Result<MergeOutcome> {
     checkout_head_for_scope(&discovered.scope.scope_root)?;
 
     Ok(MergeOutcome::MergeCommit { merge_oid })
+}
+
+pub fn complete_merge(path: &Path) -> Result<Oid> {
+    let discovered = discover_repo(path)?;
+    let repo = &discovered.repo;
+    ensure_merge_state(repo)?;
+
+    let conflicted_paths = collect_conflicted_paths(repo)?;
+    if !conflicted_paths.is_empty() {
+        bail!("cannot complete merge with unresolved conflicts");
+    }
+
+    let unstaged_diff = build_unstaged_diff(repo)?;
+    let unstaged_files = collect_changed_files(&unstaged_diff, None)?;
+    if !unstaged_files.is_empty() {
+        bail!("cannot complete merge with unstaged changes");
+    }
+
+    let head = repo
+        .head()
+        .map_err(map_unborn_head("repository has no valid HEAD commit"))?;
+    let head_commit = peel_head_commit(&head)?;
+    let merge_head_commit = read_merge_head_commit(repo)?;
+    let merge_message = read_merge_message(repo)?;
+
+    let sig = repo.signature().context("Git identity not configured")?;
+    let mut index = repo.index().context("failed to read index")?;
+    let tree_id = index
+        .write_tree_to(repo)
+        .context("failed to write index tree")?;
+    let tree = repo
+        .find_tree(tree_id)
+        .context("failed to find merge tree")?;
+
+    let merge_oid = repo
+        .commit(
+            Some("HEAD"),
+            &sig,
+            &sig,
+            &merge_message,
+            &tree,
+            &[&head_commit, &merge_head_commit],
+        )
+        .context("failed to create merge commit")?;
+    repo.cleanup_state()
+        .context("failed to clear merge state")?;
+    Ok(merge_oid)
+}
+
+pub fn abort_merge(path: &Path) -> Result<()> {
+    let discovered = discover_repo(path)?;
+    let repo = &discovered.repo;
+    ensure_merge_state(repo)?;
+
+    let head = repo
+        .head()
+        .map_err(map_unborn_head("repository has no valid HEAD commit"))?;
+    let head_obj = head
+        .peel(ObjectType::Commit)
+        .context("failed to peel HEAD to commit for abort")?;
+    repo.reset(&head_obj, ResetType::Hard, None)
+        .context("failed to hard reset during merge abort")?;
+    repo.cleanup_state()
+        .context("failed to clear merge state")?;
+    Ok(())
 }
 
 // ── Merge-back substrate ─────────────────────────────────────────────
@@ -817,9 +2565,11 @@ pub fn merge_managed_branch(managed_scope: &Path, source_ref: &str) -> Result<Me
         .context("merge analysis failed")?;
 
     if merge_index.has_conflicts() {
-        return Ok(MergeOutcome::Blocked {
-            reason: "Merge would produce conflicts. Resolve in the terminal.".into(),
-        });
+        let managed_annotated = source_repo
+            .find_annotated_commit(managed_commit_oid)
+            .context("failed to prepare managed annotated commit")?;
+        enter_merge_state(&source_repo, &managed_annotated)?;
+        return merge_conflicted_outcome(&source_repo, &source_scope_path);
     }
 
     // Clean merge: write tree and create merge commit IN the source repo
@@ -850,6 +2600,150 @@ pub fn merge_managed_branch(managed_scope: &Path, source_ref: &str) -> Result<Me
     checkout_head_for_scope(&source_scope_path)?;
 
     Ok(MergeOutcome::MergeCommit { merge_oid })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConflictMarkerStyle {
+    Merge,
+    Diff3,
+}
+
+fn enter_merge_state(repo: &Repository, commit: &git2::AnnotatedCommit<'_>) -> Result<()> {
+    let mut merge_opts = MergeOptions::new();
+    let mut checkout = git2::build::CheckoutBuilder::new();
+    let conflict_style = configured_conflict_marker_style(repo)?;
+    checkout.allow_conflicts(true).recreate_missing(true);
+    match conflict_style {
+        ConflictMarkerStyle::Merge => {
+            checkout.conflict_style_merge(true);
+        }
+        ConflictMarkerStyle::Diff3 => {
+            checkout.conflict_style_diff3(true);
+        }
+    }
+    repo.merge(&[commit], Some(&mut merge_opts), Some(&mut checkout))
+        .context("failed to enter merge state")?;
+    Ok(())
+}
+
+fn configured_conflict_marker_style(repo: &Repository) -> Result<ConflictMarkerStyle> {
+    let config = repo.config().context("failed to read git config")?;
+    let style = config
+        .get_string("merge.conflictstyle")
+        .unwrap_or_else(|_| "merge".to_string());
+    Ok(match style.trim().to_ascii_lowercase().as_str() {
+        "diff3" | "zdiff3" => ConflictMarkerStyle::Diff3,
+        _ => ConflictMarkerStyle::Merge,
+    })
+}
+
+fn merge_conflicted_outcome(repo: &Repository, affected_scope: &Path) -> Result<MergeOutcome> {
+    Ok(MergeOutcome::Conflicted {
+        affected_scope: affected_scope.to_path_buf(),
+        conflicted_files: collect_conflicted_paths(repo)?,
+    })
+}
+
+fn branch_checkout_block_reason(repo: &Repository) -> Result<Option<String>> {
+    if repo.state() == RepositoryState::Merge {
+        return Ok(Some(
+            "Cannot checkout branches while a merge is in progress. Complete or abort the merge first."
+                .to_string(),
+        ));
+    }
+
+    if !is_repo_clean(repo)? {
+        return Ok(Some(
+            "Cannot checkout branches with uncommitted changes. Commit or stash first.".to_string(),
+        ));
+    }
+
+    Ok(None)
+}
+
+fn validate_local_branch_name(branch_name: &str) -> std::result::Result<String, String> {
+    let trimmed = branch_name.trim();
+    if trimmed.is_empty() {
+        return Err("Branch name cannot be empty.".to_string());
+    }
+
+    let full_ref = format!("refs/heads/{trimmed}");
+    if !Reference::is_valid_name(&full_ref) {
+        return Err(format!("{trimmed} is not a valid local branch name."));
+    }
+
+    Ok(trimmed.to_string())
+}
+
+fn local_branch_requires_force_delete(
+    repo: &Repository,
+    branch: &git2::Branch<'_>,
+) -> Result<bool> {
+    let branch_target = branch
+        .get()
+        .target()
+        .context("local branch has no target commit")?;
+
+    let comparison_target = match branch.upstream() {
+        Ok(upstream) => upstream.get().target(),
+        Err(err) if err.code() == ErrorCode::NotFound => None,
+        Err(err) => return Err(err).context("failed to resolve branch upstream"),
+    }
+    .or_else(|| repo.head().ok().and_then(|head| head.target()));
+
+    let Some(comparison_target) = comparison_target else {
+        return Ok(false);
+    };
+
+    Ok(comparison_target != branch_target
+        && !repo.graph_descendant_of(comparison_target, branch_target)?)
+}
+
+fn status_is_uncommitted(status: Status) -> bool {
+    status.intersects(
+        Status::INDEX_NEW
+            | Status::INDEX_MODIFIED
+            | Status::INDEX_DELETED
+            | Status::INDEX_RENAMED
+            | Status::INDEX_TYPECHANGE
+            | Status::WT_NEW
+            | Status::WT_MODIFIED
+            | Status::WT_DELETED
+            | Status::WT_TYPECHANGE
+            | Status::WT_RENAMED
+            | Status::WT_UNREADABLE
+            | Status::CONFLICTED,
+    )
+}
+
+fn ensure_merge_state(repo: &Repository) -> Result<()> {
+    if repo.state() != RepositoryState::Merge {
+        bail!("repository is not in merge state");
+    }
+    Ok(())
+}
+
+fn read_merge_head_commit(repo: &Repository) -> Result<Commit<'_>> {
+    let merge_head =
+        fs::read_to_string(repo.path().join("MERGE_HEAD")).context("failed to read MERGE_HEAD")?;
+    let merge_head_oid = merge_head
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .context("MERGE_HEAD did not contain a commit id")?;
+    let merge_head_oid = Oid::from_str(merge_head_oid.trim())
+        .context("MERGE_HEAD contained an invalid commit id")?;
+    repo.find_commit(merge_head_oid)
+        .context("failed to resolve MERGE_HEAD commit")
+}
+
+fn read_merge_message(repo: &Repository) -> Result<String> {
+    let message =
+        fs::read_to_string(repo.path().join("MERGE_MSG")).context("failed to read MERGE_MSG")?;
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        bail!("MERGE_MSG was empty");
+    }
+    Ok(trimmed.to_string())
 }
 
 /// Resolve the worktree path whose HEAD matches `source_ref`.
@@ -901,6 +2795,138 @@ fn checkout_head_for_scope(scope_path: &Path) -> Result<()> {
     repo.checkout_tree(&head_obj, Some(&mut checkout))
         .context("failed to checkout HEAD tree")?;
     Ok(())
+}
+
+fn switch_head_to_branch(
+    repo: &Repository,
+    target_commit: &Commit<'_>,
+    full_ref: &str,
+) -> Result<()> {
+    let target_object = target_commit.as_object();
+    let mut checkout = git2::build::CheckoutBuilder::new();
+    checkout.safe().recreate_missing(true);
+    repo.checkout_tree(target_object, Some(&mut checkout))
+        .with_context(|| format!("failed to checkout {full_ref}"))?;
+    repo.set_head(full_ref)
+        .with_context(|| format!("failed to set HEAD to {full_ref}"))?;
+    Ok(())
+}
+
+fn current_head_ref_name(repo: &Repository) -> Result<Option<String>> {
+    match repo.head() {
+        Ok(head) => Ok(head.name().map(str::to_owned)),
+        Err(err) if err.code() == ErrorCode::UnbornBranch => Ok(None),
+        Err(err) => Err(err).context("failed to resolve HEAD"),
+    }
+}
+
+fn current_local_branch_name(repo: &Repository) -> Result<Option<String>> {
+    if repo
+        .head_detached()
+        .context("failed to inspect detached HEAD state")?
+    {
+        return Ok(None);
+    }
+
+    let Some(head_ref) = current_head_ref_name(repo)? else {
+        return Ok(None);
+    };
+    Ok(head_ref.strip_prefix("refs/heads/").map(str::to_owned))
+}
+
+fn select_tracking_branch_for_remote(
+    repo: &Repository,
+    remote_full_ref: &str,
+    short_name: &str,
+) -> Result<Option<String>> {
+    if let Some(current_branch) = current_local_branch_name(repo)? {
+        let branch = repo
+            .find_branch(&current_branch, BranchType::Local)
+            .with_context(|| format!("failed to resolve current branch {current_branch}"))?;
+        if local_branch_upstream_full_ref(&branch)?.as_deref() == Some(remote_full_ref) {
+            return Ok(Some(current_branch));
+        }
+    }
+
+    let mut matches = Vec::new();
+    let branches = repo
+        .branches(Some(BranchType::Local))
+        .context("failed to enumerate local branches")?;
+    for branch in branches {
+        let (branch, _) = branch.context("failed to read local branch")?;
+        if local_branch_upstream_full_ref(&branch)?.as_deref() != Some(remote_full_ref) {
+            continue;
+        }
+        let Some(name) = branch.name().context("failed to read local branch name")? else {
+            continue;
+        };
+        matches.push(name.to_string());
+    }
+
+    if matches.is_empty() {
+        return Ok(None);
+    }
+
+    if matches.iter().any(|name| name == short_name) {
+        return Ok(Some(short_name.to_string()));
+    }
+
+    matches.sort();
+    Ok(matches.into_iter().next())
+}
+
+fn local_branch_upstream_full_ref(branch: &git2::Branch<'_>) -> Result<Option<String>> {
+    match branch.upstream() {
+        Ok(upstream) => Ok(upstream.get().name().map(str::to_owned)),
+        Err(err) if err.code() == ErrorCode::NotFound => Ok(None),
+        Err(err) => Err(err).context("failed to resolve branch upstream"),
+    }
+}
+
+fn find_checkout_holding_ref(
+    repo_root: &Path,
+    current_scope_root: &Path,
+    full_ref: &str,
+) -> Result<Option<PathBuf>> {
+    let admin_repo = Repository::open(repo_root).with_context(|| {
+        format!(
+            "failed to open repository at {} for worktree inspection",
+            repo_root.display()
+        )
+    })?;
+
+    let mut checkout_paths = vec![repo_root.to_path_buf()];
+    if let Ok(worktrees) = admin_repo.worktrees() {
+        for worktree_name in worktrees.iter().flatten() {
+            let Ok(worktree) = admin_repo.find_worktree(worktree_name) else {
+                continue;
+            };
+            checkout_paths.push(worktree.path().to_path_buf());
+        }
+    }
+
+    for checkout_path in checkout_paths {
+        let checkout_scope = match discover_scope(&checkout_path) {
+            Ok(scope) => scope.scope_root,
+            Err(_) => continue,
+        };
+        if checkout_scope == current_scope_root {
+            continue;
+        }
+
+        let checkout_repo = match Repository::open(&checkout_scope) {
+            Ok(repo) => repo,
+            Err(_) => continue,
+        };
+        let Ok(head_ref) = current_head_ref_name(&checkout_repo) else {
+            continue;
+        };
+        if head_ref.as_deref() == Some(full_ref) {
+            return Ok(Some(checkout_scope));
+        }
+    }
+
+    Ok(None)
 }
 
 // ── Worktree management ──────────────────────────────────────────────
@@ -1117,6 +3143,35 @@ fn resolve_head_tree(repo: &Repository) -> Result<git2::Tree<'_>> {
     head_commit.tree().context("failed to load HEAD tree")
 }
 
+fn empty_tree(repo: &Repository) -> Result<git2::Tree<'_>> {
+    let tree_id = repo
+        .treebuilder(None)
+        .context("failed to create empty tree builder")?
+        .write()
+        .context("failed to write empty tree")?;
+    repo.find_tree(tree_id)
+        .context("failed to load empty tree object")
+}
+
+fn build_tree_to_tree_diff<'repo>(
+    repo: &'repo Repository,
+    old_tree: Option<&git2::Tree<'repo>>,
+    new_tree: Option<&git2::Tree<'repo>>,
+) -> Result<Diff<'repo>> {
+    let mut opts = DiffOptions::new();
+    opts.include_typechange(true).ignore_submodules(true);
+
+    let mut diff = repo
+        .diff_tree_to_tree(old_tree, new_tree, Some(&mut opts))
+        .context("failed to build tree diff")?;
+
+    let mut find_opts = DiffFindOptions::new();
+    find_opts.renames(true);
+    diff.find_similar(Some(&mut find_opts))
+        .context("failed to run rename detection on tree diff")?;
+    Ok(diff)
+}
+
 fn build_staged_diff(repo: &Repository) -> Result<Diff<'_>> {
     let head_tree = resolve_head_tree(repo)?;
     let index = repo
@@ -1163,6 +3218,243 @@ fn build_unstaged_diff(repo: &Repository) -> Result<Diff<'_>> {
     Ok(diff)
 }
 
+fn build_unstaged_apply_diff<'repo>(
+    repo: &'repo Repository,
+    paths: &[PathBuf],
+    reverse: bool,
+) -> Result<Diff<'repo>> {
+    let index = repo
+        .index()
+        .context("failed to read index for unstaged discard diff")?;
+
+    let mut opts = DiffOptions::new();
+    opts.include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .show_untracked_content(true)
+        .include_typechange(true)
+        .include_unreadable_as_untracked(true)
+        .ignore_submodules(true)
+        .show_binary(true)
+        .reverse(reverse)
+        .disable_pathspec_match(true);
+
+    for path in paths {
+        let path = path.to_str().context("path contains invalid UTF-8")?;
+        opts.pathspec(path);
+    }
+
+    let mut diff = repo
+        .diff_index_to_workdir(Some(&index), Some(&mut opts))
+        .context("failed to diff index against worktree for discard")?;
+
+    let mut find_opts = DiffFindOptions::new();
+    find_opts.renames(true).for_untracked(true);
+    diff.find_similar(Some(&mut find_opts))
+        .context("failed to run rename detection on discard diff")?;
+
+    Ok(diff)
+}
+
+fn collect_untracked_status_paths(repo: &Repository, paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut opts = StatusOptions::new();
+    opts.show(StatusShow::Workdir)
+        .include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .include_unreadable(true)
+        .exclude_submodules(true)
+        .disable_pathspec_match(true);
+
+    for path in paths {
+        let path = path.to_str().context("path contains invalid UTF-8")?;
+        opts.pathspec(path);
+    }
+
+    let statuses = repo
+        .statuses(Some(&mut opts))
+        .context("failed to inspect untracked worktree paths for discard")?;
+    let mut untracked = Vec::new();
+    for entry in statuses.iter() {
+        if !entry.status().contains(Status::WT_NEW) {
+            continue;
+        }
+        let relative_path = entry
+            .path()
+            .map(PathBuf::from)
+            .context("status entry missing path for untracked discard cleanup")?;
+        untracked.push(relative_path);
+    }
+    untracked.sort();
+    untracked.dedup();
+    Ok(untracked)
+}
+
+enum UnstagedTargetInspection {
+    Discardable,
+    BlockedUnsupportedStatus,
+    Missing,
+}
+
+enum CurrentUnstagedTargetStatus {
+    Modified,
+    Deleted,
+    Untracked,
+    BlockedUnsupportedStatus,
+    Missing,
+}
+
+fn inspect_unstaged_target(
+    repo: &Repository,
+    relative_path: &Path,
+) -> Result<UnstagedTargetInspection> {
+    let current = inspect_current_unstaged_target_status(repo, relative_path)?;
+    if matches!(
+        current,
+        CurrentUnstagedTargetStatus::BlockedUnsupportedStatus
+    ) {
+        return Ok(UnstagedTargetInspection::BlockedUnsupportedStatus);
+    }
+    if matches!(current, CurrentUnstagedTargetStatus::Missing) {
+        return Ok(UnstagedTargetInspection::Missing);
+    }
+    if matches!(
+        current,
+        CurrentUnstagedTargetStatus::Modified | CurrentUnstagedTargetStatus::Deleted
+    ) {
+        return Ok(UnstagedTargetInspection::Discardable);
+    }
+    inspect_unstaged_target_with_full_diff(repo, relative_path)
+}
+
+fn inspect_current_unstaged_target_status(
+    repo: &Repository,
+    relative_path: &Path,
+) -> Result<CurrentUnstagedTargetStatus> {
+    let path = relative_path
+        .to_str()
+        .context("path contains invalid UTF-8")?;
+    let mut opts = StatusOptions::new();
+    opts.show(StatusShow::IndexAndWorkdir)
+        .include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .include_unreadable(true)
+        .exclude_submodules(true)
+        .disable_pathspec_match(true)
+        .pathspec(path);
+
+    let statuses = repo
+        .statuses(Some(&mut opts))
+        .context("failed to inspect discard target status")?;
+    for entry in statuses.iter() {
+        let status = entry.status();
+        if status.intersects(Status::WT_RENAMED | Status::WT_TYPECHANGE) {
+            return Ok(CurrentUnstagedTargetStatus::BlockedUnsupportedStatus);
+        }
+        if status.intersects(Status::WT_NEW) {
+            return Ok(CurrentUnstagedTargetStatus::Untracked);
+        }
+        if status.intersects(Status::WT_MODIFIED | Status::WT_UNREADABLE) {
+            return Ok(CurrentUnstagedTargetStatus::Modified);
+        }
+        if status.intersects(Status::WT_DELETED) {
+            return Ok(CurrentUnstagedTargetStatus::Deleted);
+        }
+    }
+    Ok(CurrentUnstagedTargetStatus::Missing)
+}
+
+fn inspect_unstaged_target_with_full_diff(
+    repo: &Repository,
+    relative_path: &Path,
+) -> Result<UnstagedTargetInspection> {
+    let diff = build_unstaged_diff(repo)?;
+    let Some((_, delta)) = find_diff_delta_by_path(&diff, relative_path)? else {
+        return Ok(UnstagedTargetInspection::Missing);
+    };
+    if is_unsupported_file_discard_status(map_status(delta.status())?) {
+        return Ok(UnstagedTargetInspection::BlockedUnsupportedStatus);
+    }
+    Ok(UnstagedTargetInspection::Discardable)
+}
+
+fn remove_workdir_paths(scope_root: &Path, paths: &[PathBuf]) -> Result<()> {
+    for relative_path in paths {
+        let full_path = scope_root.join(relative_path);
+        let metadata = match fs::symlink_metadata(&full_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to inspect {}", relative_path.display()));
+            }
+        };
+
+        let file_type = metadata.file_type();
+        if file_type.is_dir() && !file_type.is_symlink() {
+            fs::remove_dir_all(&full_path).with_context(|| {
+                format!("failed to remove directory {}", relative_path.display())
+            })?;
+        } else if let Err(error) = fs::remove_file(&full_path) {
+            return Err(error)
+                .with_context(|| format!("failed to remove {}", relative_path.display()));
+        }
+
+        prune_empty_parent_dirs(scope_root, &full_path)?;
+    }
+    Ok(())
+}
+
+fn prune_empty_parent_dirs(scope_root: &Path, removed_path: &Path) -> Result<()> {
+    let mut current = removed_path.parent();
+    while let Some(directory) = current {
+        if directory == scope_root {
+            break;
+        }
+
+        match fs::remove_dir(directory) {
+            Ok(()) => {
+                current = directory.parent();
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                current = directory.parent();
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                break;
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to prune {}", directory.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn remove_empty_untracked_file(
+    scope_root: &Path,
+    relative_path: &Path,
+    status: GitFileStatus,
+) -> Result<()> {
+    if status != GitFileStatus::Untracked {
+        return Ok(());
+    }
+
+    let full_path = scope_root.join(relative_path);
+    let metadata = match fs::metadata(&full_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect {}", relative_path.display()));
+        }
+    };
+
+    if metadata.is_file() && metadata.len() == 0 {
+        remove_workdir_paths(scope_root, &[relative_path.to_path_buf()])?;
+    }
+
+    Ok(())
+}
+
 fn snapshot_summary_from_split(
     scope: &GitScope,
     repo: &Repository,
@@ -1173,6 +3465,7 @@ fn snapshot_summary_from_split(
     generation: u64,
 ) -> Result<GitSnapshotSummary> {
     let branch = branch_name(repo)?;
+    let remotes = configured_remote_names(repo)?;
     let staged_stats = staged_diff
         .stats()
         .context("failed to compute staged diff statistics")?;
@@ -1202,6 +3495,7 @@ fn snapshot_summary_from_split(
             unstaged_files,
         )?,
         branch_name: branch,
+        remotes,
         is_worktree: scope.is_worktree,
         worktree_name: scope.worktree_name.clone(),
         changed_files: unique_paths.len(),
@@ -1210,18 +3504,320 @@ fn snapshot_summary_from_split(
     })
 }
 
-fn collect_changed_files(diff: &Diff<'_>) -> Result<Vec<ChangedFile>> {
+fn configured_remote_names(repo: &Repository) -> Result<Vec<String>> {
+    let remotes = repo.remotes().context("failed to read git remotes")?;
+    let mut names = remotes
+        .iter()
+        .flatten()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    Ok(names)
+}
+
+fn collect_changed_files(
+    diff: &Diff<'_>,
+    excluded_paths: Option<&HashSet<PathBuf>>,
+) -> Result<Vec<ChangedFile>> {
     let mut files = Vec::new();
     for (idx, delta) in diff.deltas().enumerate() {
-        files.push(
-            changed_file_from_delta(diff, idx, delta).with_context(|| {
-                format!("failed to build changed-file entry at diff index {idx}")
-            })?,
-        );
+        let file = changed_file_from_delta(diff, idx, delta)
+            .with_context(|| format!("failed to build changed-file entry at diff index {idx}"))?;
+        if excluded_paths.is_some_and(|paths| paths.contains(&file.relative_path)) {
+            continue;
+        }
+        files.push(file);
     }
 
     files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     Ok(files)
+}
+
+fn build_stash_file_diff_document(
+    stash_oid: Oid,
+    relative_path: &Path,
+    mut rendered: SelectedDiffRender,
+    theme_id: ThemeId,
+) -> StashFileDiffDocument {
+    if !rendered.file.is_binary {
+        attach_syntax_highlights(&mut rendered.lines, &rendered.file.relative_path, theme_id);
+        attach_inline_changes(&mut rendered.lines);
+    }
+
+    StashFileDiffDocument {
+        stash_oid,
+        selection: StashFileSelection {
+            stash_oid,
+            relative_path: relative_path.to_path_buf(),
+        },
+        file: rendered.file,
+        lines: rendered.lines,
+    }
+}
+
+fn stash_includes_untracked(commit: &Commit<'_>) -> bool {
+    commit.parent_count() >= 3
+}
+
+#[derive(Debug, Clone)]
+struct RawStashEntry {
+    stash_index: usize,
+    message: String,
+    stash_oid: Oid,
+}
+
+impl RawStashEntry {
+    fn label(&self) -> String {
+        format!("stash@{{{}}}", self.stash_index)
+    }
+}
+
+fn load_stash_entry_summaries(repo: &mut Repository) -> Result<Vec<StashEntrySummary>> {
+    let raw_entries = collect_raw_stash_entries(repo)?;
+    let mut entries = Vec::with_capacity(raw_entries.len());
+    for raw_entry in raw_entries {
+        let stash_commit = repo
+            .find_commit(raw_entry.stash_oid)
+            .with_context(|| format!("failed to find stash {}", short_oid(raw_entry.stash_oid)))?;
+        entries.push(StashEntrySummary {
+            stash_oid: raw_entry.stash_oid,
+            stash_index: raw_entry.stash_index,
+            label: format!("stash@{{{}}}", raw_entry.stash_index),
+            message: raw_entry.message,
+            committed_at_unix: stash_commit.committer().when().seconds(),
+            includes_untracked: stash_includes_untracked(&stash_commit),
+        });
+    }
+    Ok(entries)
+}
+
+fn collect_raw_stash_entries(repo: &mut Repository) -> Result<Vec<RawStashEntry>> {
+    let mut entries = Vec::new();
+    repo.stash_foreach(|stash_index, message, stash_oid| {
+        entries.push(RawStashEntry {
+            stash_index,
+            message: message.to_string(),
+            stash_oid: *stash_oid,
+        });
+        true
+    })
+    .context("failed to enumerate stash entries")?;
+    Ok(entries)
+}
+
+fn resolve_stash_entry(repo: &mut Repository, stash_oid: Oid) -> Result<StashEntrySummary> {
+    load_stash_entry_summaries(repo)?
+        .into_iter()
+        .find(|entry| entry.stash_oid == stash_oid)
+        .with_context(|| format!("stash {} is no longer available", short_oid(stash_oid)))
+}
+
+fn resolve_raw_stash_entry(repo: &mut Repository, stash_oid: Oid) -> Result<RawStashEntry> {
+    collect_raw_stash_entries(repo)?
+        .into_iter()
+        .find(|entry| entry.stash_oid == stash_oid)
+        .with_context(|| format!("stash {} is no longer available", short_oid(stash_oid)))
+}
+
+fn load_stash_changed_files(
+    repo: &Repository,
+    stash_commit: &Commit<'_>,
+) -> Result<Vec<ChangedFile>> {
+    let tracked_files = load_stash_tracked_files(repo, stash_commit)?;
+    let untracked_files = load_stash_untracked_files(repo, stash_commit)?;
+    merge_stash_changed_files(tracked_files, untracked_files)
+}
+
+fn load_stash_tracked_files(
+    repo: &Repository,
+    stash_commit: &Commit<'_>,
+) -> Result<Vec<ChangedFile>> {
+    let stash_tree = stash_commit
+        .tree()
+        .context("failed to read stash commit tree")?;
+    let base_commit = stash_commit
+        .parent(0)
+        .context("stash commit did not have a base parent")?;
+    let base_tree = base_commit
+        .tree()
+        .context("failed to read stash base tree")?;
+    let diff = build_tree_to_tree_diff(repo, Some(&base_tree), Some(&stash_tree))
+        .context("failed to diff stash against its base parent")?;
+    collect_changed_files(&diff, None)
+}
+
+fn load_stash_untracked_files(
+    repo: &Repository,
+    stash_commit: &Commit<'_>,
+) -> Result<Vec<ChangedFile>> {
+    if !stash_includes_untracked(stash_commit) {
+        return Ok(Vec::new());
+    }
+
+    let untracked_commit = stash_commit
+        .parent(2)
+        .context("stash declared untracked content but was missing parent 2")?;
+    let untracked_tree = untracked_commit
+        .tree()
+        .context("failed to read stash untracked tree")?;
+    let empty_tree = empty_tree(repo)?;
+    let diff = build_tree_to_tree_diff(repo, Some(&empty_tree), Some(&untracked_tree))
+        .context("failed to diff stash untracked parent")?;
+    let mut files = collect_changed_files(&diff, None)?;
+    for file in &mut files {
+        file.status = GitFileStatus::Untracked;
+    }
+    Ok(files)
+}
+
+fn merge_stash_changed_files(
+    tracked_files: Vec<ChangedFile>,
+    untracked_files: Vec<ChangedFile>,
+) -> Result<Vec<ChangedFile>> {
+    let mut merged = tracked_files
+        .into_iter()
+        .map(|file| (file.relative_path.clone(), file))
+        .collect::<HashMap<_, _>>();
+    for file in untracked_files {
+        merged.entry(file.relative_path.clone()).or_insert(file);
+    }
+
+    let mut files = merged.into_values().collect::<Vec<_>>();
+    files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    Ok(files)
+}
+
+fn render_stash_tracked_target(
+    repo: &Repository,
+    stash_commit: &Commit<'_>,
+    relative_path: &Path,
+) -> Result<Option<SelectedDiffRender>> {
+    let stash_tree = stash_commit
+        .tree()
+        .context("failed to read stash commit tree")?;
+    let base_commit = stash_commit
+        .parent(0)
+        .context("stash commit did not have a base parent")?;
+    let base_tree = base_commit
+        .tree()
+        .context("failed to read stash base tree")?;
+    let diff = build_tree_to_tree_diff(repo, Some(&base_tree), Some(&stash_tree))
+        .context("failed to diff stash against its base parent")?;
+    render_target_from_diff(&diff, relative_path, false)
+}
+
+fn render_stash_untracked_target(
+    repo: &Repository,
+    stash_commit: &Commit<'_>,
+    relative_path: &Path,
+) -> Result<Option<SelectedDiffRender>> {
+    if !stash_includes_untracked(stash_commit) {
+        return Ok(None);
+    }
+
+    let untracked_commit = stash_commit
+        .parent(2)
+        .context("stash declared untracked content but was missing parent 2")?;
+    let untracked_tree = untracked_commit
+        .tree()
+        .context("failed to read stash untracked tree")?;
+    let empty_tree = empty_tree(repo)?;
+    let diff = build_tree_to_tree_diff(repo, Some(&empty_tree), Some(&untracked_tree))
+        .context("failed to diff stash untracked parent")?;
+    let mut rendered = match render_target_from_diff(&diff, relative_path, false)? {
+        Some(rendered) => rendered,
+        None => return Ok(None),
+    };
+    rendered.file.status = GitFileStatus::Untracked;
+    Ok(Some(rendered))
+}
+
+fn apply_stash_internal(path: &Path, stash_oid: Oid) -> Result<StashMutationOutcome> {
+    let mut discovered = discover_repo(path)?;
+    let repo = &mut discovered.repo;
+    let target = resolve_raw_stash_entry(repo, stash_oid)?;
+    let result = repo.stash_apply(target.stash_index, None);
+
+    if repository_has_conflicts(repo)? {
+        let conflicted_files = collect_conflicted_paths(repo)?;
+        return Ok(StashMutationOutcome::Conflicted {
+            affected_scope: discovered.scope.scope_root,
+            conflicted_files,
+        });
+    }
+
+    match result {
+        Ok(()) => Ok(StashMutationOutcome::Applied {
+            label: target.label(),
+        }),
+        Err(error) => Err(error).with_context(|| format!("failed to apply {}", target.label())),
+    }
+}
+
+fn pop_stash_internal(path: &Path, stash_oid: Oid) -> Result<StashMutationOutcome> {
+    let mut discovered = discover_repo(path)?;
+    let repo = &mut discovered.repo;
+    let target = resolve_raw_stash_entry(repo, stash_oid)?;
+    let result = repo.stash_apply(target.stash_index, None);
+
+    if repository_has_conflicts(repo)? {
+        let conflicted_files = collect_conflicted_paths(repo)?;
+        return Ok(StashMutationOutcome::Conflicted {
+            affected_scope: discovered.scope.scope_root,
+            conflicted_files,
+        });
+    }
+
+    match result {
+        Ok(()) => {
+            let drop_target = resolve_raw_stash_entry(repo, stash_oid)?;
+            repo.stash_drop(drop_target.stash_index)
+                .with_context(|| format!("failed to drop {} after apply", drop_target.label()))?;
+            Ok(StashMutationOutcome::Applied {
+                label: drop_target.label(),
+            })
+        }
+        Err(error) => Err(error).with_context(|| format!("failed to pop {}", target.label())),
+    }
+}
+
+fn repository_has_conflicts(repo: &Repository) -> Result<bool> {
+    let index = repo.index().context("failed to read index for conflicts")?;
+    Ok(index.has_conflicts())
+}
+
+fn collect_conflicted_paths(repo: &Repository) -> Result<Vec<PathBuf>> {
+    let index = repo.index().context("failed to read index for conflicts")?;
+    let conflicts = index
+        .conflicts()
+        .context("failed to iterate index conflicts")?;
+
+    let mut paths = Vec::new();
+    for conflict in conflicts {
+        let conflict = conflict.context("failed to read index conflict")?;
+        let path = conflict
+            .our
+            .as_ref()
+            .or(conflict.their.as_ref())
+            .or(conflict.ancestor.as_ref())
+            .map(|entry| PathBuf::from(String::from_utf8_lossy(&entry.path).into_owned()))
+            .context("conflict entry had no path")?;
+        paths.push(path);
+    }
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+fn conflicted_changed_file(relative_path: PathBuf) -> ChangedFile {
+    ChangedFile {
+        relative_path,
+        status: GitFileStatus::Conflicted,
+        is_binary: false,
+        insertions: 0,
+        deletions: 0,
+    }
 }
 
 // ── Internal: fingerprinting ─────────────────────────────────────────
@@ -1308,7 +3904,191 @@ fn diff_line_kind_code(kind: DiffLineKind) -> u8 {
         DiffLineKind::Addition => 4,
         DiffLineKind::Deletion => 5,
         DiffLineKind::BinaryNotice => 6,
+        DiffLineKind::ConflictMarker => 7,
+        DiffLineKind::ConflictOurs => 8,
+        DiffLineKind::ConflictBase => 9,
+        DiffLineKind::ConflictTheirs => 10,
     }
+}
+
+fn filtered_diff_lines(lines: &[DiffLineView]) -> Vec<&DiffLineView> {
+    lines
+        .iter()
+        .filter(|line| line.kind != DiffLineKind::FileHeader)
+        .collect()
+}
+
+fn normalized_hunk_body_from_filtered_lines(
+    filtered_lines: &[&DiffLineView],
+    hunk: &FileDiffHunk,
+) -> Result<String> {
+    let header = filtered_lines
+        .get(hunk.line_start)
+        .context("hunk start line missing from filtered diff lines")?;
+    if header.kind != DiffLineKind::HunkHeader {
+        bail!("hunk start did not point at a hunk header");
+    }
+    let body_lines = filtered_lines
+        .get(hunk.line_start + 1..hunk.line_end)
+        .context("hunk body range missing from filtered diff lines")?;
+    Ok(serialize_hunk_body(body_lines))
+}
+
+fn serialize_hunk_body(lines: &[&DiffLineView]) -> String {
+    let mut body = String::new();
+    for line in lines {
+        body.push_str(&diff_line_kind_code(line.kind).to_string());
+        body.push('\0');
+        body.push_str(&line.text.len().to_string());
+        body.push('\0');
+        body.push_str(&line.text);
+        body.push('\u{1}');
+    }
+    body
+}
+
+fn fingerprint_hunk_body(body: &str) -> u64 {
+    let mut fingerprint = 0xcbf29ce484222325u64;
+    fingerprint_bytes(&mut fingerprint, body.as_bytes());
+    fingerprint
+}
+
+fn discard_hunk_target_from_lines(
+    lines: &[DiffLineView],
+    hunks: &[FileDiffHunk],
+    hunk_index: usize,
+) -> Option<DiscardHunkTarget> {
+    let filtered_lines = filtered_diff_lines(lines);
+    discard_hunk_target_from_filtered_lines(&filtered_lines, hunks, hunk_index)
+}
+
+fn discard_hunk_target_from_filtered_lines(
+    filtered_lines: &[&DiffLineView],
+    hunks: &[FileDiffHunk],
+    hunk_index: usize,
+) -> Option<DiscardHunkTarget> {
+    let hunk = hunks.iter().find(|hunk| hunk.hunk_index == hunk_index)?;
+    let body = normalized_hunk_body_from_filtered_lines(filtered_lines, hunk).ok()?;
+    Some(DiscardHunkTarget {
+        hunk_index: hunk.hunk_index,
+        body_fingerprint: hunk.body_fingerprint,
+        old_start: hunk.old_start,
+        old_lines: hunk.old_lines,
+        new_start: hunk.new_start,
+        new_lines: hunk.new_lines,
+        body,
+    })
+}
+
+fn same_hunk_range(hunk: &FileDiffHunk, target: &DiscardHunkTarget) -> bool {
+    hunk.old_start == target.old_start
+        && hunk.old_lines == target.old_lines
+        && hunk.new_start == target.new_start
+        && hunk.new_lines == target.new_lines
+}
+
+fn resolve_hunk_discard_index(
+    lines: &[DiffLineView],
+    hunks: &[FileDiffHunk],
+    target: &DiscardHunkTarget,
+) -> Result<usize, String> {
+    let filtered_lines = filtered_diff_lines(lines);
+    if let Some(candidate) =
+        discard_hunk_target_from_filtered_lines(&filtered_lines, hunks, target.hunk_index)
+    {
+        if candidate.body_fingerprint == target.body_fingerprint
+            && candidate.body == target.body
+            && candidate.old_start == target.old_start
+            && candidate.old_lines == target.old_lines
+            && candidate.new_start == target.new_start
+            && candidate.new_lines == target.new_lines
+        {
+            return Ok(target.hunk_index);
+        }
+    }
+
+    let exact_matches = hunks
+        .iter()
+        .filter_map(|hunk| {
+            let candidate =
+                discard_hunk_target_from_filtered_lines(&filtered_lines, hunks, hunk.hunk_index)?;
+            if candidate.body_fingerprint == target.body_fingerprint
+                && candidate.body == target.body
+            {
+                Some((hunk.hunk_index, hunk))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    match exact_matches.as_slice() {
+        [(matched_index, _)] => Ok(*matched_index),
+        [] => Err("Selected hunk changed. Refresh and try again.".to_string()),
+        _ => {
+            let range_matches = exact_matches
+                .iter()
+                .filter(|(_, hunk)| same_hunk_range(hunk, target))
+                .map(|(index, _)| *index)
+                .collect::<Vec<_>>();
+            if range_matches.len() == 1 {
+                Ok(range_matches[0])
+            } else {
+                Err("Selected hunk changed. Refresh and try again.".to_string())
+            }
+        }
+    }
+}
+
+fn is_unsupported_file_discard_status(status: GitFileStatus) -> bool {
+    matches!(status, GitFileStatus::Renamed | GitFileStatus::Typechange)
+}
+
+fn repo_state_warning(state: RepositoryState) -> Option<String> {
+    match state {
+        RepositoryState::Clean | RepositoryState::Merge => None,
+        RepositoryState::Revert => Some("Repository is in a revert state.".to_string()),
+        RepositoryState::RevertSequence => {
+            Some("Repository is in a revert-sequence state.".to_string())
+        }
+        RepositoryState::CherryPick => Some("Repository is in a cherry-pick state.".to_string()),
+        RepositoryState::CherryPickSequence => {
+            Some("Repository is in a cherry-pick-sequence state.".to_string())
+        }
+        RepositoryState::Bisect => Some("Repository is in a bisect state.".to_string()),
+        RepositoryState::Rebase => Some("Repository is in a rebase state.".to_string()),
+        RepositoryState::RebaseInteractive => {
+            Some("Repository is in an interactive rebase state.".to_string())
+        }
+        RepositoryState::RebaseMerge => Some("Repository is in a rebase-merge state.".to_string()),
+        RepositoryState::ApplyMailbox => {
+            Some("Repository is applying a mailbox patch.".to_string())
+        }
+        RepositoryState::ApplyMailboxOrRebase => {
+            Some("Repository is applying a mailbox patch or continuing a rebase.".to_string())
+        }
+    }
+}
+
+fn ensure_discard_repo_state(repo: &Repository) -> Result<()> {
+    match repo.state() {
+        RepositoryState::Clean => Ok(()),
+        RepositoryState::Merge => bail!("discard actions are unavailable while a merge is active"),
+        state => {
+            let warning = repo_state_warning(state)
+                .unwrap_or_else(|| format!("discard actions are unavailable in {state:?} state"));
+            bail!("{warning}");
+        }
+    }
+}
+
+fn split_lines_inclusive(text: &str) -> Vec<&str> {
+    let mut lines = text.split_inclusive('\n').collect::<Vec<_>>();
+    if !text.is_empty() && !text.ends_with('\n') {
+        let consumed = lines.iter().map(|line| line.len()).sum::<usize>();
+        lines.push(&text[consumed..]);
+    }
+    lines
 }
 
 // ── Internal: diff rendering ─────────────────────────────────────────
@@ -1336,6 +4116,166 @@ fn changed_file_from_delta(
         insertions,
         deletions,
     })
+}
+
+struct SelectedDiffRender {
+    file: ChangedFile,
+    lines: Vec<DiffLineView>,
+    hunks: Vec<FileDiffHunk>,
+}
+
+fn render_target_from_diff(
+    diff: &Diff<'_>,
+    relative_path: &Path,
+    include_hunks: bool,
+) -> Result<Option<SelectedDiffRender>> {
+    let Some((idx, delta)) = find_diff_delta_by_path(diff, relative_path)? else {
+        return Ok(None);
+    };
+    render_selected_diff_entry(diff, idx, delta, include_hunks).map(Some)
+}
+
+fn render_unstaged_target_with_path_filter(
+    repo: &Repository,
+    relative_path: &Path,
+    include_hunks: bool,
+) -> Result<Option<SelectedDiffRender>> {
+    let diff = build_unstaged_apply_diff(repo, &[relative_path.to_path_buf()], false)?;
+    render_target_from_diff(&diff, relative_path, include_hunks)
+}
+
+fn render_selected_diff_entry(
+    diff: &Diff<'_>,
+    idx: usize,
+    delta: git2::DiffDelta<'_>,
+    include_hunks: bool,
+) -> Result<SelectedDiffRender> {
+    let relative_path = delta_path(&delta).context("diff delta did not contain a path")?;
+    let status = map_status(delta.status())?;
+    let is_binary = delta.old_file().is_binary() || delta.new_file().is_binary();
+    let patch = Patch::from_diff(diff, idx).context("failed to create patch from diff")?;
+    let (insertions, deletions) = if let Some(ref patch) = patch {
+        let (_, insertions, deletions) =
+            patch.line_stats().context("failed to collect line stats")?;
+        (insertions, deletions)
+    } else {
+        (0, 0)
+    };
+    let mut file = ChangedFile {
+        relative_path,
+        status,
+        is_binary,
+        insertions,
+        deletions,
+    };
+
+    if file.is_binary {
+        return Ok(SelectedDiffRender {
+            file,
+            lines: vec![binary_notice(BINARY_DIFF_MESSAGE)],
+            hunks: Vec::new(),
+        });
+    }
+
+    let Some(mut patch) = patch else {
+        return Ok(SelectedDiffRender {
+            file,
+            lines: vec![no_text_diff_notice()],
+            hunks: Vec::new(),
+        });
+    };
+
+    if patch.size(true, true, true) > MAX_RENDERED_DIFF_BYTES
+        || estimated_patch_line_count(&patch)? > MAX_RENDERED_DIFF_LINES
+    {
+        return Ok(SelectedDiffRender {
+            file,
+            lines: vec![binary_notice(OVERSIZE_DIFF_MESSAGE)],
+            hunks: Vec::new(),
+        });
+    }
+
+    let mut lines = Vec::new();
+    let mut hunks = Vec::new();
+    let mut open_hunk: Option<FileDiffHunk> = None;
+    let mut filtered_line_index = 0usize;
+    let mut render_error = None;
+    patch
+        .print(&mut |_delta, hunk, line| {
+            let kind = map_line_kind(line.origin_value());
+            if include_hunks && kind == DiffLineKind::HunkHeader {
+                if let Some(mut previous) = open_hunk.take() {
+                    previous.line_end = filtered_line_index;
+                    hunks.push(previous);
+                }
+                let Some(hunk) = hunk else {
+                    render_error = Some(anyhow!(
+                        "libgit2 omitted hunk metadata for a rendered hunk header"
+                    ));
+                    return false;
+                };
+                open_hunk = Some(FileDiffHunk {
+                    hunk_index: hunks.len(),
+                    old_start: hunk.old_start(),
+                    old_lines: hunk.old_lines(),
+                    new_start: hunk.new_start(),
+                    new_lines: hunk.new_lines(),
+                    header: String::from_utf8_lossy(hunk.header())
+                        .trim_end()
+                        .to_string(),
+                    body_fingerprint: 0,
+                    line_start: filtered_line_index,
+                    line_end: filtered_line_index,
+                });
+            }
+
+            lines.push(DiffLineView {
+                kind,
+                old_lineno: line.old_lineno(),
+                new_lineno: line.new_lineno(),
+                text: String::from_utf8_lossy(line.content()).into_owned(),
+                highlights: None,
+                inline_changes: None,
+            });
+            if kind != DiffLineKind::FileHeader {
+                filtered_line_index += 1;
+            }
+            true
+        })
+        .context("failed to render patch lines")?;
+    if let Some(error) = render_error {
+        return Err(error);
+    }
+
+    if let Some(mut last_hunk) = open_hunk.take() {
+        last_hunk.line_end = filtered_line_index;
+        hunks.push(last_hunk);
+    }
+
+    if lines
+        .iter()
+        .any(|line| line.kind == DiffLineKind::BinaryNotice)
+    {
+        file.is_binary = true;
+        return Ok(SelectedDiffRender {
+            file,
+            lines: vec![binary_notice(BINARY_DIFF_MESSAGE)],
+            hunks: Vec::new(),
+        });
+    }
+
+    if include_hunks && !hunks.is_empty() {
+        let filtered_lines = filtered_diff_lines(&lines);
+        for hunk in &mut hunks {
+            let body = normalized_hunk_body_from_filtered_lines(&filtered_lines, hunk)
+                .context("failed to normalize rendered hunk body")?;
+            hunk.body_fingerprint = fingerprint_hunk_body(&body);
+        }
+    } else {
+        hunks.clear();
+    }
+
+    Ok(SelectedDiffRender { file, lines, hunks })
 }
 
 fn render_diff_lines(diff: &Diff<'_>, idx: usize, file: &ChangedFile) -> Result<Vec<DiffLineView>> {
@@ -1421,6 +4361,7 @@ fn capture_feed_layers(
                     selection: selection.clone(),
                     file: file.clone(),
                     lines,
+                    hunks: Vec::new(),
                 })
             }
             Err(error) => FeedLayerState::Unavailable {
@@ -1526,8 +4467,11 @@ fn build_live_delta_event(
             current.generation,
             theme_id,
         )? {
-            DeltaFileOutcome::Document(document) => {
-                let (document_insertions, document_deletions) = count_document_changes(&document);
+            DeltaFileOutcome::Document {
+                document,
+                insertions: document_insertions,
+                deletions: document_deletions,
+            } => {
                 insertions += document_insertions;
                 deletions += document_deletions;
                 if event_files.len() >= FEED_EVENT_FILE_CAP {
@@ -1594,6 +4538,7 @@ fn summarize_feed_layers(layers: Vec<&FeedLayerSnapshot>) -> Vec<FeedEventFileSu
         if let Some(index) = positions.get(&layer.selection.relative_path).copied() {
             let summary: &mut FeedEventFileSummary = &mut ordered[index];
             match layer.selection.section {
+                DiffSectionKind::Conflicted => {}
                 DiffSectionKind::Staged => summary.staged = true,
                 DiffSectionKind::Unstaged => summary.unstaged = true,
             }
@@ -1612,6 +4557,7 @@ fn summarize_feed_layers(layers: Vec<&FeedLayerSnapshot>) -> Vec<FeedEventFileSu
                 deletions: layer.file.deletions,
             };
             match layer.selection.section {
+                DiffSectionKind::Conflicted => {}
                 DiffSectionKind::Staged => summary.staged = true,
                 DiffSectionKind::Unstaged => summary.unstaged = true,
             }
@@ -1639,6 +4585,7 @@ fn feed_summary_from_layers(
     };
     for layer in [previous, current].into_iter().flatten() {
         match layer.selection.section {
+            DiffSectionKind::Conflicted => {}
             DiffSectionKind::Staged => summary.staged = true,
             DiffSectionKind::Unstaged => summary.unstaged = true,
         }
@@ -1718,7 +4665,11 @@ fn feed_layer_changed(
 }
 
 enum DeltaFileOutcome {
-    Document(FileDiffDocument),
+    Document {
+        document: FileDiffDocument,
+        insertions: usize,
+        deletions: usize,
+    },
     Unavailable(String),
     NoContent,
 }
@@ -1776,17 +4727,27 @@ fn build_delta_file_document(
         return Ok(DeltaFileOutcome::NoContent);
     }
 
+    let (insertions, deletions) = count_diff_line_changes(&lines);
+    let mut normalized_file = file;
+    normalized_file.insertions = insertions;
+    normalized_file.deletions = deletions;
+
     let mut document = FileDiffDocument {
         generation,
         selection: selection.clone(),
-        file: file.clone(),
+        file: normalized_file,
         lines,
+        hunks: Vec::new(),
     };
-    if !file.is_binary {
+    if !document.file.is_binary {
         attach_syntax_highlights(&mut document.lines, &selection.relative_path, theme_id);
         attach_inline_changes(&mut document.lines);
     }
-    Ok(DeltaFileOutcome::Document(document))
+    Ok(DeltaFileOutcome::Document {
+        document,
+        insertions,
+        deletions,
+    })
 }
 
 fn diff_feed_documents(
@@ -1865,6 +4826,10 @@ fn removed_event_kind(kind: DiffLineKind) -> DiffLineKind {
         DiffLineKind::HunkHeader => DiffLineKind::HunkHeader,
         DiffLineKind::Context => DiffLineKind::Context,
         DiffLineKind::BinaryNotice => DiffLineKind::BinaryNotice,
+        DiffLineKind::ConflictMarker => DiffLineKind::ConflictMarker,
+        DiffLineKind::ConflictOurs => DiffLineKind::ConflictOurs,
+        DiffLineKind::ConflictBase => DiffLineKind::ConflictBase,
+        DiffLineKind::ConflictTheirs => DiffLineKind::ConflictTheirs,
     }
 }
 
@@ -1873,9 +4838,13 @@ fn event_line_numbers_for_added(line: &DiffLineView) -> (Option<u32>, Option<u32
         DiffLineKind::Addition => (None, line.new_lineno.or(line.old_lineno)),
         DiffLineKind::Deletion => (line.old_lineno.or(line.new_lineno), None),
         DiffLineKind::Context => (line.old_lineno, line.new_lineno),
-        DiffLineKind::FileHeader | DiffLineKind::HunkHeader | DiffLineKind::BinaryNotice => {
-            (line.old_lineno, line.new_lineno)
-        }
+        DiffLineKind::FileHeader
+        | DiffLineKind::HunkHeader
+        | DiffLineKind::BinaryNotice
+        | DiffLineKind::ConflictMarker
+        | DiffLineKind::ConflictOurs
+        | DiffLineKind::ConflictBase
+        | DiffLineKind::ConflictTheirs => (line.old_lineno, line.new_lineno),
     }
 }
 
@@ -1884,9 +4853,13 @@ fn event_line_numbers_for_removed(line: &DiffLineView) -> (Option<u32>, Option<u
         DiffLineKind::Addition => (line.new_lineno.or(line.old_lineno), None),
         DiffLineKind::Deletion => (None, line.old_lineno.or(line.new_lineno)),
         DiffLineKind::Context => (line.old_lineno, line.new_lineno),
-        DiffLineKind::FileHeader | DiffLineKind::HunkHeader | DiffLineKind::BinaryNotice => {
-            (line.old_lineno, line.new_lineno)
-        }
+        DiffLineKind::FileHeader
+        | DiffLineKind::HunkHeader
+        | DiffLineKind::BinaryNotice
+        | DiffLineKind::ConflictMarker
+        | DiffLineKind::ConflictOurs
+        | DiffLineKind::ConflictBase
+        | DiffLineKind::ConflictTheirs => (line.old_lineno, line.new_lineno),
     }
 }
 
@@ -1925,6 +4898,7 @@ fn truncate_feed_file_document(
             selection: document.selection.clone(),
             file: document.file.clone(),
             lines: kept_lines,
+            hunks: Vec::new(),
         },
         used_lines,
         used_bytes,
@@ -1959,16 +4933,24 @@ fn count_feed_scope_changes(capture: &FeedScopeCapture) -> (usize, usize) {
 }
 
 fn count_document_changes(document: &FileDiffDocument) -> (usize, usize) {
+    count_diff_line_changes(&document.lines)
+}
+
+fn count_diff_line_changes(lines: &[DiffLineView]) -> (usize, usize) {
     let mut insertions = 0usize;
     let mut deletions = 0usize;
-    for line in &document.lines {
+    for line in lines {
         match line.kind {
             DiffLineKind::Addition => insertions += 1,
             DiffLineKind::Deletion => deletions += 1,
             DiffLineKind::FileHeader
             | DiffLineKind::HunkHeader
             | DiffLineKind::Context
-            | DiffLineKind::BinaryNotice => {}
+            | DiffLineKind::BinaryNotice
+            | DiffLineKind::ConflictMarker
+            | DiffLineKind::ConflictOurs
+            | DiffLineKind::ConflictBase
+            | DiffLineKind::ConflictTheirs => {}
         }
     }
     (insertions, deletions)
@@ -1977,8 +4959,9 @@ fn count_document_changes(document: &FileDiffDocument) -> (usize, usize) {
 fn feed_selection_sort_key(selection: &DiffSelectionKey) -> (u8, &Path) {
     (
         match selection.section {
-            DiffSectionKind::Staged => 0,
-            DiffSectionKind::Unstaged => 1,
+            DiffSectionKind::Conflicted => 0,
+            DiffSectionKind::Staged => 1,
+            DiffSectionKind::Unstaged => 2,
         },
         selection.relative_path.as_path(),
     )
@@ -1986,6 +4969,7 @@ fn feed_selection_sort_key(selection: &DiffSelectionKey) -> (u8, &Path) {
 
 fn feed_section_label(section: DiffSectionKind) -> &'static str {
     match section {
+        DiffSectionKind::Conflicted => "conflicted",
         DiffSectionKind::Staged => "staged",
         DiffSectionKind::Unstaged => "unstaged",
     }
@@ -2008,6 +4992,19 @@ fn delta_path(delta: &git2::DiffDelta<'_>) -> Option<PathBuf> {
         .path()
         .or_else(|| delta.old_file().path())
         .map(Path::to_path_buf)
+}
+
+fn find_diff_delta_by_path<'diff>(
+    diff: &'diff Diff<'_>,
+    relative_path: &Path,
+) -> Result<Option<(usize, git2::DiffDelta<'diff>)>> {
+    for (idx, delta) in diff.deltas().enumerate() {
+        let delta_path = delta_path(&delta).context("diff delta did not contain a path")?;
+        if delta_path == relative_path {
+            return Ok(Some((idx, delta)));
+        }
+    }
+    Ok(None)
 }
 
 fn map_status(delta: Delta) -> Result<GitFileStatus> {
@@ -2196,7 +5193,13 @@ fn attach_syntax_highlights(lines: &mut [DiffLineView], relative_path: &Path, th
             DiffLineKind::Deletion => {
                 line.highlights = Some(old_hl.highlight_line(&line.text));
             }
-            DiffLineKind::FileHeader | DiffLineKind::HunkHeader | DiffLineKind::BinaryNotice => {}
+            DiffLineKind::FileHeader
+            | DiffLineKind::HunkHeader
+            | DiffLineKind::BinaryNotice
+            | DiffLineKind::ConflictMarker
+            | DiffLineKind::ConflictOurs
+            | DiffLineKind::ConflictBase
+            | DiffLineKind::ConflictTheirs => {}
         }
     }
 }
@@ -2917,1839 +5920,4 @@ fn no_text_diff_notice() -> DiffLineView {
 // ── Tests ────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use git2::{IndexAddOption, Signature};
-    use tempfile::TempDir;
-
-    fn repo_fixture() -> (TempDir, Repository) {
-        let tempdir = TempDir::new().unwrap();
-        let repo = Repository::init(tempdir.path()).unwrap();
-        (tempdir, repo)
-    }
-
-    fn signature() -> Signature<'static> {
-        Signature::now("OrcaShell", "orca@example.com").unwrap()
-    }
-
-    fn commit_all(repo: &Repository, message: &str) -> Oid {
-        let sig = signature();
-        let mut index = repo.index().unwrap();
-        index
-            .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
-            .unwrap();
-        index.write().unwrap();
-        let tree_id = index.write_tree().unwrap();
-        let tree = repo.find_tree(tree_id).unwrap();
-
-        let parent_commit = repo
-            .head()
-            .ok()
-            .and_then(|head| head.target())
-            .and_then(|oid| repo.find_commit(oid).ok());
-
-        match parent_commit {
-            Some(parent) => repo
-                .commit(Some("HEAD"), &sig, &sig, message, &tree, &[&parent])
-                .unwrap(),
-            None => repo
-                .commit(Some("HEAD"), &sig, &sig, message, &tree, &[])
-                .unwrap(),
-        }
-    }
-
-    fn write_file(path: &Path, contents: impl AsRef<[u8]>) {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).unwrap();
-        }
-        fs::write(path, contents).unwrap();
-    }
-
-    fn split_gitdir_repo_fixture() -> (TempDir, PathBuf, PathBuf, Repository) {
-        let tempdir = TempDir::new().unwrap();
-        let worktree_path = tempdir.path().join("checkout");
-        let admin_dir = tempdir.path().join("admin.git");
-        let repo = Repository::init(&worktree_path).unwrap();
-        drop(repo);
-
-        fs::rename(worktree_path.join(".git"), &admin_dir).unwrap();
-        fs::write(
-            worktree_path.join(".git"),
-            format!("gitdir: {}\n", admin_dir.display()),
-        )
-        .unwrap();
-
-        let admin_repo = Repository::open(&admin_dir).unwrap();
-        admin_repo
-            .config()
-            .unwrap()
-            .set_str(
-                "core.worktree",
-                worktree_path.canonicalize().unwrap().to_str().unwrap(),
-            )
-            .unwrap();
-        let repo = Repository::open(&worktree_path).unwrap();
-        (tempdir, worktree_path, admin_dir, repo)
-    }
-
-    fn current_branch_name(repo: &Repository) -> String {
-        repo.head().unwrap().shorthand().map(str::to_owned).unwrap()
-    }
-
-    fn current_head_ref(repo: &Repository) -> String {
-        repo.head().unwrap().name().map(str::to_owned).unwrap()
-    }
-
-    /// Helper to configure git identity for test repos.
-    fn configure_identity(repo: &Repository) {
-        let mut config = repo.config().unwrap();
-        config.set_str("user.name", "OrcaShell").unwrap();
-        config.set_str("user.email", "orca@example.com").unwrap();
-    }
-
-    // ── Discovery tests ──────────────────────────────────────────────
-
-    #[test]
-    fn discovers_repo_from_nested_directory() {
-        let (tempdir, repo) = repo_fixture();
-        write_file(&tempdir.path().join("src/lib.rs"), "fn main() {}\n");
-        commit_all(&repo, "initial");
-
-        let nested = tempdir.path().join("src");
-        let scope = discover_scope(&nested).unwrap();
-        assert_eq!(scope.repo_root, tempdir.path().canonicalize().unwrap());
-        assert_eq!(scope.scope_root, tempdir.path().canonicalize().unwrap());
-        assert!(!scope.is_worktree);
-        assert_eq!(scope.worktree_name, None);
-    }
-
-    #[test]
-    fn discovers_split_gitdir_repo_from_checkout_root() {
-        let (_tempdir, worktree_path, _admin_dir, repo) = split_gitdir_repo_fixture();
-        write_file(&worktree_path.join("tracked.txt"), "one\n");
-        commit_all(&repo, "initial");
-
-        let scope = discover_scope(&worktree_path).unwrap();
-        assert_eq!(scope.repo_root, worktree_path.canonicalize().unwrap());
-        assert_eq!(scope.scope_root, worktree_path.canonicalize().unwrap());
-        assert!(!scope.is_worktree);
-        assert_eq!(scope.worktree_name, None);
-    }
-
-    // ── Snapshot tests ───────────────────────────────────────────────
-
-    #[test]
-    fn snapshot_counts_staged_unstaged_and_untracked_changes() {
-        let (tempdir, repo) = repo_fixture();
-        write_file(&tempdir.path().join("tracked.txt"), "one\n");
-        commit_all(&repo, "initial");
-
-        write_file(&tempdir.path().join("tracked.txt"), "one\ntwo\n");
-        write_file(&tempdir.path().join("notes.txt"), "draft\n");
-
-        let summary = load_snapshot(tempdir.path(), 7).unwrap();
-        assert_eq!(summary.generation, 7);
-        assert_eq!(summary.branch_name, current_branch_name(&repo));
-        assert_eq!(summary.changed_files, 2);
-        assert_eq!(summary.insertions, 2);
-        assert_eq!(summary.deletions, 0);
-    }
-
-    #[test]
-    fn snapshot_uses_detached_branch_label() {
-        let (tempdir, repo) = repo_fixture();
-        write_file(&tempdir.path().join("tracked.txt"), "one\n");
-        let commit_id = commit_all(&repo, "initial");
-        repo.set_head_detached(commit_id).unwrap();
-
-        let summary = load_snapshot(tempdir.path(), 1).unwrap();
-        assert!(summary.branch_name.starts_with("detached@"));
-    }
-
-    #[test]
-    fn snapshot_fingerprint_is_stable_for_unchanged_content() {
-        let (tempdir, repo) = repo_fixture();
-        write_file(&tempdir.path().join("tracked.txt"), "one\n");
-        commit_all(&repo, "initial");
-
-        let first = load_snapshot(tempdir.path(), 1).unwrap();
-        let second = load_snapshot(tempdir.path(), 2).unwrap();
-
-        assert_eq!(first.content_fingerprint, second.content_fingerprint);
-    }
-
-    #[test]
-    fn snapshot_fingerprint_changes_when_diff_content_changes() {
-        let (tempdir, repo) = repo_fixture();
-        write_file(&tempdir.path().join("tracked.txt"), "one\n");
-        commit_all(&repo, "initial");
-
-        let first = load_snapshot(tempdir.path(), 1).unwrap();
-        write_file(&tempdir.path().join("tracked.txt"), "one\ntwo\n");
-        let second = load_snapshot(tempdir.path(), 2).unwrap();
-
-        assert_ne!(first.content_fingerprint, second.content_fingerprint);
-    }
-
-    // ── Split diff index tests ───────────────────────────────────────
-
-    #[test]
-    fn diff_index_detects_renames_in_unstaged() {
-        let (tempdir, repo) = repo_fixture();
-        write_file(&tempdir.path().join("before.txt"), "hello\n");
-        commit_all(&repo, "initial");
-
-        fs::rename(
-            tempdir.path().join("before.txt"),
-            tempdir.path().join("after.txt"),
-        )
-        .unwrap();
-
-        let diff = load_diff_index(tempdir.path(), 3).unwrap();
-        assert!(diff.staged_files.is_empty());
-        assert_eq!(diff.unstaged_files.len(), 1);
-        assert_eq!(
-            diff.unstaged_files[0].relative_path,
-            PathBuf::from("after.txt")
-        );
-        assert_eq!(diff.unstaged_files[0].status, GitFileStatus::Renamed);
-    }
-
-    #[test]
-    fn staged_only_files_appear_in_staged_section() {
-        let (tempdir, repo) = repo_fixture();
-        write_file(&tempdir.path().join("a.txt"), "v1\n");
-        commit_all(&repo, "initial");
-
-        // Modify and stage
-        write_file(&tempdir.path().join("a.txt"), "v2\n");
-        let mut index = repo.index().unwrap();
-        index.add_path(Path::new("a.txt")).unwrap();
-        index.write().unwrap();
-
-        let diff = load_diff_index(tempdir.path(), 1).unwrap();
-        assert_eq!(diff.staged_files.len(), 1);
-        assert_eq!(diff.staged_files[0].relative_path, PathBuf::from("a.txt"));
-        assert!(diff.unstaged_files.is_empty());
-    }
-
-    #[test]
-    fn unstaged_only_files_appear_in_unstaged_section() {
-        let (tempdir, repo) = repo_fixture();
-        write_file(&tempdir.path().join("a.txt"), "v1\n");
-        commit_all(&repo, "initial");
-
-        // Modify without staging
-        write_file(&tempdir.path().join("a.txt"), "v2\n");
-
-        let diff = load_diff_index(tempdir.path(), 1).unwrap();
-        assert!(diff.staged_files.is_empty());
-        assert_eq!(diff.unstaged_files.len(), 1);
-        assert_eq!(diff.unstaged_files[0].relative_path, PathBuf::from("a.txt"));
-    }
-
-    #[test]
-    fn same_path_appears_in_both_sections() {
-        let (tempdir, repo) = repo_fixture();
-        write_file(&tempdir.path().join("a.txt"), "v1\n");
-        commit_all(&repo, "initial");
-
-        // Stage v2
-        write_file(&tempdir.path().join("a.txt"), "v2\n");
-        let mut index = repo.index().unwrap();
-        index.add_path(Path::new("a.txt")).unwrap();
-        index.write().unwrap();
-
-        // Modify to v3 in worktree (after staging v2)
-        write_file(&tempdir.path().join("a.txt"), "v3\n");
-
-        let diff = load_diff_index(tempdir.path(), 1).unwrap();
-        assert_eq!(diff.staged_files.len(), 1);
-        assert_eq!(diff.staged_files[0].relative_path, PathBuf::from("a.txt"));
-        assert_eq!(diff.unstaged_files.len(), 1);
-        assert_eq!(diff.unstaged_files[0].relative_path, PathBuf::from("a.txt"));
-    }
-
-    #[test]
-    fn untracked_file_in_unstaged_section() {
-        let (tempdir, repo) = repo_fixture();
-        write_file(&tempdir.path().join("tracked.txt"), "one\n");
-        commit_all(&repo, "initial");
-
-        write_file(&tempdir.path().join("new.txt"), "untracked\n");
-
-        let diff = load_diff_index(tempdir.path(), 1).unwrap();
-        assert!(diff.staged_files.is_empty());
-        assert_eq!(diff.unstaged_files.len(), 1);
-        assert_eq!(
-            diff.unstaged_files[0].relative_path,
-            PathBuf::from("new.txt")
-        );
-        assert_eq!(diff.unstaged_files[0].status, GitFileStatus::Untracked);
-    }
-
-    #[test]
-    fn staged_file_diff_shows_head_vs_index() {
-        let (tempdir, repo) = repo_fixture();
-        write_file(&tempdir.path().join("a.txt"), "line1\n");
-        commit_all(&repo, "initial");
-
-        write_file(&tempdir.path().join("a.txt"), "line1\nline2\n");
-        let mut index = repo.index().unwrap();
-        index.add_path(Path::new("a.txt")).unwrap();
-        index.write().unwrap();
-
-        let selection = DiffSelectionKey {
-            section: DiffSectionKind::Staged,
-            relative_path: PathBuf::from("a.txt"),
-        };
-        let file_diff = load_file_diff(tempdir.path(), 1, &selection, ThemeId::Dark).unwrap();
-        assert!(file_diff
-            .lines
-            .iter()
-            .any(|l| l.kind == DiffLineKind::Addition && l.text.contains("line2")));
-    }
-
-    #[test]
-    fn unstaged_file_diff_shows_index_vs_worktree() {
-        let (tempdir, repo) = repo_fixture();
-        write_file(&tempdir.path().join("a.txt"), "line1\n");
-        commit_all(&repo, "initial");
-
-        // Stage v2
-        write_file(&tempdir.path().join("a.txt"), "line1\nline2\n");
-        let mut index = repo.index().unwrap();
-        index.add_path(Path::new("a.txt")).unwrap();
-        index.write().unwrap();
-
-        // Write v3 to worktree
-        write_file(&tempdir.path().join("a.txt"), "line1\nline2\nline3\n");
-
-        let selection = DiffSelectionKey {
-            section: DiffSectionKind::Unstaged,
-            relative_path: PathBuf::from("a.txt"),
-        };
-        let file_diff = load_file_diff(tempdir.path(), 1, &selection, ThemeId::Dark).unwrap();
-        // Should show addition of line3 (index has line1+line2, worktree has line1+line2+line3)
-        assert!(file_diff
-            .lines
-            .iter()
-            .any(|l| l.kind == DiffLineKind::Addition && l.text.contains("line3")));
-        // Should NOT show line2 as added (it's already in index)
-        assert!(!file_diff
-            .lines
-            .iter()
-            .any(|l| l.kind == DiffLineKind::Addition && l.text.contains("line2")));
-    }
-
-    // ── Stage / unstage tests ────────────────────────────────────────
-
-    #[test]
-    fn stage_paths_stages_modified_file() {
-        let (tempdir, repo) = repo_fixture();
-        write_file(&tempdir.path().join("a.txt"), "v1\n");
-        commit_all(&repo, "initial");
-
-        write_file(&tempdir.path().join("a.txt"), "v2\n");
-        stage_paths(tempdir.path(), &[PathBuf::from("a.txt")]).unwrap();
-
-        let diff = load_diff_index(tempdir.path(), 1).unwrap();
-        assert_eq!(diff.staged_files.len(), 1);
-        assert!(diff.unstaged_files.is_empty());
-    }
-
-    #[test]
-    fn stage_paths_stages_new_file() {
-        let (tempdir, repo) = repo_fixture();
-        write_file(&tempdir.path().join("a.txt"), "v1\n");
-        commit_all(&repo, "initial");
-
-        write_file(&tempdir.path().join("new.txt"), "new\n");
-        stage_paths(tempdir.path(), &[PathBuf::from("new.txt")]).unwrap();
-
-        let diff = load_diff_index(tempdir.path(), 1).unwrap();
-        assert_eq!(diff.staged_files.len(), 1);
-        assert_eq!(diff.staged_files[0].status, GitFileStatus::Added);
-    }
-
-    #[test]
-    fn stage_paths_stages_deletion() {
-        let (tempdir, repo) = repo_fixture();
-        write_file(&tempdir.path().join("a.txt"), "v1\n");
-        commit_all(&repo, "initial");
-
-        fs::remove_file(tempdir.path().join("a.txt")).unwrap();
-        stage_paths(tempdir.path(), &[PathBuf::from("a.txt")]).unwrap();
-
-        let diff = load_diff_index(tempdir.path(), 1).unwrap();
-        assert_eq!(diff.staged_files.len(), 1);
-        assert_eq!(diff.staged_files[0].status, GitFileStatus::Deleted);
-    }
-
-    #[test]
-    fn unstage_paths_moves_to_unstaged() {
-        let (tempdir, repo) = repo_fixture();
-        write_file(&tempdir.path().join("a.txt"), "v1\n");
-        commit_all(&repo, "initial");
-
-        write_file(&tempdir.path().join("a.txt"), "v2\n");
-        stage_paths(tempdir.path(), &[PathBuf::from("a.txt")]).unwrap();
-
-        // Verify staged
-        let diff = load_diff_index(tempdir.path(), 1).unwrap();
-        assert_eq!(diff.staged_files.len(), 1);
-
-        unstage_paths(tempdir.path(), &[PathBuf::from("a.txt")]).unwrap();
-
-        let diff = load_diff_index(tempdir.path(), 2).unwrap();
-        assert!(diff.staged_files.is_empty());
-        assert_eq!(diff.unstaged_files.len(), 1);
-    }
-
-    #[test]
-    fn unstage_new_file_becomes_untracked() {
-        let (tempdir, repo) = repo_fixture();
-        write_file(&tempdir.path().join("a.txt"), "v1\n");
-        commit_all(&repo, "initial");
-
-        write_file(&tempdir.path().join("new.txt"), "new\n");
-        stage_paths(tempdir.path(), &[PathBuf::from("new.txt")]).unwrap();
-        unstage_paths(tempdir.path(), &[PathBuf::from("new.txt")]).unwrap();
-
-        let diff = load_diff_index(tempdir.path(), 1).unwrap();
-        assert!(diff.staged_files.is_empty());
-        assert_eq!(diff.unstaged_files.len(), 1);
-        assert_eq!(diff.unstaged_files[0].status, GitFileStatus::Untracked);
-        // File still exists in worktree
-        assert!(tempdir.path().join("new.txt").exists());
-    }
-
-    #[test]
-    fn stage_unstage_round_trip() {
-        let (tempdir, repo) = repo_fixture();
-        write_file(&tempdir.path().join("a.txt"), "v1\n");
-        commit_all(&repo, "initial");
-
-        write_file(&tempdir.path().join("a.txt"), "v2\n");
-
-        let before = load_diff_index(tempdir.path(), 1).unwrap();
-        assert!(before.staged_files.is_empty());
-        assert_eq!(before.unstaged_files.len(), 1);
-
-        stage_paths(tempdir.path(), &[PathBuf::from("a.txt")]).unwrap();
-        unstage_paths(tempdir.path(), &[PathBuf::from("a.txt")]).unwrap();
-
-        let after = load_diff_index(tempdir.path(), 2).unwrap();
-        assert!(after.staged_files.is_empty());
-        assert_eq!(after.unstaged_files.len(), 1);
-    }
-
-    #[test]
-    fn path_validation_rejects_traversal() {
-        let (tempdir, repo) = repo_fixture();
-        write_file(&tempdir.path().join("a.txt"), "v1\n");
-        commit_all(&repo, "initial");
-
-        let result = stage_paths(tempdir.path(), &[PathBuf::from("../outside.txt")]);
-        assert!(result.is_err());
-    }
-
-    // ── Commit tests ─────────────────────────────────────────────────
-
-    #[test]
-    fn commit_staged_creates_commit() {
-        let (tempdir, repo) = repo_fixture();
-        configure_identity(&repo);
-        write_file(&tempdir.path().join("a.txt"), "v1\n");
-        commit_all(&repo, "initial");
-
-        write_file(&tempdir.path().join("a.txt"), "v2\n");
-        stage_paths(tempdir.path(), &[PathBuf::from("a.txt")]).unwrap();
-
-        let oid = commit_staged(tempdir.path(), "test commit").unwrap();
-        let commit = repo.find_commit(oid).unwrap();
-        assert_eq!(commit.message(), Some("test commit"));
-
-        // Staged section should now be empty
-        let diff = load_diff_index(tempdir.path(), 1).unwrap();
-        assert!(diff.staged_files.is_empty());
-        assert!(diff.unstaged_files.is_empty());
-    }
-
-    #[test]
-    fn commit_staged_rejects_empty_message() {
-        let (tempdir, repo) = repo_fixture();
-        write_file(&tempdir.path().join("a.txt"), "v1\n");
-        commit_all(&repo, "initial");
-
-        let result = commit_staged(tempdir.path(), "");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("empty"));
-    }
-
-    #[test]
-    fn commit_staged_trims_whitespace() {
-        let (tempdir, repo) = repo_fixture();
-        configure_identity(&repo);
-        write_file(&tempdir.path().join("a.txt"), "v1\n");
-        commit_all(&repo, "initial");
-
-        write_file(&tempdir.path().join("a.txt"), "v2\n");
-        stage_paths(tempdir.path(), &[PathBuf::from("a.txt")]).unwrap();
-
-        let oid = commit_staged(tempdir.path(), "  hello  ").unwrap();
-        let commit = repo.find_commit(oid).unwrap();
-        assert_eq!(commit.message(), Some("hello"));
-    }
-
-    #[test]
-    fn commit_staged_rejects_empty_staged_area() {
-        let (tempdir, repo) = repo_fixture();
-        configure_identity(&repo);
-        write_file(&tempdir.path().join("a.txt"), "v1\n");
-        commit_all(&repo, "initial");
-
-        // Nothing staged. Should fail.
-        let result = commit_staged(tempdir.path(), "empty commit");
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("no staged changes"));
-    }
-
-    // ── Tracking status tests ────────────────────────────────────────
-
-    #[test]
-    fn tracking_no_upstream_returns_none() {
-        let (tempdir, repo) = repo_fixture();
-        write_file(&tempdir.path().join("a.txt"), "v1\n");
-        commit_all(&repo, "initial");
-
-        let diff = load_diff_index(tempdir.path(), 1).unwrap();
-        assert!(diff.tracking.upstream_ref.is_none());
-        assert_eq!(diff.tracking.ahead, 0);
-        assert_eq!(diff.tracking.behind, 0);
-    }
-
-    #[test]
-    fn tracking_detached_head_returns_none() {
-        let (tempdir, repo) = repo_fixture();
-        write_file(&tempdir.path().join("a.txt"), "v1\n");
-        let oid = commit_all(&repo, "initial");
-        repo.set_head_detached(oid).unwrap();
-
-        let diff = load_diff_index(tempdir.path(), 1).unwrap();
-        assert!(diff.tracking.upstream_ref.is_none());
-    }
-
-    #[test]
-    fn tracking_ahead_of_upstream() {
-        let (tempdir, repo) = repo_fixture();
-        write_file(&tempdir.path().join("a.txt"), "v1\n");
-        commit_all(&repo, "initial");
-
-        // Create a bare remote and push
-        let remote_dir = tempdir.path().join("remote.git");
-        Repository::init_bare(&remote_dir).unwrap();
-        let mut remote = repo.remote("origin", remote_dir.to_str().unwrap()).unwrap();
-        remote
-            .push(&["refs/heads/master:refs/heads/master"], None)
-            .unwrap();
-
-        // Set up tracking
-        let mut branch = repo.find_branch("master", BranchType::Local).unwrap();
-        branch.set_upstream(Some("origin/master")).unwrap();
-
-        // Make additional local commit
-        write_file(&tempdir.path().join("a.txt"), "v2\n");
-        commit_all(&repo, "local only");
-
-        let diff = load_diff_index(tempdir.path(), 1).unwrap();
-        assert!(diff.tracking.upstream_ref.is_some());
-        assert_eq!(diff.tracking.ahead, 1);
-        assert_eq!(diff.tracking.behind, 0);
-    }
-
-    // ── Scope clean check test ───────────────────────────────────────
-
-    #[test]
-    fn is_scope_clean_reports_correctly() {
-        let (tempdir, repo) = repo_fixture();
-        write_file(&tempdir.path().join("a.txt"), "v1\n");
-        commit_all(&repo, "initial");
-
-        assert!(is_scope_clean(tempdir.path()).unwrap());
-
-        write_file(&tempdir.path().join("a.txt"), "v2\n");
-        assert!(!is_scope_clean(tempdir.path()).unwrap());
-    }
-
-    // ── Merge-back tests ─────────────────────────────────────────────
-
-    #[test]
-    fn merge_back_fast_forward() {
-        let (tempdir, repo) = repo_fixture();
-        configure_identity(&repo);
-        write_file(&tempdir.path().join("a.txt"), "v1\n");
-        commit_all(&repo, "initial");
-
-        let source_ref = current_head_ref(&repo);
-        let managed = create_managed_worktree(tempdir.path(), "wt-ab123456").unwrap();
-
-        // Make commits on managed branch
-        write_file(&managed.path.join("a.txt"), "v2\n");
-        let wt_repo = Repository::open(&managed.path).unwrap();
-        configure_identity(&wt_repo);
-        commit_all(&wt_repo, "managed commit");
-
-        let outcome = merge_managed_branch(&managed.path, &source_ref).unwrap();
-        assert!(matches!(outcome, MergeOutcome::FastForward { .. }));
-
-        // Verify source ref advanced
-        let source_commit = repo
-            .find_reference(&source_ref)
-            .unwrap()
-            .peel_to_commit()
-            .unwrap();
-        assert_eq!(source_commit.message(), Some("managed commit"));
-    }
-
-    #[test]
-    fn merge_back_already_merged() {
-        let (tempdir, repo) = repo_fixture();
-        configure_identity(&repo);
-        write_file(&tempdir.path().join("a.txt"), "v1\n");
-        commit_all(&repo, "initial");
-
-        let source_ref = current_head_ref(&repo);
-        let managed = create_managed_worktree(tempdir.path(), "wt-ab123456").unwrap();
-
-        // Make commits on managed branch
-        write_file(&managed.path.join("a.txt"), "v2\n");
-        let wt_repo = Repository::open(&managed.path).unwrap();
-        configure_identity(&wt_repo);
-        commit_all(&wt_repo, "managed commit");
-
-        // First merge (fast-forward)
-        merge_managed_branch(&managed.path, &source_ref).unwrap();
-
-        // Second merge should be already merged
-        let outcome = merge_managed_branch(&managed.path, &source_ref).unwrap();
-        assert!(matches!(outcome, MergeOutcome::AlreadyMerged));
-    }
-
-    #[test]
-    fn merge_back_clean_merge_commit() {
-        let (tempdir, repo) = repo_fixture();
-        configure_identity(&repo);
-        write_file(&tempdir.path().join("a.txt"), "v1\n");
-        commit_all(&repo, "initial");
-
-        let source_ref = current_head_ref(&repo);
-        let managed = create_managed_worktree(tempdir.path(), "wt-ab123456").unwrap();
-
-        // Make commit on managed branch (different file)
-        write_file(&managed.path.join("b.txt"), "managed\n");
-        let wt_repo = Repository::open(&managed.path).unwrap();
-        configure_identity(&wt_repo);
-        commit_all(&wt_repo, "managed commit");
-
-        // Make commit on source branch (different file)
-        write_file(&tempdir.path().join("c.txt"), "source\n");
-        commit_all(&repo, "source commit");
-
-        let outcome = merge_managed_branch(&managed.path, &source_ref).unwrap();
-        assert!(matches!(outcome, MergeOutcome::MergeCommit { .. }));
-
-        // Verify merge commit has two parents
-        if let MergeOutcome::MergeCommit { merge_oid } = outcome {
-            let merge_commit = repo.find_commit(merge_oid).unwrap();
-            assert_eq!(merge_commit.parent_count(), 2);
-        }
-    }
-
-    #[test]
-    fn merge_back_conflict_blocks() {
-        let (tempdir, repo) = repo_fixture();
-        configure_identity(&repo);
-        write_file(&tempdir.path().join("a.txt"), "v1\n");
-        commit_all(&repo, "initial");
-
-        let source_ref = current_head_ref(&repo);
-        let managed = create_managed_worktree(tempdir.path(), "wt-ab123456").unwrap();
-
-        // Conflicting changes to same file
-        write_file(&managed.path.join("a.txt"), "managed version\n");
-        let wt_repo = Repository::open(&managed.path).unwrap();
-        configure_identity(&wt_repo);
-        commit_all(&wt_repo, "managed conflict");
-
-        write_file(&tempdir.path().join("a.txt"), "source version\n");
-        commit_all(&repo, "source conflict");
-
-        let outcome = merge_managed_branch(&managed.path, &source_ref).unwrap();
-        assert!(matches!(outcome, MergeOutcome::Blocked { .. }));
-
-        // Verify source ref is unchanged (still at "source conflict" commit)
-        let source_commit = repo
-            .find_reference(&source_ref)
-            .unwrap()
-            .peel_to_commit()
-            .unwrap();
-        assert_eq!(source_commit.message(), Some("source conflict"));
-    }
-
-    #[test]
-    fn merge_back_blocks_when_managed_scope_is_dirty() {
-        let (tempdir, repo) = repo_fixture();
-        configure_identity(&repo);
-        write_file(&tempdir.path().join("a.txt"), "v1\n");
-        commit_all(&repo, "initial");
-
-        let source_ref = current_head_ref(&repo);
-        let managed = create_managed_worktree(tempdir.path(), "wt-ab123456").unwrap();
-
-        // Make committed change on managed branch
-        write_file(&managed.path.join("a.txt"), "v2\n");
-        let wt_repo = Repository::open(&managed.path).unwrap();
-        configure_identity(&wt_repo);
-        commit_all(&wt_repo, "managed commit");
-
-        // Leave dirty file in managed worktree
-        write_file(&managed.path.join("dirty.txt"), "uncommitted\n");
-
-        let outcome = merge_managed_branch(&managed.path, &source_ref).unwrap();
-        assert!(matches!(outcome, MergeOutcome::Blocked { .. }));
-        if let MergeOutcome::Blocked { reason } = outcome {
-            assert!(reason.contains("Managed worktree"));
-        }
-    }
-
-    #[test]
-    fn merge_back_blocks_when_source_scope_is_dirty() {
-        let (tempdir, repo) = repo_fixture();
-        configure_identity(&repo);
-        write_file(&tempdir.path().join("a.txt"), "v1\n");
-        commit_all(&repo, "initial");
-
-        let source_ref = current_head_ref(&repo);
-        let managed = create_managed_worktree(tempdir.path(), "wt-ab123456").unwrap();
-
-        // Make committed change on managed branch
-        write_file(&managed.path.join("b.txt"), "managed\n");
-        let wt_repo = Repository::open(&managed.path).unwrap();
-        configure_identity(&wt_repo);
-        commit_all(&wt_repo, "managed commit");
-
-        // Leave dirty file in source (main checkout)
-        write_file(&tempdir.path().join("dirty.txt"), "uncommitted\n");
-
-        let outcome = merge_managed_branch(&managed.path, &source_ref).unwrap();
-        assert!(matches!(outcome, MergeOutcome::Blocked { .. }));
-        if let MergeOutcome::Blocked { reason } = outcome {
-            assert!(reason.contains("Source branch"));
-        }
-    }
-
-    #[test]
-    fn merge_back_fast_forward_updates_source_worktree() {
-        let (tempdir, repo) = repo_fixture();
-        configure_identity(&repo);
-        write_file(&tempdir.path().join("a.txt"), "v1\n");
-        commit_all(&repo, "initial");
-
-        let source_ref = current_head_ref(&repo);
-        let managed = create_managed_worktree(tempdir.path(), "wt-ab123456").unwrap();
-
-        // Make a new file on managed branch
-        write_file(&managed.path.join("new.txt"), "from managed\n");
-        let wt_repo = Repository::open(&managed.path).unwrap();
-        configure_identity(&wt_repo);
-        commit_all(&wt_repo, "add new.txt");
-
-        let outcome = merge_managed_branch(&managed.path, &source_ref).unwrap();
-        assert!(matches!(outcome, MergeOutcome::FastForward { .. }));
-
-        // The source worktree should now have the new file on disk
-        assert!(tempdir.path().join("new.txt").exists());
-        let content = fs::read_to_string(tempdir.path().join("new.txt")).unwrap();
-        // Normalize line endings for Windows (autocrlf may convert \n → \r\n)
-        assert_eq!(content.replace("\r\n", "\n"), "from managed\n");
-    }
-
-    // ── Worktree management tests ────────────────────────────────────
-
-    #[test]
-    fn discovers_managed_worktree_scope_and_admin_root() {
-        let (tempdir, repo) = repo_fixture();
-        write_file(&tempdir.path().join("tracked.txt"), "one\n");
-        commit_all(&repo, "initial");
-
-        let managed = create_managed_worktree(tempdir.path(), "wt-abc12345").unwrap();
-        let scope = discover_scope(&managed.path).unwrap();
-        assert_eq!(scope.repo_root, tempdir.path().canonicalize().unwrap());
-        assert_eq!(scope.scope_root, managed.path);
-        assert!(scope.is_worktree);
-        assert_eq!(scope.worktree_name.as_deref(), Some("wt-abc12345"));
-    }
-
-    #[test]
-    fn remove_managed_worktree_without_branch() {
-        let (tempdir, repo) = repo_fixture();
-        write_file(&tempdir.path().join("tracked.txt"), "one\n");
-        commit_all(&repo, "initial");
-
-        let managed = create_managed_worktree(tempdir.path(), "wt-abc12345").unwrap();
-        remove_managed_worktree(&managed.path, false).unwrap();
-
-        // Worktree directory should be gone
-        assert!(!managed.path.exists());
-        // Branch should still exist
-        assert!(repo
-            .find_branch("orca/wt-abc12345", BranchType::Local)
-            .is_ok());
-    }
-
-    #[test]
-    fn remove_managed_worktree_with_branch() {
-        let (tempdir, repo) = repo_fixture();
-        write_file(&tempdir.path().join("tracked.txt"), "one\n");
-        commit_all(&repo, "initial");
-
-        let managed = create_managed_worktree(tempdir.path(), "wt-abc12345").unwrap();
-        remove_managed_worktree(&managed.path, true).unwrap();
-
-        assert!(!managed.path.exists());
-        assert!(repo
-            .find_branch("orca/wt-abc12345", BranchType::Local)
-            .is_err());
-    }
-
-    #[test]
-    fn remove_managed_worktree_blocks_when_dirty() {
-        let (tempdir, repo) = repo_fixture();
-        write_file(&tempdir.path().join("tracked.txt"), "one\n");
-        commit_all(&repo, "initial");
-
-        let managed = create_managed_worktree(tempdir.path(), "wt-abc12345").unwrap();
-        // Dirty the worktree
-        write_file(&managed.path.join("dirty.txt"), "uncommitted\n");
-
-        let result = remove_managed_worktree(&managed.path, false);
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("uncommitted changes"));
-        // Worktree should still exist
-        assert!(managed.path.exists());
-    }
-
-    #[test]
-    fn remove_managed_worktree_rejects_external_linked_worktree() {
-        let (tempdir, repo) = repo_fixture();
-        write_file(&tempdir.path().join("tracked.txt"), "one\n");
-        commit_all(&repo, "initial");
-
-        let head = repo.head().unwrap();
-        let head_commit = peel_head_commit(&head).unwrap();
-        repo.branch("external-branch", &head_commit, false).unwrap();
-
-        let external_path = tempdir.path().join("external-worktree");
-        let branch = repo
-            .find_branch("external-branch", BranchType::Local)
-            .unwrap();
-        let mut opts = WorktreeAddOptions::new();
-        opts.reference(Some(branch.get()));
-        repo.worktree("external-worktree", &external_path, Some(&opts))
-            .unwrap();
-
-        let result = remove_managed_worktree(&external_path, false);
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("is not Orca-managed"));
-        assert!(external_path.exists());
-    }
-
-    // ── Binary and oversize diff tests ───────────────────────────────
-
-    #[test]
-    fn binary_files_return_binary_notice() {
-        let (tempdir, repo) = repo_fixture();
-        write_file(&tempdir.path().join("asset.bin"), [0_u8, 1, 2, 3, 4]);
-        commit_all(&repo, "initial");
-        write_file(&tempdir.path().join("asset.bin"), [0_u8, 1, 2, 9, 10]);
-
-        let diff = load_diff_index(tempdir.path(), 5).unwrap();
-        assert_eq!(diff.unstaged_files.len(), 1);
-        assert!(diff.unstaged_files[0].is_binary);
-
-        let selection = DiffSelectionKey {
-            section: DiffSectionKind::Unstaged,
-            relative_path: PathBuf::from("asset.bin"),
-        };
-        let file_diff = load_file_diff(tempdir.path(), 5, &selection, ThemeId::Dark).unwrap();
-        assert_eq!(file_diff.lines, vec![binary_notice(BINARY_DIFF_MESSAGE)]);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn non_binary_mode_only_change_returns_non_binary_notice() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let (tempdir, repo) = repo_fixture();
-        write_file(&tempdir.path().join("script.sh"), "#!/bin/sh\necho hi\n");
-        commit_all(&repo, "initial");
-        repo.config()
-            .unwrap()
-            .set_bool("core.filemode", true)
-            .unwrap();
-
-        let script_path = tempdir.path().join("script.sh");
-        let mut permissions = fs::metadata(&script_path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script_path, permissions).unwrap();
-
-        let selection = DiffSelectionKey {
-            section: DiffSectionKind::Unstaged,
-            relative_path: PathBuf::from("script.sh"),
-        };
-        let file_diff = load_file_diff(tempdir.path(), 5, &selection, ThemeId::Dark).unwrap();
-        assert_eq!(file_diff.file.relative_path, PathBuf::from("script.sh"));
-        assert!(!file_diff.file.is_binary);
-    }
-
-    #[test]
-    fn oversized_diff_returns_oversize_notice() {
-        let (tempdir, repo) = repo_fixture();
-        let baseline = (0..10_500)
-            .map(|i| format!("old-{i}\n"))
-            .collect::<String>();
-        write_file(&tempdir.path().join("big.txt"), &baseline);
-        commit_all(&repo, "initial");
-
-        let updated = (0..10_500)
-            .map(|i| format!("new-{i}\n"))
-            .collect::<String>();
-        write_file(&tempdir.path().join("big.txt"), updated);
-
-        let selection = DiffSelectionKey {
-            section: DiffSectionKind::Unstaged,
-            relative_path: PathBuf::from("big.txt"),
-        };
-        let file_diff = load_file_diff(tempdir.path(), 9, &selection, ThemeId::Dark).unwrap();
-        assert_eq!(file_diff.lines, vec![binary_notice(OVERSIZE_DIFF_MESSAGE)]);
-    }
-
-    // ── Worktree creation tests ──────────────────────────────────────
-
-    #[test]
-    fn managed_worktree_creation_is_deterministic_and_updates_excludes() {
-        let (tempdir, repo) = repo_fixture();
-        write_file(&tempdir.path().join("tracked.txt"), "one\n");
-        let commit_id = commit_all(&repo, "initial");
-
-        let managed = create_managed_worktree(tempdir.path(), "wt-abc12345").unwrap();
-        assert_eq!(managed.id, "wt-abc12345");
-        assert_eq!(managed.branch_name, "orca/wt-abc12345");
-        assert_eq!(managed.worktree_name, "wt-abc12345");
-        assert_eq!(
-            managed.path,
-            tempdir
-                .path()
-                .canonicalize()
-                .unwrap()
-                .join(".orcashell/worktrees")
-                .join("wt-abc12345")
-        );
-        assert_eq!(managed.source_ref, current_head_ref(&repo));
-
-        let worktree_repo = Repository::open(&managed.path).unwrap();
-        assert!(worktree_repo.is_worktree());
-        let head = worktree_repo.head().unwrap();
-        assert_eq!(head.shorthand(), Some(managed.branch_name.as_str()));
-        assert_eq!(head.peel_to_commit().unwrap().id(), commit_id);
-
-        let exclude = fs::read_to_string(tempdir.path().join(".git/info/exclude")).unwrap();
-        let occurrences = exclude
-            .lines()
-            .filter(|line| line.trim() == ORCASHELL_EXCLUDE_ENTRY)
-            .count();
-        assert_eq!(occurrences, 1);
-
-        ensure_orcashell_excluded(tempdir.path()).unwrap();
-        let exclude = fs::read_to_string(tempdir.path().join(".git/info/exclude")).unwrap();
-        let occurrences = exclude
-            .lines()
-            .filter(|line| line.trim() == ORCASHELL_EXCLUDE_ENTRY)
-            .count();
-        assert_eq!(occurrences, 1);
-    }
-
-    #[test]
-    fn split_gitdir_repos_update_their_actual_shared_exclude_file() {
-        let (_tempdir, worktree_path, admin_dir, repo) = split_gitdir_repo_fixture();
-        write_file(&worktree_path.join("tracked.txt"), "one\n");
-        commit_all(&repo, "initial");
-
-        ensure_orcashell_excluded(&worktree_path).unwrap();
-
-        let exclude = fs::read_to_string(admin_dir.join("info/exclude")).unwrap();
-        assert!(exclude
-            .lines()
-            .any(|line| line.trim() == ORCASHELL_EXCLUDE_ENTRY));
-        assert!(fs::metadata(worktree_path.join(".git")).unwrap().is_file());
-    }
-
-    #[test]
-    fn managed_worktree_requires_valid_head_commit() {
-        let (tempdir, _repo) = repo_fixture();
-        let err = create_managed_worktree(tempdir.path(), "wt-abc12345").unwrap_err();
-        assert!(err.to_string().contains("HEAD"));
-    }
-
-    #[test]
-    fn managed_worktree_id_validation_requires_uuid_like_suffix() {
-        assert!(validate_worktree_id("wt-abc12345").is_ok());
-        assert!(validate_worktree_id("wt-ABC12345").is_err());
-        assert!(validate_worktree_id("wt-abc1234").is_err());
-        assert!(validate_worktree_id("wt-abc12345-extra").is_err());
-        assert!(validate_worktree_id("feature-abc1").is_err());
-    }
-
-    #[test]
-    fn managed_worktree_path_collision_does_not_leave_branch_behind() {
-        let (tempdir, repo) = repo_fixture();
-        write_file(&tempdir.path().join("tracked.txt"), "one\n");
-        commit_all(&repo, "initial");
-
-        let collision_path =
-            managed_worktree_path(&tempdir.path().canonicalize().unwrap(), "wt-abc12345");
-        fs::create_dir_all(&collision_path).unwrap();
-
-        let err = create_managed_worktree(tempdir.path(), "wt-abc12345").unwrap_err();
-        assert!(err.to_string().contains("already exists"));
-        assert!(repo
-            .find_branch("orca/wt-abc12345", BranchType::Local)
-            .is_err());
-    }
-
-    // ── Upstream info tests ────────────────────────────────────────────
-
-    #[test]
-    fn resolve_upstream_info_no_upstream() {
-        let (tempdir, repo) = repo_fixture();
-        write_file(&tempdir.path().join("tracked.txt"), "one\n");
-        commit_all(&repo, "initial");
-
-        let result = resolve_upstream_info(tempdir.path());
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("No upstream configured"));
-    }
-
-    #[test]
-    fn resolve_upstream_info_with_tracking() {
-        let (tempdir, repo) = repo_fixture();
-        write_file(&tempdir.path().join("tracked.txt"), "one\n");
-        commit_all(&repo, "initial");
-
-        // Create a bare remote and configure tracking.
-        let bare_dir = tempdir.path().join("bare.git");
-        Repository::init_bare(&bare_dir).unwrap();
-        let mut remote = repo.remote("origin", bare_dir.to_str().unwrap()).unwrap();
-        remote.push(&["refs/heads/master"], None).ok();
-        let mut config = repo.config().unwrap();
-        let branch = current_branch_name(&repo);
-        config
-            .set_str(&format!("branch.{branch}.remote"), "origin")
-            .unwrap();
-        config
-            .set_str(
-                &format!("branch.{branch}.merge"),
-                &format!("refs/heads/{branch}"),
-            )
-            .unwrap();
-
-        let info = resolve_upstream_info(tempdir.path()).unwrap();
-        assert_eq!(info.remote, "origin");
-        assert_eq!(info.upstream_branch, branch);
-    }
-
-    // ── Pull integration tests ──────────────────────────────────────
-
-    fn setup_tracking_repo() -> (TempDir, Repository, PathBuf) {
-        let tempdir = TempDir::new().unwrap();
-        let bare_dir = tempdir.path().join("bare.git");
-        Repository::init_bare(&bare_dir).unwrap();
-
-        let client_dir = tempdir.path().join("client");
-        let repo = Repository::clone(bare_dir.to_str().unwrap(), &client_dir).unwrap();
-        configure_identity(&repo);
-
-        write_file(&client_dir.join("file.txt"), "initial\n");
-        commit_all(&repo, "initial");
-
-        // Push to bare remote so tracking is set up.
-        {
-            let mut remote = repo.find_remote("origin").unwrap();
-            remote
-                .push(&["refs/heads/master:refs/heads/master"], None)
-                .unwrap();
-        }
-
-        (tempdir, repo, bare_dir)
-    }
-
-    #[test]
-    fn pull_integrate_already_up_to_date() {
-        let (_tempdir, repo, _bare_dir) = setup_tracking_repo();
-        let result = pull_integrate(repo.workdir().unwrap()).unwrap();
-        assert_eq!(result, MergeOutcome::AlreadyMerged);
-    }
-
-    #[test]
-    fn pull_integrate_fast_forward() {
-        let (tempdir, repo, bare_dir) = setup_tracking_repo();
-
-        // Create a second clone, make a commit, push.
-        let other_dir = tempdir.path().join("other");
-        let other = Repository::clone(bare_dir.to_str().unwrap(), &other_dir).unwrap();
-        configure_identity(&other);
-        write_file(&other_dir.join("file.txt"), "initial\nnew line\n");
-        commit_all(&other, "other commit");
-        let mut remote = other.find_remote("origin").unwrap();
-        remote
-            .push(&["refs/heads/master:refs/heads/master"], None)
-            .unwrap();
-
-        // Fetch in client to update tracking ref.
-        let mut client_remote = repo.find_remote("origin").unwrap();
-        client_remote.fetch(&["master"], None, None).unwrap();
-
-        let result = pull_integrate(repo.workdir().unwrap()).unwrap();
-        assert!(matches!(result, MergeOutcome::FastForward { .. }));
-
-        // Verify file updated.
-        let content = fs::read_to_string(repo.workdir().unwrap().join("file.txt")).unwrap();
-        assert!(content.contains("new line"));
-    }
-
-    #[test]
-    fn pull_integrate_conflict_blocks() {
-        let (tempdir, repo, bare_dir) = setup_tracking_repo();
-
-        // Create a second clone, make a conflicting commit, push.
-        let other_dir = tempdir.path().join("other");
-        let other = Repository::clone(bare_dir.to_str().unwrap(), &other_dir).unwrap();
-        configure_identity(&other);
-        write_file(&other_dir.join("file.txt"), "conflict content\n");
-        commit_all(&other, "conflicting commit");
-        let mut remote = other.find_remote("origin").unwrap();
-        remote
-            .push(&["refs/heads/master:refs/heads/master"], None)
-            .unwrap();
-
-        // Make a local commit with different content.
-        write_file(
-            &repo.workdir().unwrap().join("file.txt"),
-            "local conflict content\n",
-        );
-        commit_all(&repo, "local commit");
-
-        // Fetch in client.
-        let mut client_remote = repo.find_remote("origin").unwrap();
-        client_remote.fetch(&["master"], None, None).unwrap();
-
-        let head_before = repo.head().unwrap().target().unwrap();
-        let result = pull_integrate(repo.workdir().unwrap()).unwrap();
-        assert!(matches!(result, MergeOutcome::Blocked { .. }));
-
-        // Verify HEAD unchanged.
-        let head_after = repo.head().unwrap().target().unwrap();
-        assert_eq!(head_before, head_after);
-    }
-
-    #[test]
-    fn pull_integrate_dirty_scope_blocks() {
-        let (_tempdir, repo, _bare_dir) = setup_tracking_repo();
-
-        // Dirty the scope.
-        write_file(&repo.workdir().unwrap().join("dirty.txt"), "uncommitted\n");
-
-        let result = pull_integrate(repo.workdir().unwrap()).unwrap();
-        assert!(matches!(result, MergeOutcome::Blocked { .. }));
-        if let MergeOutcome::Blocked { reason } = result {
-            assert!(reason.contains("uncommitted changes"));
-        }
-    }
-
-    // ── Merge-back tests (source repo) ──────────────────────────────
-
-    #[test]
-    fn merge_back_opens_source_repo_directly() {
-        let (tempdir, repo) = repo_fixture();
-        write_file(&tempdir.path().join("tracked.txt"), "one\n");
-        commit_all(&repo, "initial");
-
-        let managed = create_managed_worktree(tempdir.path(), "wt-abc12345").unwrap();
-        configure_identity(&Repository::open(&managed.path).unwrap());
-
-        // Make a commit in managed worktree.
-        write_file(&managed.path.join("new.txt"), "from managed\n");
-        let wt_repo = Repository::open(&managed.path).unwrap();
-        commit_all(&wt_repo, "managed commit");
-
-        let result = merge_managed_branch(&managed.path, &managed.source_ref).unwrap();
-        assert!(
-            matches!(result, MergeOutcome::FastForward { .. }),
-            "expected fast-forward, got {result:?}"
-        );
-
-        // Verify merge result visible in source repo.
-        let source_repo = Repository::open(tempdir.path()).unwrap();
-        let source_content = fs::read_to_string(tempdir.path().join("new.txt")).unwrap();
-        // Normalize line endings for Windows (autocrlf may convert \n → \r\n)
-        assert_eq!(source_content.replace("\r\n", "\n"), "from managed\n");
-
-        // Verify source HEAD advanced.
-        let source_head = source_repo.head().unwrap().peel_to_commit().unwrap().id();
-        let managed_head = wt_repo.head().unwrap().peel_to_commit().unwrap().id();
-        assert_eq!(source_head, managed_head);
-    }
-
-    #[test]
-    fn merge_back_source_scope_dirty_blocks() {
-        let (tempdir, repo) = repo_fixture();
-        write_file(&tempdir.path().join("tracked.txt"), "one\n");
-        commit_all(&repo, "initial");
-
-        let managed = create_managed_worktree(tempdir.path(), "wt-abc12345").unwrap();
-        configure_identity(&Repository::open(&managed.path).unwrap());
-
-        // Make a commit in managed worktree.
-        write_file(&managed.path.join("new.txt"), "from managed\n");
-        let wt_repo = Repository::open(&managed.path).unwrap();
-        commit_all(&wt_repo, "managed commit");
-
-        // Dirty the source scope.
-        write_file(&tempdir.path().join("dirty.txt"), "uncommitted\n");
-
-        let result = merge_managed_branch(&managed.path, &managed.source_ref).unwrap();
-        assert!(matches!(result, MergeOutcome::Blocked { .. }));
-        if let MergeOutcome::Blocked { reason } = result {
-            assert!(reason.contains("Source branch has uncommitted changes"));
-        }
-    }
-
-    // ── Inline diff tests ────────────────────────────────────────────
-
-    #[test]
-    fn tokenize_words_splits_on_boundaries() {
-        let tokens = tokenize_words("fn main() {");
-        let words: Vec<&str> = tokens.iter().map(|r| &"fn main() {"[r.clone()]).collect();
-        assert_eq!(words, vec!["fn", " ", "main", "()", " ", "{"]);
-    }
-
-    #[test]
-    fn tokenize_words_empty_input() {
-        assert!(tokenize_words("").is_empty());
-    }
-
-    #[test]
-    fn tokenize_words_unicode() {
-        let tokens = tokenize_words("café += 1");
-        let words: Vec<&str> = tokens.iter().map(|r| &"café += 1"[r.clone()]).collect();
-        assert_eq!(words, vec!["café", " ", "+=", " ", "1"]);
-    }
-
-    #[test]
-    fn compute_line_inline_diff_word_change() {
-        let (old_ranges, new_ranges) =
-            compute_line_inline_diff("let width = 240.0;", "let width = 300.0;");
-        assert_eq!(old_ranges.len(), 1);
-        assert_eq!(new_ranges.len(), 1);
-        assert_eq!(&"let width = 240.0;"[old_ranges[0].clone()], "240");
-        assert_eq!(&"let width = 300.0;"[new_ranges[0].clone()], "300");
-    }
-
-    #[test]
-    fn compute_line_inline_diff_identical_lines() {
-        let (old_ranges, new_ranges) = compute_line_inline_diff("no change here", "no change here");
-        assert!(old_ranges.is_empty());
-        assert!(new_ranges.is_empty());
-    }
-
-    #[test]
-    fn compute_line_inline_diff_completely_different() {
-        let (old_ranges, new_ranges) = compute_line_inline_diff("aaa", "zzz");
-        assert_eq!(&"aaa"[old_ranges[0].clone()], "aaa");
-        assert_eq!(&"zzz"[new_ranges[0].clone()], "zzz");
-    }
-
-    #[test]
-    fn attach_inline_changes_pairs_blocks() {
-        let mut lines = vec![
-            DiffLineView {
-                kind: DiffLineKind::Context,
-                old_lineno: Some(1),
-                new_lineno: Some(1),
-                text: "context\n".into(),
-                highlights: None,
-                inline_changes: None,
-            },
-            DiffLineView {
-                kind: DiffLineKind::Deletion,
-                old_lineno: Some(2),
-                new_lineno: None,
-                text: "let x = 10;\n".into(),
-                highlights: None,
-                inline_changes: None,
-            },
-            DiffLineView {
-                kind: DiffLineKind::Addition,
-                old_lineno: None,
-                new_lineno: Some(2),
-                text: "let x = 20;\n".into(),
-                highlights: None,
-                inline_changes: None,
-            },
-            DiffLineView {
-                kind: DiffLineKind::Context,
-                old_lineno: Some(3),
-                new_lineno: Some(3),
-                text: "more context\n".into(),
-                highlights: None,
-                inline_changes: None,
-            },
-        ];
-
-        attach_inline_changes(&mut lines);
-
-        assert!(lines[0].inline_changes.is_none());
-        assert!(lines[3].inline_changes.is_none());
-
-        let del_changes = lines[1].inline_changes.as_ref().unwrap();
-        let add_changes = lines[2].inline_changes.as_ref().unwrap();
-        assert_eq!(&"let x = 10;\n"[del_changes[0].clone()], "10");
-        assert_eq!(&"let x = 20;\n"[add_changes[0].clone()], "20");
-    }
-
-    #[test]
-    fn attach_inline_changes_unpaired_stays_none() {
-        let mut lines = vec![DiffLineView {
-            kind: DiffLineKind::Addition,
-            old_lineno: None,
-            new_lineno: Some(1),
-            text: "brand new line\n".into(),
-            highlights: None,
-            inline_changes: None,
-        }];
-        attach_inline_changes(&mut lines);
-        assert!(lines[0].inline_changes.is_none());
-    }
-
-    #[test]
-    fn added_event_kind_preserves_non_body_lines() {
-        assert_eq!(
-            added_event_kind(DiffLineKind::FileHeader),
-            DiffLineKind::FileHeader
-        );
-        assert_eq!(
-            added_event_kind(DiffLineKind::HunkHeader),
-            DiffLineKind::HunkHeader
-        );
-        assert_eq!(
-            added_event_kind(DiffLineKind::Context),
-            DiffLineKind::Context
-        );
-        assert_eq!(
-            added_event_kind(DiffLineKind::Addition),
-            DiffLineKind::Addition
-        );
-        assert_eq!(
-            added_event_kind(DiffLineKind::Deletion),
-            DiffLineKind::Deletion
-        );
-    }
-
-    #[test]
-    fn removed_event_kind_inverts_only_patch_body_lines() {
-        assert_eq!(
-            removed_event_kind(DiffLineKind::Addition),
-            DiffLineKind::Deletion
-        );
-        assert_eq!(
-            removed_event_kind(DiffLineKind::Deletion),
-            DiffLineKind::Addition
-        );
-        assert_eq!(
-            removed_event_kind(DiffLineKind::FileHeader),
-            DiffLineKind::FileHeader
-        );
-        assert_eq!(
-            removed_event_kind(DiffLineKind::HunkHeader),
-            DiffLineKind::HunkHeader
-        );
-        assert_eq!(
-            removed_event_kind(DiffLineKind::Context),
-            DiffLineKind::Context
-        );
-    }
-
-    #[test]
-    fn delta_view_line_from_added_preserves_relevant_line_numbers() {
-        let added = DiffLineView {
-            kind: DiffLineKind::Addition,
-            old_lineno: None,
-            new_lineno: Some(12),
-            text: "+alpha".into(),
-            highlights: None,
-            inline_changes: None,
-        };
-        let deletion = DiffLineView {
-            kind: DiffLineKind::Deletion,
-            old_lineno: Some(8),
-            new_lineno: None,
-            text: "-beta".into(),
-            highlights: None,
-            inline_changes: None,
-        };
-
-        let added_event = delta_view_line_from_added(&added);
-        assert_eq!(added_event.old_lineno, None);
-        assert_eq!(added_event.new_lineno, Some(12));
-
-        let deletion_event = delta_view_line_from_added(&deletion);
-        assert_eq!(deletion_event.old_lineno, Some(8));
-        assert_eq!(deletion_event.new_lineno, None);
-    }
-
-    #[test]
-    fn delta_view_line_from_removed_remaps_line_numbers_to_output_side() {
-        let prior_addition = DiffLineView {
-            kind: DiffLineKind::Addition,
-            old_lineno: None,
-            new_lineno: Some(21),
-            text: "+gamma".into(),
-            highlights: None,
-            inline_changes: None,
-        };
-        let prior_deletion = DiffLineView {
-            kind: DiffLineKind::Deletion,
-            old_lineno: Some(34),
-            new_lineno: None,
-            text: "-delta".into(),
-            highlights: None,
-            inline_changes: None,
-        };
-
-        let removed_added_event = delta_view_line_from_removed(&prior_addition);
-        assert_eq!(removed_added_event.kind, DiffLineKind::Deletion);
-        assert_eq!(removed_added_event.old_lineno, Some(21));
-        assert_eq!(removed_added_event.new_lineno, None);
-
-        let removed_deletion_event = delta_view_line_from_removed(&prior_deletion);
-        assert_eq!(removed_deletion_event.kind, DiffLineKind::Addition);
-        assert_eq!(removed_deletion_event.old_lineno, None);
-        assert_eq!(removed_deletion_event.new_lineno, Some(34));
-    }
-
-    #[test]
-    fn count_capture_changes_ignores_metadata_lines_in_event_deltas() {
-        let capture = FeedCapturedEvent {
-            files: vec![FeedEventFile {
-                selection: DiffSelectionKey {
-                    section: DiffSectionKind::Unstaged,
-                    relative_path: PathBuf::from("docs/internal/delivery/Working-Set.md"),
-                },
-                file: ChangedFile {
-                    relative_path: PathBuf::from("docs/internal/delivery/Working-Set.md"),
-                    status: GitFileStatus::Modified,
-                    is_binary: false,
-                    insertions: 1,
-                    deletions: 0,
-                },
-                document: FileDiffDocument {
-                    generation: 2,
-                    selection: DiffSelectionKey {
-                        section: DiffSectionKind::Unstaged,
-                        relative_path: PathBuf::from("docs/internal/delivery/Working-Set.md"),
-                    },
-                    file: ChangedFile {
-                        relative_path: PathBuf::from("docs/internal/delivery/Working-Set.md"),
-                        status: GitFileStatus::Modified,
-                        is_binary: false,
-                        insertions: 1,
-                        deletions: 0,
-                    },
-                    lines: vec![
-                        DiffLineView {
-                            kind: DiffLineKind::FileHeader,
-                            old_lineno: None,
-                            new_lineno: None,
-                            text: "diff --git a/docs/internal/delivery/Working-Set.md b/docs/internal/delivery/Working-Set.md".into(),
-                            highlights: None,
-                            inline_changes: None,
-                        },
-                        DiffLineView {
-                            kind: DiffLineKind::HunkHeader,
-                            old_lineno: None,
-                            new_lineno: None,
-                            text: "@@ -8,4 +8,5 @@".into(),
-                            highlights: None,
-                            inline_changes: None,
-                        },
-                        DiffLineView {
-                            kind: DiffLineKind::Context,
-                            old_lineno: Some(8),
-                            new_lineno: Some(8),
-                            text: "- **Tracked Between-Phase Work:** existing text".into(),
-                            highlights: None,
-                            inline_changes: None,
-                        },
-                        DiffLineView {
-                            kind: DiffLineKind::Addition,
-                            old_lineno: None,
-                            new_lineno: Some(9),
-                            text: "+ **Live Feed Test Note:** Temporary text edit added on April 3, 2026 to exercise the delta-based live feed.".into(),
-                            highlights: None,
-                            inline_changes: None,
-                        },
-                    ],
-                },
-            }],
-            failed_files: Vec::new(),
-            truncated: false,
-            total_rendered_lines: 4,
-            total_rendered_bytes: 0,
-        };
-
-        assert_eq!(count_capture_changes(&capture), (1, 0));
-    }
-
-    #[test]
-    fn bootstrap_feed_event_counts_full_changes_even_when_capture_truncates() {
-        let total_lines = FEED_EVENT_LINE_CAP + 5;
-        let current = FeedScopeCapture {
-            generation: 7,
-            layers: vec![FeedLayerSnapshot {
-                selection: DiffSelectionKey {
-                    section: DiffSectionKind::Unstaged,
-                    relative_path: PathBuf::from("src/live.rs"),
-                },
-                file: ChangedFile {
-                    relative_path: PathBuf::from("src/live.rs"),
-                    status: GitFileStatus::Modified,
-                    is_binary: false,
-                    insertions: total_lines,
-                    deletions: 0,
-                },
-                state: FeedLayerState::Ready(FileDiffDocument {
-                    generation: 7,
-                    selection: DiffSelectionKey {
-                        section: DiffSectionKind::Unstaged,
-                        relative_path: PathBuf::from("src/live.rs"),
-                    },
-                    file: ChangedFile {
-                        relative_path: PathBuf::from("src/live.rs"),
-                        status: GitFileStatus::Modified,
-                        is_binary: false,
-                        insertions: total_lines,
-                        deletions: 0,
-                    },
-                    lines: (0..total_lines)
-                        .map(|ix| DiffLineView {
-                            kind: DiffLineKind::Addition,
-                            old_lineno: None,
-                            new_lineno: Some((ix + 1) as u32),
-                            text: format!("added line {ix}\n"),
-                            highlights: None,
-                            inline_changes: None,
-                        })
-                        .collect(),
-                }),
-            }],
-        };
-
-        let event = build_bootstrap_feed_event(&current);
-        assert_eq!(event.insertions, total_lines);
-        assert_eq!(event.deletions, 0);
-        assert!(event.capture.truncated);
-        assert_eq!(event.capture.total_rendered_lines, FEED_EVENT_LINE_CAP);
-    }
-
-    #[test]
-    fn live_delta_event_counts_full_changes_even_when_capture_truncates() {
-        let total_lines = FEED_EVENT_LINE_CAP + 5;
-        let previous = FeedScopeCapture {
-            generation: 6,
-            layers: Vec::new(),
-        };
-        let current = FeedScopeCapture {
-            generation: 7,
-            layers: vec![FeedLayerSnapshot {
-                selection: DiffSelectionKey {
-                    section: DiffSectionKind::Unstaged,
-                    relative_path: PathBuf::from("src/live.rs"),
-                },
-                file: ChangedFile {
-                    relative_path: PathBuf::from("src/live.rs"),
-                    status: GitFileStatus::Modified,
-                    is_binary: false,
-                    insertions: total_lines,
-                    deletions: 0,
-                },
-                state: FeedLayerState::Ready(FileDiffDocument {
-                    generation: 7,
-                    selection: DiffSelectionKey {
-                        section: DiffSectionKind::Unstaged,
-                        relative_path: PathBuf::from("src/live.rs"),
-                    },
-                    file: ChangedFile {
-                        relative_path: PathBuf::from("src/live.rs"),
-                        status: GitFileStatus::Modified,
-                        is_binary: false,
-                        insertions: total_lines,
-                        deletions: 0,
-                    },
-                    lines: (0..total_lines)
-                        .map(|ix| DiffLineView {
-                            kind: DiffLineKind::Addition,
-                            old_lineno: None,
-                            new_lineno: Some((ix + 1) as u32),
-                            text: format!("added line {ix}\n"),
-                            highlights: None,
-                            inline_changes: None,
-                        })
-                        .collect(),
-                }),
-            }],
-        };
-
-        let event = build_live_delta_event(&previous, &current, ThemeId::Dark)
-            .unwrap()
-            .unwrap();
-        assert_eq!(event.insertions, total_lines);
-        assert_eq!(event.deletions, 0);
-        assert!(event.capture.truncated);
-        assert_eq!(event.capture.total_rendered_lines, FEED_EVENT_LINE_CAP);
-    }
-
-    #[test]
-    fn attach_inline_changes_handles_reflowed_multiline_block() {
-        let mut lines = vec![
-            DiffLineView {
-                kind: DiffLineKind::Deletion,
-                old_lineno: Some(1),
-                new_lineno: None,
-                text: "        build_diff_tree, extract_selected_text, is_oversize_document, plain_text_for_line,\n"
-                    .into(),
-                highlights: None,
-                inline_changes: None,
-            },
-            DiffLineView {
-                kind: DiffLineKind::Deletion,
-                old_lineno: Some(2),
-                new_lineno: None,
-                text: "        render_diff_text, selection_range_for_line, DiffSelection, DiffTreeNodeKind,\n"
-                    .into(),
-                highlights: None,
-                inline_changes: None,
-            },
-            DiffLineView {
-                kind: DiffLineKind::Addition,
-                old_lineno: None,
-                new_lineno: Some(1),
-                text: "        build_diff_tree, extract_selected_text, is_oversize_document, map_raw_to_display_ranges,\n"
-                    .into(),
-                highlights: None,
-                inline_changes: None,
-            },
-            DiffLineView {
-                kind: DiffLineKind::Addition,
-                old_lineno: None,
-                new_lineno: Some(2),
-                text: "        plain_text_for_line, render_diff_text, selection_range_for_line, DiffSelection,\n"
-                    .into(),
-                highlights: None,
-                inline_changes: None,
-            },
-            DiffLineView {
-                kind: DiffLineKind::Addition,
-                old_lineno: None,
-                new_lineno: Some(3),
-                text: "        DiffTreeNodeKind,\n".into(),
-                highlights: None,
-                inline_changes: None,
-            },
-        ];
-
-        attach_inline_changes(&mut lines);
-
-        assert!(lines[0].inline_changes.is_none());
-        assert!(lines[1].inline_changes.is_none());
-
-        let inserted = lines[2].inline_changes.as_ref().unwrap();
-        assert_eq!(inserted.len(), 1);
-        assert!(
-            lines[2].text[inserted[0].clone()].contains("map_raw_to_display_ranges"),
-            "expected inserted token highlight, got {:?}",
-            &lines[2].text[inserted[0].clone()]
-        );
-
-        assert!(lines[3].inline_changes.is_none());
-        assert!(lines[4].inline_changes.is_none());
-    }
-
-    #[test]
-    fn attach_inline_changes_aligns_ordered_multiline_pairs() {
-        let mut lines = vec![
-            DiffLineView {
-                kind: DiffLineKind::Deletion,
-                old_lineno: Some(1),
-                new_lineno: None,
-                text: "let alpha = 10;\n".into(),
-                highlights: None,
-                inline_changes: None,
-            },
-            DiffLineView {
-                kind: DiffLineKind::Deletion,
-                old_lineno: Some(2),
-                new_lineno: None,
-                text: "let beta = 20;\n".into(),
-                highlights: None,
-                inline_changes: None,
-            },
-            DiffLineView {
-                kind: DiffLineKind::Deletion,
-                old_lineno: Some(3),
-                new_lineno: None,
-                text: "let gamma = 30;\n".into(),
-                highlights: None,
-                inline_changes: None,
-            },
-            DiffLineView {
-                kind: DiffLineKind::Addition,
-                old_lineno: None,
-                new_lineno: Some(1),
-                text: "let alpha = 11;\n".into(),
-                highlights: None,
-                inline_changes: None,
-            },
-            DiffLineView {
-                kind: DiffLineKind::Addition,
-                old_lineno: None,
-                new_lineno: Some(2),
-                text: "let beta = 21;\n".into(),
-                highlights: None,
-                inline_changes: None,
-            },
-            DiffLineView {
-                kind: DiffLineKind::Addition,
-                old_lineno: None,
-                new_lineno: Some(3),
-                text: "let gamma = 31;\n".into(),
-                highlights: None,
-                inline_changes: None,
-            },
-        ];
-
-        attach_inline_changes(&mut lines);
-
-        assert_eq!(
-            &lines[0].text[lines[0].inline_changes.as_ref().unwrap()[0].clone()],
-            "10"
-        );
-        assert_eq!(
-            &lines[1].text[lines[1].inline_changes.as_ref().unwrap()[0].clone()],
-            "20"
-        );
-        assert_eq!(
-            &lines[2].text[lines[2].inline_changes.as_ref().unwrap()[0].clone()],
-            "30"
-        );
-        assert_eq!(
-            &lines[3].text[lines[3].inline_changes.as_ref().unwrap()[0].clone()],
-            "11"
-        );
-        assert_eq!(
-            &lines[4].text[lines[4].inline_changes.as_ref().unwrap()[0].clone()],
-            "21"
-        );
-        assert_eq!(
-            &lines[5].text[lines[5].inline_changes.as_ref().unwrap()[0].clone()],
-            "31"
-        );
-    }
-
-    #[test]
-    fn attach_inline_changes_skips_large_unbalanced_rewrite() {
-        let mut lines = vec![DiffLineView {
-            kind: DiffLineKind::Deletion,
-            old_lineno: Some(1),
-            new_lineno: None,
-            text: "legacy compact paragraph\n".into(),
-            highlights: None,
-            inline_changes: None,
-        }];
-
-        for (idx, text) in [
-            "new introduction line\n",
-            "expanded rationale line\n",
-            "usage details line\n",
-            "installation details line\n",
-            "configuration details line\n",
-            "workflow example line\n",
-            "review guidance line\n",
-            "testing guidance line\n",
-            "deployment guidance line\n",
-            "closing note line\n",
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            lines.push(DiffLineView {
-                kind: DiffLineKind::Addition,
-                old_lineno: None,
-                new_lineno: Some((idx + 1) as u32),
-                text: text.into(),
-                highlights: None,
-                inline_changes: None,
-            });
-        }
-
-        attach_inline_changes(&mut lines);
-
-        assert!(lines[0].inline_changes.is_none());
-        for line in &lines[1..] {
-            assert!(
-                line.inline_changes.is_none(),
-                "expected unmatched rewrite line to have no inline changes: {:?}",
-                line.text
-            );
-        }
-    }
-
-    #[test]
-    fn compute_block_inline_diff_keeps_punctuation_separated_ranges_distinct() {
-        let (old_ranges, new_ranges) =
-            compute_block_inline_diff(&["alpha, beta, gamma\n"], &["delta, epsilon, zeta\n"], true);
-
-        assert_eq!(
-            old_ranges,
-            vec![vec![0..5, 7..11, 13..18]],
-            "old-side ranges should not bridge commas"
-        );
-        assert_eq!(
-            new_ranges,
-            vec![vec![0..5, 7..14, 16..20]],
-            "new-side ranges should not bridge commas"
-        );
-    }
-}
+mod tests;

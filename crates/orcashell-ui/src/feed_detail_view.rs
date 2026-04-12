@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use gpui::prelude::FluentBuilder as _;
@@ -8,11 +9,11 @@ use orcashell_terminal_view::Copy;
 
 use crate::diff_explorer::{
     self, build_diff_tree, collect_file_keys, extract_selected_text, is_copy_keystroke,
-    is_oversize_document, measure_diff_char_width, plain_text_for_line, plain_text_len,
-    render_diff_line_element, simple_hash, CachedDiffLines, DiffSelection, DiffTreeNode,
-    DiffTreeNodeKind, ScrollbarDrag, DEFAULT_CHAR_WIDTH, DIFF_FONT_FAMILY, LINE_HEIGHT,
-    SCROLLBAR_HIT_WIDTH, SCROLLBAR_THUMB_INSET, SCROLLBAR_THUMB_MIN, SCROLLBAR_THUMB_WIDTH,
-    TEXT_COL_X,
+    is_oversize_document, max_diff_content_width, measure_diff_char_width, plain_text_for_line,
+    plain_text_len, render_diff_line_element, simple_hash, CachedDiffLines, DiffSelection,
+    DiffTreeNode, DiffTreeNodeKind, ScrollbarDrag, DEFAULT_CHAR_WIDTH, DIFF_FONT_FAMILY,
+    LINE_HEIGHT, SCROLLBAR_HIT_WIDTH, SCROLLBAR_THUMB_INSET, SCROLLBAR_THUMB_MIN,
+    SCROLLBAR_THUMB_WIDTH, TEXT_COL_X,
 };
 use crate::theme::{self, OrcaTheme};
 use crate::workspace::{CapturedDiffFailure, CapturedDiffFile, ChangeFeedEntry, FeedCaptureState};
@@ -171,6 +172,7 @@ impl FeedDetailView {
             selection: selection.clone(),
             generation: captured.document.generation,
             lines: Rc::new(lines),
+            hunk_headers: Rc::new(HashMap::new()),
             max_line_chars,
         });
     }
@@ -379,7 +381,7 @@ impl FeedDetailView {
         };
 
         let file_header =
-            diff_explorer::DiffExplorerView::diff_file_header(&palette, &captured.file, None);
+            diff_explorer::DiffExplorerView::diff_file_header(&palette, &captured.file, None, None);
         let lines = cached.lines.clone();
         let line_count = lines.len();
         let selection = self.selection;
@@ -398,6 +400,7 @@ impl FeedDetailView {
                             ix,
                             selection.as_ref(),
                             scroll_x,
+                            None,
                         )
                     })
                     .collect()
@@ -449,7 +452,7 @@ impl FeedDetailView {
                     .line_cache
                     .as_ref()
                     .map(|cache| {
-                        cache.max_line_chars as f32 * this.measured_char_width + TEXT_COL_X
+                        max_diff_content_width(cache.max_line_chars, this.measured_char_width)
                     })
                     .unwrap_or(0.0);
                 let max_scroll = (max_line_w - viewport_w).max(0.0);
@@ -838,6 +841,7 @@ fn build_captured_tree_cache(entry: &ChangeFeedEntry) -> CapturedTreeCache {
     {
         for file in &captured.files {
             match file.selection.section {
+                DiffSectionKind::Conflicted => {}
                 DiffSectionKind::Staged => staged_files.push(file.file.clone()),
                 DiffSectionKind::Unstaged => unstaged_files.push(file.file.clone()),
             }

@@ -283,6 +283,16 @@ impl Sidebar {
                 ws.active_auxiliary_tab().map(|tab| &tab.kind),
                 Some(AuxiliaryTabKind::LiveDiffStream { project_id }) if project_id == &project.id
             );
+            let repository_is_open = ws.auxiliary_tabs().iter().any(|tab| {
+                matches!(
+                    &tab.kind,
+                    AuxiliaryTabKind::RepositoryGraph { project_id } if project_id == &project.id
+                )
+            });
+            let repository_is_active = matches!(
+                ws.active_auxiliary_tab().map(|tab| &tab.kind),
+                Some(AuxiliaryTabKind::RepositoryGraph { project_id }) if project_id == &project.id
+            );
 
             // Project header row
             let mut project_row = div()
@@ -304,6 +314,8 @@ impl Sidebar {
             let pid_for_add = pid.clone();
             let ws_live_diff = self.workspace.clone();
             let pid_for_live_diff = pid.clone();
+            let ws_repository = self.workspace.clone();
+            let pid_for_repository = pid.clone();
             let mut project_actions = div().flex().items_center().gap(px(4.0));
             if project_has_git {
                 project_actions = project_actions.child(
@@ -311,18 +323,24 @@ impl Sidebar {
                         .id(ElementId::Name(
                             format!("sidebar-live-diff-{}", project.id).into(),
                         ))
+                        .debug_selector(|| "sidebar-live-diff-action".to_string())
                         .cursor_pointer()
                         .flex()
                         .items_center()
                         .justify_center()
                         .w(px(20.0))
+                        .h(px(16.0))
+                        .rounded(px(3.0))
                         .text_size(px(12.0))
                         .text_color(rgb(if live_diff_is_active || live_diff_is_open {
                             palette.STATUS_GREEN
                         } else {
                             palette.FOG
                         }))
-                        .hover(move |s| s.text_color(rgb(palette.STATUS_GREEN)))
+                        .hover(move |s| {
+                            s.text_color(rgb(palette.STATUS_GREEN))
+                                .bg(rgb(palette.SURFACE))
+                        })
                         .tooltip(move |_window, cx| {
                             cx.new(|_| SidebarTooltipView {
                                 label: "Open Live Diff Stream".into(),
@@ -337,27 +355,72 @@ impl Sidebar {
                             });
                         }),
                 );
+                project_actions = project_actions.child(
+                    div()
+                        .id(ElementId::Name(
+                            format!("sidebar-repository-{}", project.id).into(),
+                        ))
+                        .debug_selector(|| "sidebar-repository-action".to_string())
+                        .cursor_pointer()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .w(px(20.0))
+                        .h(px(16.0))
+                        .rounded(px(3.0))
+                        .text_size(px(13.0))
+                        .text_color(rgb(if repository_is_active || repository_is_open {
+                            palette.ORCA_BLUE
+                        } else {
+                            palette.FOG
+                        }))
+                        .hover(move |s| s.text_color(rgb(palette.BONE)).bg(rgb(palette.SURFACE)))
+                        .tooltip(move |_window, cx| {
+                            cx.new(|_| SidebarTooltipView {
+                                label: "Open Repository".into(),
+                            })
+                            .into()
+                        })
+                        .child("⎇")
+                        .on_click(move |_event, _window, cx| {
+                            cx.stop_propagation();
+                            ws_repository.update(cx, |ws, cx| {
+                                ws.open_repository_graph_for_project(&pid_for_repository, cx);
+                            });
+                        }),
+                );
             }
             project_actions = project_actions.child(
                 div()
                     .id(ElementId::Name(
                         format!("sidebar-add-term-{}", project.id).into(),
                     ))
+                    .debug_selector(|| "sidebar-add-term-action".to_string())
                     .cursor_pointer()
                     .flex()
                     .items_center()
                     .justify_center()
                     .w(px(24.0))
-                    .text_size(px(15.0))
+                    .h(px(16.0))
+                    .rounded(px(3.0))
+                    .text_size(px(17.0))
                     .text_color(rgb(palette.FOG))
-                    .hover(|s| s.text_color(rgb(palette.BONE)))
+                    .hover(|s| s.text_color(rgb(palette.BONE)).bg(rgb(palette.SURFACE)))
                     .tooltip(move |_window, cx| {
                         cx.new(|_| SidebarTooltipView {
                             label: "Open New Terminal".into(),
                         })
                         .into()
                     })
-                    .child("+")
+                    .child(
+                        div()
+                            .mt(if cfg!(target_os = "windows") {
+                                px(0.0)
+                            } else {
+                                px(-4.0)
+                            })
+                            .child("+"),
+                    )
                     .on_click(move |_event, window, cx| {
                         cx.stop_propagation();
                         ws_add.update(cx, |ws, cx| {
@@ -725,6 +788,7 @@ impl Sidebar {
                             div()
                                 .id(ElementId::Name(format!("sidebar-close-{}", tid).into()))
                                 .ml(px(4.0))
+                                .mr(px(4.0))
                                 .mt(px(1.0))
                                 .w(px(16.0))
                                 .h(px(16.0))

@@ -6,6 +6,8 @@ pub mod diff_explorer;
 pub mod feed_detail_view;
 pub mod live_diff_stream;
 pub mod pane;
+pub mod prompt_dialog;
+pub mod repository_browser;
 pub mod settings;
 pub mod settings_view;
 pub mod sidebar;

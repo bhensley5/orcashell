@@ -1,6 +1,6 @@
 [package]
 name = "orcashell-ui"
-version = "0.2.0"
+version = "0.3.0"
 edition.workspace = true
 
 [dependencies]
@@ -9,6 +9,7 @@ orcashell-session = { path = "../orcashell-session" }
 orcashell-terminal-view = { path = "../orcashell-terminal-view" }
 orcashell-daemon-core = { path = "../orcashell-daemon-core" }
 orcashell-git = { path = "../orcashell-git" }
+orcashell-syntax = { path = "../orcashell-syntax" }
 tracing.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -24,6 +25,6 @@ uuid = { version = "1", features = ["v4"] }
 raw-window-handle = { workspace = true }
 
 [dev-dependencies]
-orcashell-syntax = { path = "../orcashell-syntax" }
+gpui = { workspace = true, features = ["test-support"] }
 orcashell-platform = { workspace = true }
 tempfile = "3"

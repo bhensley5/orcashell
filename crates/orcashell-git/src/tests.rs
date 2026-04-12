@@ -6,6 +6,7 @@ use tempfile::TempDir;
 fn repo_fixture() -> (TempDir, Repository) {
     let tempdir = TempDir::new().unwrap();
     let repo = Repository::init(tempdir.path()).unwrap();
+    configure_line_endings(&repo);
     (tempdir, repo)
 }
 
@@ -46,6 +47,10 @@ fn write_file(path: &Path, contents: impl AsRef<[u8]>) {
     fs::write(path, contents).unwrap();
 }
 
+fn read_text_file_normalized(path: &Path) -> String {
+    fs::read_to_string(path).unwrap().replace("\r\n", "\n")
+}
+
 fn hunk_target(document: &FileDiffDocument, hunk_index: usize) -> DiscardHunkTarget {
     document
         .discard_hunk_target(hunk_index)
@@ -79,6 +84,7 @@ fn split_gitdir_repo_fixture() -> (TempDir, PathBuf, PathBuf, Repository) {
             worktree_path.canonicalize().unwrap().to_str().unwrap(),
         )
         .unwrap();
+    configure_line_endings(&admin_repo);
     let repo = Repository::open(&worktree_path).unwrap();
     (tempdir, worktree_path, admin_dir, repo)
 }
@@ -96,6 +102,12 @@ fn configure_identity(repo: &Repository) {
     let mut config = repo.config().unwrap();
     config.set_str("user.name", "OrcaShell").unwrap();
     config.set_str("user.email", "orca@example.com").unwrap();
+}
+
+fn configure_line_endings(repo: &Repository) {
+    let mut config = repo.config().unwrap();
+    config.set_str("core.autocrlf", "false").unwrap();
+    config.set_str("core.eol", "lf").unwrap();
 }
 
 fn run_git(cwd: &Path, args: &[&str]) -> std::process::Output {
@@ -411,7 +423,7 @@ fn apply_and_drop_stash_succeed() {
         }
     );
     assert_eq!(
-        fs::read_to_string(tempdir.path().join("tracked.txt")).unwrap(),
+        read_text_file_normalized(&tempdir.path().join("tracked.txt")),
         "base\napplied\n"
     );
     assert_eq!(list_stashes(tempdir.path()).unwrap().entries.len(), 1);
@@ -440,7 +452,7 @@ fn pop_stash_removes_entry_and_restores_changes() {
         }
     );
     assert_eq!(
-        fs::read_to_string(tempdir.path().join("tracked.txt")).unwrap(),
+        read_text_file_normalized(&tempdir.path().join("tracked.txt")),
         "base\npopped\n"
     );
     assert!(list_stashes(tempdir.path()).unwrap().entries.is_empty());
@@ -547,7 +559,7 @@ fn apply_stash_targets_oid_after_indices_shift() {
         }
     );
     assert_eq!(
-        fs::read_to_string(tempdir.path().join("tracked.txt")).unwrap(),
+        read_text_file_normalized(&tempdir.path().join("tracked.txt")),
         "base\nfirst\n"
     );
 }
@@ -601,7 +613,7 @@ fn pop_stash_targets_oid_after_indices_shift() {
         }
     );
     assert_eq!(
-        fs::read_to_string(tempdir.path().join("tracked.txt")).unwrap(),
+        read_text_file_normalized(&tempdir.path().join("tracked.txt")),
         "base\nsecond\n"
     );
 
@@ -632,7 +644,7 @@ fn missing_stash_oid_returns_error_without_mutating_other_entries() {
     assert_eq!(remaining.entries.len(), 1);
     assert_eq!(remaining.entries[0].stash_oid, first_oid);
     assert_eq!(
-        fs::read_to_string(tempdir.path().join("tracked.txt")).unwrap(),
+        read_text_file_normalized(&tempdir.path().join("tracked.txt")),
         "base\n"
     );
 }
@@ -927,16 +939,16 @@ fn discard_all_unstaged_restores_worktree_and_preserves_staged_changes() {
     discard_all_unstaged(tempdir.path()).unwrap();
 
     assert_eq!(
-        fs::read_to_string(tempdir.path().join("a.txt")).unwrap(),
+        read_text_file_normalized(&tempdir.path().join("a.txt")),
         "a1\n"
     );
     assert_eq!(
-        fs::read_to_string(tempdir.path().join("b.txt")).unwrap(),
+        read_text_file_normalized(&tempdir.path().join("b.txt")),
         "b1\n"
     );
     assert!(!tempdir.path().join("new.bin").exists());
     assert_eq!(
-        fs::read_to_string(tempdir.path().join("staged.txt")).unwrap(),
+        read_text_file_normalized(&tempdir.path().join("staged.txt")),
         "s2\n"
     );
 
@@ -962,11 +974,11 @@ fn discard_unstaged_file_only_reverts_target_path() {
     discard_unstaged_file(tempdir.path(), Path::new("a.txt")).unwrap();
 
     assert_eq!(
-        fs::read_to_string(tempdir.path().join("a.txt")).unwrap(),
+        read_text_file_normalized(&tempdir.path().join("a.txt")),
         "a1\n"
     );
     assert_eq!(
-        fs::read_to_string(tempdir.path().join("b.txt")).unwrap(),
+        read_text_file_normalized(&tempdir.path().join("b.txt")),
         "b2\n"
     );
 
@@ -1098,7 +1110,7 @@ fn discard_unstaged_hunk_reverts_only_the_target_hunk() {
     assert_eq!(outcome, DiscardMutationOutcome::Applied);
 
     assert_eq!(
-        fs::read_to_string(tempdir.path().join("a.txt")).unwrap(),
+        read_text_file_normalized(&tempdir.path().join("a.txt")),
         "1\n2\n3\n4\n5\n6\n7\n8\n9\nchanged-10\n11\n12\n"
     );
 
@@ -1230,7 +1242,7 @@ fn discard_unstaged_hunk_matches_same_body_after_hunk_positions_shift() {
     let outcome = discard_unstaged_hunk(tempdir.path(), Path::new("a.txt"), &target).unwrap();
     assert_eq!(outcome, DiscardMutationOutcome::Applied);
     assert_eq!(
-        fs::read_to_string(tempdir.path().join("a.txt")).unwrap(),
+        read_text_file_normalized(&tempdir.path().join("a.txt")),
         "1\ninserted-top\n2\n3\n4\n5\n6\n7\n8\n9\nchanged-10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30\n"
     );
 }
@@ -1266,7 +1278,7 @@ fn discard_unstaged_hunk_blocks_when_target_body_changes() {
         }
     );
     assert_eq!(
-        fs::read_to_string(tempdir.path().join("a.txt")).unwrap(),
+        read_text_file_normalized(&tempdir.path().join("a.txt")),
         "1\nchanged-2-again\n3\n4\n5\n6\n7\n8\n9\nchanged-10\n11\n12\n"
     );
 }
@@ -1352,7 +1364,7 @@ fn discard_unstaged_hunk_preserves_same_file_partial_staging() {
     let outcome = discard_unstaged_hunk(tempdir.path(), Path::new("a.txt"), &target).unwrap();
     assert_eq!(outcome, DiscardMutationOutcome::Applied);
     assert_eq!(
-        fs::read_to_string(tempdir.path().join("a.txt")).unwrap(),
+        read_text_file_normalized(&tempdir.path().join("a.txt")),
         "1\nchanged-2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n"
     );
 
@@ -2212,9 +2224,10 @@ fn merge_back_fast_forward_updates_source_worktree() {
 
     // The source worktree should now have the new file on disk
     assert!(tempdir.path().join("new.txt").exists());
-    let content = fs::read_to_string(tempdir.path().join("new.txt")).unwrap();
-    // Normalize line endings for Windows (autocrlf may convert \n → \r\n)
-    assert_eq!(content.replace("\r\n", "\n"), "from managed\n");
+    assert_eq!(
+        read_text_file_normalized(&tempdir.path().join("new.txt")),
+        "from managed\n"
+    );
 }
 
 // ── Worktree management tests ────────────────────────────────────
@@ -3285,9 +3298,7 @@ fn abort_merge_restores_pre_merge_state() {
     assert_eq!(repo.state(), RepositoryState::Clean);
     assert_eq!(repo.head().unwrap().target().unwrap(), head_before);
     assert_eq!(
-        fs::read_to_string(repo.workdir().unwrap().join("file.txt"))
-            .unwrap()
-            .replace("\r\n", "\n"),
+        read_text_file_normalized(&repo.workdir().unwrap().join("file.txt")),
         "local conflict content\n"
     );
     assert!(!repo.path().join("MERGE_HEAD").exists());
@@ -3356,9 +3367,10 @@ fn merge_back_opens_source_repo_directly() {
 
     // Verify merge result visible in source repo.
     let source_repo = Repository::open(tempdir.path()).unwrap();
-    let source_content = fs::read_to_string(tempdir.path().join("new.txt")).unwrap();
-    // Normalize line endings for Windows (autocrlf may convert \n → \r\n)
-    assert_eq!(source_content.replace("\r\n", "\n"), "from managed\n");
+    assert_eq!(
+        read_text_file_normalized(&tempdir.path().join("new.txt")),
+        "from managed\n"
+    );
 
     // Verify source HEAD advanced.
     let source_head = source_repo.head().unwrap().peel_to_commit().unwrap().id();

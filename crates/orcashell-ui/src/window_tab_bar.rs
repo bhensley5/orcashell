@@ -491,6 +491,7 @@ impl Render for WindowTabBar {
                 AuxiliaryTabKind::Settings => "\u{2699}",
                 AuxiliaryTabKind::Diff { .. } => "\u{2260}",
                 AuxiliaryTabKind::LiveDiffStream { .. } => "\u{223f}",
+                AuxiliaryTabKind::RepositoryGraph { .. } => "⎇",
             };
 
             let ws_focus = workspace.clone();

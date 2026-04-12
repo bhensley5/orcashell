@@ -4,19 +4,25 @@ pub mod layout;
 pub mod project;
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use gpui::*;
 use orcashell_daemon_core::git_coordinator::{
-    GitActionKind, GitCoordinator, GitEvent, GitRemoteKind,
+    GitActionKind, GitCoordinator, GitEvent, GitFetchOrigin, GitRemoteKind, MergeConflictTrigger,
 };
 use orcashell_git::{
-    rehighlight_captured_feed_event, DiffDocument, DiffLineKind, DiffSectionKind, DiffSelectionKey,
-    FeedCaptureResult, FeedCapturedEvent, FeedEventData, FeedEventFailure, FeedEventFile,
-    FeedEventFileSummary, FeedEventKind, FeedScopeCapture, FileDiffDocument, GitSnapshotSummary,
-    ManagedWorktree,
+    discover_scope, parse_conflict_file_text, rehighlight_captured_feed_event, ChangedFile,
+    CommitDetailDocument, CommitFileDiffDocument, CommitFileSelection, DiffDocument, DiffLineKind,
+    DiffSectionKind, DiffSelectionKey, DiscardHunkTarget, FeedCaptureResult, FeedCapturedEvent,
+    FeedEventData, FeedEventFailure, FeedEventFile, FeedEventFileSummary, FeedEventKind,
+    FeedScopeCapture, FileDiffDocument, GitFileStatus, GitSnapshotSummary, HeadState,
+    ManagedWorktree, Oid, ParsedConflictBlock, RepositoryGraphDocument, SnapshotLoadError,
+    SnapshotLoadErrorKind, StashDetailDocument, StashFileDiffDocument, StashFileSelection,
+    StashListDocument, MAX_RENDERED_DIFF_BYTES, MAX_RENDERED_DIFF_LINES,
 };
 use parking_lot::Mutex;
 use uuid::Uuid;
@@ -36,6 +42,9 @@ use orcashell_terminal_view::{
     ColorPalette, CursorShape, TerminalConfig, TerminalRuntimeEvent, TerminalView, TextInputState,
 };
 use project::ProjectData;
+
+const REPOSITORY_AUTO_FETCH_INTERVAL: Duration = Duration::from_secs(180);
+const REPOSITORY_AUTO_FETCH_FAILURE_COOLDOWN: Duration = Duration::from_secs(300);
 
 /// Where the rename input should appear.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +77,7 @@ pub enum AuxiliaryTabKind {
     Settings,
     Diff { scope_root: PathBuf },
     LiveDiffStream { project_id: String },
+    RepositoryGraph { project_id: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,6 +102,79 @@ pub struct DiffFileState {
     pub loading: bool,
     pub requested_generation: Option<u64>,
     pub requested_selection: Option<DiffSelectionKey>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffTabViewMode {
+    WorkingTree,
+    Stashes,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiffTabStashState {
+    pub list: AsyncDocumentState<StashListDocument>,
+    pub selected_stash: Option<Oid>,
+    pub expanded_stash: Option<Oid>,
+    pub detail: AsyncDocumentState<StashDetailDocument>,
+    pub selected_file: Option<StashFileSelection>,
+    pub file_diff: AsyncDocumentState<StashFileDiffDocument>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AsyncDocumentState<T> {
+    pub document: Option<T>,
+    pub error: Option<String>,
+    pub loading: bool,
+    pub requested_revision: u64,
+}
+
+impl<T> Default for AsyncDocumentState<T> {
+    fn default() -> Self {
+        Self {
+            document: None,
+            error: None,
+            loading: false,
+            requested_revision: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConflictEditorDocument {
+    pub generation: u64,
+    pub version: u64,
+    pub selection: DiffSelectionKey,
+    pub file: ChangedFile,
+    pub initial_raw_text: String,
+    pub raw_text: String,
+    pub blocks: Vec<ParsedConflictBlock>,
+    pub has_base_sections: bool,
+    pub parse_error: Option<String>,
+    pub is_dirty: bool,
+    pub cursor_pos: usize,
+    pub selection_range: Option<Range<usize>>,
+    pub active_block_index: Option<usize>,
+    pub scroll_x: f32,
+    pub scroll_y: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConflictUnavailableState {
+    pub generation: u64,
+    pub selection: DiffSelectionKey,
+    pub file: ChangedFile,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConflictDocumentState {
+    Loaded(ConflictEditorDocument),
+    Unavailable(ConflictUnavailableState),
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ConflictEditorState {
+    pub documents: HashMap<PathBuf, ConflictDocumentState>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -216,13 +299,56 @@ pub struct ManagedWorktreeSummary {
     pub source_ref: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepositoryBranchSelection {
+    Local { name: String },
+    Remote { full_ref: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepositoryBranchAction {
+    Checkout {
+        selection: RepositoryBranchSelection,
+    },
+    Create {
+        source_branch_name: String,
+        new_branch_name: String,
+    },
+    Delete {
+        branch_name: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryGraphTabState {
+    pub project_id: String,
+    pub scope_root: PathBuf,
+    pub graph: AsyncDocumentState<RepositoryGraphDocument>,
+    pub selected_branch: Option<RepositoryBranchSelection>,
+    pub selected_commit: Option<Oid>,
+    pub commit_detail: AsyncDocumentState<CommitDetailDocument>,
+    pub selected_commit_file: Option<CommitFileSelection>,
+    pub commit_file_diff: AsyncDocumentState<CommitFileDiffDocument>,
+    pub fetch_in_flight: bool,
+    pub pull_in_flight: bool,
+    pub active_fetch_origin: Option<GitFetchOrigin>,
+    pub last_remote_check_at: Option<SystemTime>,
+    pub last_automatic_fetch_failure_at: Option<SystemTime>,
+    pub active_branch_action: Option<RepositoryBranchAction>,
+    pub action_banner: Option<ActionBanner>,
+    pub occupied_local_branches: HashSet<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DiffTabState {
     pub scope_root: PathBuf,
     pub tree_width: f32,
+    pub view_mode: DiffTabViewMode,
     pub index: DiffIndexState,
     pub selected_file: Option<DiffSelectionKey>,
     pub file: DiffFileState,
+    pub stash: DiffTabStashState,
+    pub conflict_editor: ConflictEditorState,
     // Phase 4.5 CP2 fields
     pub multi_select: HashSet<DiffSelectionKey>,
     pub selection_anchor: Option<DiffSelectionKey>,
@@ -298,6 +424,7 @@ const FEED_PREVIEW_FILE_CAP: usize = 3;
 const FEED_PREVIEW_MIN_LINES_PER_FILE: usize = 3;
 #[allow(dead_code)]
 const FEED_PREVIEW_HIDDEN_NAME_CAP: usize = 3;
+const REPOSITORY_GRAPH_AUTO_REFRESH_REVISION: u64 = 0;
 
 fn classify_notification(title: &str, body: &str, patterns: &[String]) -> NotificationTier {
     let lower = format!("{title} {body}").to_lowercase();
@@ -321,6 +448,7 @@ pub struct WorkspaceState {
     active_auxiliary_tab_id: Option<String>,
     diff_tabs: HashMap<PathBuf, DiffTabState>,
     live_diff_feeds: HashMap<String, ChangeFeedState>,
+    repository_graph_tabs: HashMap<String, RepositoryGraphTabState>,
     /// Active inline rename, if any.
     pub renaming: Option<RenameState>,
     pub workspace_banner: Option<WorkspaceBanner>,
@@ -349,9 +477,12 @@ impl DiffTabState {
         Self {
             scope_root,
             tree_width: DEFAULT_DIFF_TREE_WIDTH,
+            view_mode: DiffTabViewMode::WorkingTree,
             index: DiffIndexState::default(),
             selected_file: None,
             file: DiffFileState::default(),
+            stash: DiffTabStashState::default(),
+            conflict_editor: ConflictEditorState::default(),
             multi_select: HashSet::new(),
             selection_anchor: None,
             commit_message: String::new(),
@@ -360,6 +491,29 @@ impl DiffTabState {
             last_action_banner: None,
             remove_worktree_confirm: None,
             managed_worktree: None,
+        }
+    }
+}
+
+impl RepositoryGraphTabState {
+    fn new(project_id: String, scope_root: PathBuf) -> Self {
+        Self {
+            project_id,
+            scope_root,
+            graph: AsyncDocumentState::default(),
+            selected_branch: None,
+            selected_commit: None,
+            commit_detail: AsyncDocumentState::default(),
+            selected_commit_file: None,
+            commit_file_diff: AsyncDocumentState::default(),
+            fetch_in_flight: false,
+            pull_in_flight: false,
+            active_fetch_origin: None,
+            last_remote_check_at: None,
+            last_automatic_fetch_failure_at: None,
+            active_branch_action: None,
+            action_banner: None,
+            occupied_local_branches: HashSet::new(),
         }
     }
 }
@@ -406,6 +560,90 @@ impl ChangeFeedState {
     }
 }
 
+fn count_text_lines(text: &str) -> usize {
+    if text.is_empty() {
+        1
+    } else {
+        text.bytes().filter(|byte| *byte == b'\n').count() + 1
+    }
+}
+
+fn clamp_to_char_boundary(text: &str, offset: usize) -> usize {
+    if offset >= text.len() {
+        return text.len();
+    }
+    let mut offset = offset;
+    while !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    offset
+}
+
+fn clamp_selection_range(text: &str, selection: Option<Range<usize>>) -> Option<Range<usize>> {
+    let selection = selection?;
+    let start = clamp_to_char_boundary(text, selection.start.min(text.len()));
+    let end = clamp_to_char_boundary(text, selection.end.min(text.len()));
+    (start < end).then_some(start..end)
+}
+
+fn active_block_for_cursor(blocks: &[ParsedConflictBlock], cursor_pos: usize) -> Option<usize> {
+    blocks
+        .iter()
+        .find(|block| cursor_pos >= block.whole_block.start && cursor_pos <= block.whole_block.end)
+        .map(|block| block.block_index)
+}
+
+fn merge_conflict_document_from_text(
+    generation: u64,
+    selection: DiffSelectionKey,
+    file: ChangedFile,
+    raw_text: String,
+    prior: Option<&ConflictEditorDocument>,
+    is_dirty: bool,
+) -> ConflictEditorDocument {
+    let (blocks, has_base_sections, parse_error) = match parse_conflict_file_text(&raw_text) {
+        Ok(parsed) => (parsed.blocks, parsed.has_base_sections, None),
+        Err(error) => (Vec::new(), false, Some(error.to_string())),
+    };
+
+    let cursor_pos = prior
+        .map(|document| clamp_to_char_boundary(&raw_text, document.cursor_pos))
+        .unwrap_or_else(|| {
+            blocks
+                .first()
+                .map(|block| block.whole_block.start)
+                .unwrap_or(0)
+        });
+    let selection_range = prior
+        .and_then(|document| clamp_selection_range(&raw_text, document.selection_range.clone()));
+    let active_block_index = active_block_for_cursor(&blocks, cursor_pos)
+        .or_else(|| blocks.first().map(|block| block.block_index));
+
+    ConflictEditorDocument {
+        generation,
+        version: prior.map_or(0, |document| document.version.saturating_add(1)),
+        selection,
+        file,
+        initial_raw_text: prior
+            .map(|document| document.initial_raw_text.clone())
+            .unwrap_or_else(|| raw_text.clone()),
+        raw_text,
+        blocks,
+        has_base_sections,
+        parse_error,
+        is_dirty,
+        cursor_pos,
+        selection_range,
+        active_block_index,
+        scroll_x: prior.map_or(0.0, |document| document.scroll_x),
+        scroll_y: prior.map_or(0.0, |document| document.scroll_y),
+    }
+}
+
+fn unreadable_conflict_message(error: &std::io::Error) -> String {
+    format!("Could not read conflicted file: {error}")
+}
+
 impl WorkspaceState {
     pub fn new() -> Self {
         Self::new_with_services(WorkspaceServices::default())
@@ -425,6 +663,7 @@ impl WorkspaceState {
             active_auxiliary_tab_id: None,
             diff_tabs: HashMap::new(),
             live_diff_feeds: HashMap::new(),
+            repository_graph_tabs: HashMap::new(),
             renaming: None,
             workspace_banner: None,
             pending_focus_terminal_id: None,
@@ -602,6 +841,10 @@ impl WorkspaceState {
         self.live_diff_feeds.get(project_id)
     }
 
+    pub fn repository_graph_state(&self, project_id: &str) -> Option<&RepositoryGraphTabState> {
+        self.repository_graph_tabs.get(project_id)
+    }
+
     pub fn live_diff_source_terminal_available(&self, terminal_id: &str) -> bool {
         self.terminal_exists(terminal_id)
     }
@@ -676,6 +919,33 @@ impl WorkspaceState {
         true
     }
 
+    fn open_diff_tab_for_scope_and_file_optimistic(
+        &mut self,
+        scope_root: &Path,
+        preferred_file: Option<DiffSelectionKey>,
+    ) -> bool {
+        let branch_name = self
+            .git_scopes
+            .get(scope_root)
+            .map(|snapshot| snapshot.branch_name.clone())
+            .unwrap_or_else(|| {
+                scope_root
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("scope")
+                    .to_string()
+            });
+
+        self.open_or_focus_diff_tab_internal(scope_root.to_path_buf(), branch_name);
+        if let Some(diff_tab) = self.diff_tabs.get_mut(scope_root) {
+            diff_tab.selected_file = preferred_file;
+            diff_tab.file.document = None;
+            diff_tab.file.error = None;
+        }
+        self.request_diff_index_refresh(scope_root);
+        true
+    }
+
     pub fn focus_terminal_by_id(&mut self, terminal_id: &str) -> bool {
         let Some(project_id) = self
             .project_id_for_terminal(terminal_id)
@@ -715,6 +985,39 @@ impl WorkspaceState {
         self.diff_tabs.get(scope_root)
     }
 
+    pub(crate) fn selected_conflict_document(
+        &self,
+        scope_root: &Path,
+    ) -> Option<&ConflictDocumentState> {
+        let tab = self.diff_tabs.get(scope_root)?;
+        let relative_path = {
+            let selection = tab.selected_file.as_ref()?;
+            if selection.section != DiffSectionKind::Conflicted {
+                return None;
+            }
+            selection.relative_path.clone()
+        };
+        tab.conflict_editor.documents.get(&relative_path)
+    }
+
+    pub(crate) fn selected_conflict_document_mut(
+        &mut self,
+        scope_root: &Path,
+    ) -> Option<&mut ConflictEditorDocument> {
+        let tab = self.diff_tabs.get_mut(scope_root)?;
+        let relative_path = {
+            let selection = tab.selected_file.as_ref()?;
+            if selection.section != DiffSectionKind::Conflicted {
+                return None;
+            }
+            selection.relative_path.clone()
+        };
+        match tab.conflict_editor.documents.get_mut(&relative_path)? {
+            ConflictDocumentState::Loaded(document) => Some(document),
+            ConflictDocumentState::Unavailable(_) => None,
+        }
+    }
+
     pub fn take_pending_focus_terminal_id(&mut self) -> Option<String> {
         self.pending_focus_terminal_id.take()
     }
@@ -736,8 +1039,397 @@ impl WorkspaceState {
         }
     }
 
+    pub fn open_repository_graph_for_project(&mut self, project_id: &str, cx: &mut Context<Self>) {
+        if self.open_or_focus_repository_graph_tab_internal(project_id) {
+            self.tick_repository_auto_fetch(cx);
+            cx.notify();
+        }
+    }
+
+    pub fn select_repository_branch(
+        &mut self,
+        project_id: &str,
+        selection: RepositoryBranchSelection,
+        cx: &mut Context<Self>,
+    ) {
+        if self.select_repository_branch_internal(project_id, selection) {
+            cx.notify();
+        }
+    }
+
+    pub fn select_repository_commit(&mut self, project_id: &str, oid: Oid, cx: &mut Context<Self>) {
+        let already_selected = self
+            .repository_graph_tabs
+            .get(project_id)
+            .is_some_and(|tab| {
+                tab.selected_commit == Some(oid) && tab.selected_commit_file.is_none()
+            });
+        if already_selected {
+            return;
+        }
+        self.request_repository_commit_detail(project_id, oid);
+        cx.notify();
+    }
+
+    pub fn select_repository_commit_file(
+        &mut self,
+        project_id: &str,
+        selection: CommitFileSelection,
+        cx: &mut Context<Self>,
+    ) {
+        self.request_repository_commit_file_diff(project_id, selection);
+        cx.notify();
+    }
+
+    pub fn back_to_repository_commit(&mut self, project_id: &str, cx: &mut Context<Self>) {
+        if self.back_to_repository_commit_internal(project_id) {
+            cx.notify();
+        }
+    }
+
+    pub fn fetch_repository_graph(&mut self, project_id: &str, cx: &mut Context<Self>) {
+        if self.start_repository_fetch(project_id, GitFetchOrigin::Manual) {
+            cx.notify();
+        }
+    }
+
+    pub fn pull_repository_current_branch(&mut self, project_id: &str, cx: &mut Context<Self>) {
+        let Some((scope_root, can_pull)) = self.repository_graph_tabs.get(project_id).map(|tab| {
+            let can_pull = tab.graph.document.as_ref().is_some_and(|graph| {
+                let Some(head_branch_name) = (match &graph.head {
+                    HeadState::Branch { name, .. } => Some(name.as_str()),
+                    HeadState::Detached { .. } | HeadState::Unborn => None,
+                }) else {
+                    return false;
+                };
+                graph.local_branches.iter().any(|branch| {
+                    branch.name == head_branch_name
+                        && branch.upstream.is_some()
+                        && branch
+                            .upstream
+                            .as_ref()
+                            .is_some_and(|upstream| upstream.behind > 0)
+                })
+            }) && self
+                .git_scopes
+                .get(&tab.scope_root)
+                .is_none_or(|snapshot| snapshot.changed_files == 0);
+            (tab.scope_root.clone(), can_pull)
+        }) else {
+            return;
+        };
+
+        if self.scope_git_action_in_flight(&scope_root) {
+            if let Some(tab) = self.repository_graph_tabs.get_mut(project_id) {
+                tab.action_banner = Some(ActionBanner {
+                    kind: ActionBannerKind::Warning,
+                    message: "Another git action is already running for this checkout.".to_string(),
+                });
+            }
+            cx.notify();
+            return;
+        }
+
+        if !can_pull {
+            return;
+        }
+
+        if let Some(tab) = self.repository_graph_tabs.get_mut(project_id) {
+            tab.pull_in_flight = true;
+            tab.action_banner = None;
+        }
+        if let Some(diff_tab) = self.diff_tabs.get_mut(&scope_root) {
+            diff_tab.remote_op_in_flight = true;
+        }
+        self.services.git.pull_current_branch(&scope_root);
+        cx.notify();
+    }
+
+    pub fn tick_repository_auto_fetch(&mut self, cx: &mut Context<Self>) {
+        let now = SystemTime::now();
+        let Some(project_id) = self.active_auxiliary_tab().and_then(|tab| match &tab.kind {
+            AuxiliaryTabKind::RepositoryGraph { project_id } => Some(project_id.clone()),
+            AuxiliaryTabKind::Settings
+            | AuxiliaryTabKind::Diff { .. }
+            | AuxiliaryTabKind::LiveDiffStream { .. } => None,
+        }) else {
+            return;
+        };
+
+        let mut should_notify = true;
+        if self.repository_auto_fetch_due(&project_id, now) {
+            should_notify = self.start_repository_fetch(&project_id, GitFetchOrigin::Automatic);
+        }
+
+        if should_notify {
+            cx.notify();
+        }
+    }
+
+    pub fn checkout_selected_repository_branch(
+        &mut self,
+        project_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((scope_root, selection)) = self
+            .repository_graph_tabs
+            .get(project_id)
+            .map(|tab| (tab.scope_root.clone(), tab.selected_branch.clone()))
+        else {
+            return;
+        };
+        let Some(selection) = selection else {
+            return;
+        };
+        if self.repository_toolbar_action_in_flight(&scope_root) {
+            if let Some(tab) = self.repository_graph_tabs.get_mut(project_id) {
+                tab.action_banner = Some(ActionBanner {
+                    kind: ActionBannerKind::Warning,
+                    message: "Another git action is already running for this checkout.".to_string(),
+                });
+            }
+            cx.notify();
+            return;
+        }
+
+        let started = match &selection {
+            RepositoryBranchSelection::Local { name } => self
+                .services
+                .git
+                .checkout_local_branch(&scope_root, name.clone()),
+            RepositoryBranchSelection::Remote { full_ref } => self
+                .services
+                .git
+                .checkout_remote_branch(&scope_root, full_ref.clone()),
+        };
+        if !started {
+            if let Some(tab) = self.repository_graph_tabs.get_mut(project_id) {
+                tab.action_banner = Some(ActionBanner {
+                    kind: ActionBannerKind::Warning,
+                    message: "Another git action is already running for this checkout.".to_string(),
+                });
+            }
+            cx.notify();
+            return;
+        }
+
+        if let Some(tab) = self.repository_graph_tabs.get_mut(project_id) {
+            tab.active_branch_action = Some(RepositoryBranchAction::Checkout {
+                selection: selection.clone(),
+            });
+            tab.action_banner = None;
+        }
+        if let Some(diff_tab) = self.diff_tabs.get_mut(&scope_root) {
+            diff_tab.local_action_in_flight = true;
+        }
+        cx.notify();
+    }
+
+    pub fn create_repository_branch(
+        &mut self,
+        project_id: &str,
+        source_branch_name: String,
+        new_branch_name: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(scope_root) = self
+            .repository_graph_tabs
+            .get(project_id)
+            .map(|tab| tab.scope_root.clone())
+        else {
+            return;
+        };
+        if self.repository_toolbar_action_in_flight(&scope_root) {
+            if let Some(tab) = self.repository_graph_tabs.get_mut(project_id) {
+                tab.action_banner = Some(ActionBanner {
+                    kind: ActionBannerKind::Warning,
+                    message: "Another git action is already running for this checkout.".to_string(),
+                });
+            }
+            cx.notify();
+            return;
+        }
+
+        if !self.services.git.create_local_branch(
+            &scope_root,
+            source_branch_name.clone(),
+            new_branch_name.clone(),
+        ) {
+            if let Some(tab) = self.repository_graph_tabs.get_mut(project_id) {
+                tab.action_banner = Some(ActionBanner {
+                    kind: ActionBannerKind::Warning,
+                    message: "Another git action is already running for this checkout.".to_string(),
+                });
+            }
+            cx.notify();
+            return;
+        }
+
+        if let Some(tab) = self.repository_graph_tabs.get_mut(project_id) {
+            tab.active_branch_action = Some(RepositoryBranchAction::Create {
+                source_branch_name,
+                new_branch_name,
+            });
+            tab.action_banner = None;
+        }
+        if let Some(diff_tab) = self.diff_tabs.get_mut(&scope_root) {
+            diff_tab.local_action_in_flight = true;
+        }
+        cx.notify();
+    }
+
+    pub fn delete_repository_branch(
+        &mut self,
+        project_id: &str,
+        branch_name: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(scope_root) = self
+            .repository_graph_tabs
+            .get(project_id)
+            .map(|tab| tab.scope_root.clone())
+        else {
+            return;
+        };
+        if self.repository_toolbar_action_in_flight(&scope_root) {
+            if let Some(tab) = self.repository_graph_tabs.get_mut(project_id) {
+                tab.action_banner = Some(ActionBanner {
+                    kind: ActionBannerKind::Warning,
+                    message: "Another git action is already running for this checkout.".to_string(),
+                });
+            }
+            cx.notify();
+            return;
+        }
+
+        if !self
+            .services
+            .git
+            .delete_local_branch(&scope_root, branch_name.clone())
+        {
+            if let Some(tab) = self.repository_graph_tabs.get_mut(project_id) {
+                tab.action_banner = Some(ActionBanner {
+                    kind: ActionBannerKind::Warning,
+                    message: "Another git action is already running for this checkout.".to_string(),
+                });
+            }
+            cx.notify();
+            return;
+        }
+
+        if let Some(tab) = self.repository_graph_tabs.get_mut(project_id) {
+            tab.active_branch_action = Some(RepositoryBranchAction::Delete { branch_name });
+            tab.action_banner = None;
+        }
+        if let Some(diff_tab) = self.diff_tabs.get_mut(&scope_root) {
+            diff_tab.local_action_in_flight = true;
+        }
+        cx.notify();
+    }
+
+    pub fn dismiss_repository_action_banner(&mut self, project_id: &str, cx: &mut Context<Self>) {
+        if let Some(tab) = self.repository_graph_tabs.get_mut(project_id) {
+            if tab.action_banner.take().is_some() {
+                cx.notify();
+            }
+        }
+    }
+
+    fn start_repository_fetch(&mut self, project_id: &str, origin: GitFetchOrigin) -> bool {
+        let Some(scope_root) = self
+            .repository_graph_tabs
+            .get(project_id)
+            .map(|tab| tab.scope_root.clone())
+        else {
+            return false;
+        };
+
+        if self.scope_git_action_in_flight(&scope_root) {
+            if origin == GitFetchOrigin::Manual {
+                if let Some(tab) = self.repository_graph_tabs.get_mut(project_id) {
+                    tab.action_banner = Some(ActionBanner {
+                        kind: ActionBannerKind::Warning,
+                        message: "Another git action is already running for this checkout."
+                            .to_string(),
+                    });
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        if !self.services.git.fetch_repo(&scope_root, origin) {
+            if origin == GitFetchOrigin::Manual {
+                if let Some(tab) = self.repository_graph_tabs.get_mut(project_id) {
+                    tab.action_banner = Some(ActionBanner {
+                        kind: ActionBannerKind::Warning,
+                        message: "Another git action is already running for this checkout."
+                            .to_string(),
+                    });
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        if let Some(tab) = self.repository_graph_tabs.get_mut(project_id) {
+            tab.fetch_in_flight = true;
+            tab.active_fetch_origin = Some(origin);
+            if origin == GitFetchOrigin::Manual {
+                tab.action_banner = None;
+            }
+        }
+        if origin == GitFetchOrigin::Manual {
+            if let Some(diff_tab) = self.diff_tabs.get_mut(&scope_root) {
+                diff_tab.remote_op_in_flight = true;
+            }
+        }
+        true
+    }
+
+    fn repository_auto_fetch_due(&self, project_id: &str, now: SystemTime) -> bool {
+        let Some(tab) = self.repository_graph_tabs.get(project_id) else {
+            return false;
+        };
+        if tab.fetch_in_flight || tab.active_branch_action.is_some() {
+            return false;
+        }
+        if !self.repository_scope_may_have_remotes(tab) {
+            return false;
+        }
+        if let Some(last_failure) = tab.last_automatic_fetch_failure_at {
+            if now
+                .duration_since(last_failure)
+                .is_ok_and(|elapsed| elapsed < REPOSITORY_AUTO_FETCH_FAILURE_COOLDOWN)
+            {
+                return false;
+            }
+        }
+        tab.last_remote_check_at.is_none_or(|last_check| {
+            now.duration_since(last_check)
+                .is_ok_and(|elapsed| elapsed >= REPOSITORY_AUTO_FETCH_INTERVAL)
+        })
+    }
+
+    fn repository_scope_may_have_remotes(&self, tab: &RepositoryGraphTabState) -> bool {
+        let graph_has_remote_signal = tab.graph.document.as_ref().is_some_and(|graph| {
+            !graph.remote_branches.is_empty()
+                || graph
+                    .local_branches
+                    .iter()
+                    .any(|branch| branch.upstream.is_some())
+        });
+
+        match self.git_scopes.get(&tab.scope_root) {
+            Some(snapshot) if !snapshot.remotes.is_empty() => true,
+            Some(_) => graph_has_remote_signal,
+            None => true,
+        }
+    }
+
     pub fn focus_auxiliary_tab(&mut self, tab_id: &str, cx: &mut Context<Self>) {
         if self.focus_auxiliary_tab_internal(tab_id) {
+            self.tick_repository_auto_fetch(cx);
             cx.notify();
         }
     }
@@ -788,6 +1480,7 @@ impl WorkspaceState {
         };
         // Validate the selection exists in the correct section.
         let files = match selection.section {
+            DiffSectionKind::Conflicted => &index_document.conflicted_files,
             DiffSectionKind::Staged => &index_document.staged_files,
             DiffSectionKind::Unstaged => &index_document.unstaged_files,
         };
@@ -812,10 +1505,253 @@ impl WorkspaceState {
         cx.notify();
     }
 
+    fn reload_conflict_document(
+        &mut self,
+        scope_root: &Path,
+        generation: u64,
+        selection: &DiffSelectionKey,
+        preserve_editor_state: bool,
+    ) {
+        let Some(diff_tab) = self.diff_tabs.get_mut(scope_root) else {
+            return;
+        };
+        let Some(index_document) = diff_tab.index.document.as_ref() else {
+            return;
+        };
+        let Some(file) = index_document
+            .conflicted_files
+            .iter()
+            .find(|file| file.relative_path == selection.relative_path)
+            .cloned()
+        else {
+            diff_tab
+                .conflict_editor
+                .documents
+                .remove(&selection.relative_path);
+            return;
+        };
+
+        let prior_document = diff_tab
+            .conflict_editor
+            .documents
+            .get(&selection.relative_path)
+            .and_then(|state| match state {
+                ConflictDocumentState::Loaded(document) => Some(document.clone()),
+                ConflictDocumentState::Unavailable(_) => None,
+            })
+            .filter(|_| preserve_editor_state);
+
+        let next_state = if file.is_binary {
+            ConflictDocumentState::Unavailable(ConflictUnavailableState {
+                generation,
+                selection: selection.clone(),
+                file,
+                message: "Binary conflicted files cannot be edited in OrcaShell.".to_string(),
+            })
+        } else {
+            let file_path = scope_root.join(&selection.relative_path);
+            match fs::read(&file_path) {
+                Ok(bytes) if bytes.len() > MAX_RENDERED_DIFF_BYTES => {
+                    ConflictDocumentState::Unavailable(ConflictUnavailableState {
+                        generation,
+                        selection: selection.clone(),
+                        file,
+                        message: "This conflicted file is too large to edit in OrcaShell."
+                            .to_string(),
+                    })
+                }
+                Ok(bytes) => match String::from_utf8(bytes) {
+                    Ok(text) if count_text_lines(&text) > MAX_RENDERED_DIFF_LINES => {
+                        ConflictDocumentState::Unavailable(ConflictUnavailableState {
+                            generation,
+                            selection: selection.clone(),
+                            file,
+                            message: "This conflicted file is too large to edit in OrcaShell."
+                                .to_string(),
+                        })
+                    }
+                    Ok(text) => ConflictDocumentState::Loaded(merge_conflict_document_from_text(
+                        generation,
+                        selection.clone(),
+                        file,
+                        text,
+                        prior_document.as_ref(),
+                        false,
+                    )),
+                    Err(_) => ConflictDocumentState::Unavailable(ConflictUnavailableState {
+                        generation,
+                        selection: selection.clone(),
+                        file,
+                        message: "This conflicted file is not UTF-8 text.".to_string(),
+                    }),
+                },
+                Err(error) => ConflictDocumentState::Unavailable(ConflictUnavailableState {
+                    generation,
+                    selection: selection.clone(),
+                    file,
+                    message: unreadable_conflict_message(&error),
+                }),
+            }
+        };
+
+        diff_tab
+            .conflict_editor
+            .documents
+            .insert(selection.relative_path.clone(), next_state);
+    }
+
+    fn validate_conflict_path_for_resolution(
+        &self,
+        scope_root: &Path,
+        selection: &DiffSelectionKey,
+    ) -> Result<(), String> {
+        let Some(diff_tab) = self.diff_tabs.get(scope_root) else {
+            return Err("The diff tab is no longer available.".to_string());
+        };
+        let Some(index_document) = diff_tab.index.document.as_ref() else {
+            return Err("The conflicted file list is unavailable.".to_string());
+        };
+        let Some(file) = index_document
+            .conflicted_files
+            .iter()
+            .find(|file| file.relative_path == selection.relative_path)
+        else {
+            return Err(format!(
+                "{} is no longer conflicted.",
+                selection.relative_path.display()
+            ));
+        };
+
+        if let Some(state) = diff_tab
+            .conflict_editor
+            .documents
+            .get(&selection.relative_path)
+        {
+            match state {
+                ConflictDocumentState::Loaded(document) => {
+                    if document.is_dirty {
+                        return Err(format!(
+                            "Save {} before marking it resolved.",
+                            selection.relative_path.display()
+                        ));
+                    }
+                    if document.parse_error.is_some() {
+                        return Err(format!(
+                            "{} still contains malformed conflict markers.",
+                            selection.relative_path.display()
+                        ));
+                    }
+                    if !document.blocks.is_empty() {
+                        return Err(format!(
+                            "{} still contains conflict markers.",
+                            selection.relative_path.display()
+                        ));
+                    }
+                    return Ok(());
+                }
+                ConflictDocumentState::Unavailable(unavailable) => {
+                    return Err(format!(
+                        "{} cannot be marked resolved from OrcaShell: {}",
+                        selection.relative_path.display(),
+                        unavailable.message
+                    ));
+                }
+            }
+        }
+
+        if file.is_binary {
+            return Err(format!(
+                "{} cannot be marked resolved from OrcaShell because it is binary.",
+                selection.relative_path.display()
+            ));
+        }
+
+        let file_path = scope_root.join(&selection.relative_path);
+        let bytes = fs::read(&file_path).map_err(|error| unreadable_conflict_message(&error))?;
+        if bytes.len() > MAX_RENDERED_DIFF_BYTES {
+            return Err(format!(
+                "{} is too large to validate in OrcaShell.",
+                selection.relative_path.display()
+            ));
+        }
+        let text = String::from_utf8(bytes)
+            .map_err(|_| format!("{} is not UTF-8 text.", selection.relative_path.display()))?;
+        if count_text_lines(&text) > MAX_RENDERED_DIFF_LINES {
+            return Err(format!(
+                "{} is too large to validate in OrcaShell.",
+                selection.relative_path.display()
+            ));
+        }
+        let parsed = parse_conflict_file_text(&text).map_err(|_| {
+            format!(
+                "{} still contains malformed conflict markers.",
+                selection.relative_path.display()
+            )
+        })?;
+        if !parsed.blocks.is_empty() {
+            return Err(format!(
+                "{} still contains conflict markers.",
+                selection.relative_path.display()
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn conflict_resolution_targets(&self, scope_root: &Path) -> Vec<DiffSelectionKey> {
+        let Some(diff_tab) = self.diff_tabs.get(scope_root) else {
+            return Vec::new();
+        };
+
+        let mut selections: Vec<DiffSelectionKey> = diff_tab
+            .multi_select
+            .iter()
+            .filter(|selection| selection.section == DiffSectionKind::Conflicted)
+            .cloned()
+            .collect();
+        if !selections.is_empty() {
+            selections.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+            return selections;
+        }
+
+        diff_tab
+            .selected_file
+            .as_ref()
+            .filter(|selection| selection.section == DiffSectionKind::Conflicted)
+            .cloned()
+            .into_iter()
+            .collect()
+    }
+
+    pub(crate) fn can_mark_conflicts_resolved(&self, scope_root: &Path) -> bool {
+        let Some(diff_tab) = self.diff_tabs.get(scope_root) else {
+            return false;
+        };
+        if Self::any_action_in_flight(diff_tab) {
+            return false;
+        }
+        if diff_tab.index.document.as_ref().is_some_and(|document| {
+            document.merge_state.is_none() && document.repo_state_warning.is_some()
+        }) {
+            return false;
+        }
+
+        let selections = self.conflict_resolution_targets(scope_root);
+        !selections.is_empty()
+            && selections.iter().all(|selection| {
+                self.validate_conflict_path_for_resolution(scope_root, selection)
+                    .is_ok()
+            })
+    }
+
     // ── Diff tab action dispatch ───────────────────────────────────────
 
     fn any_action_in_flight(tab: &DiffTabState) -> bool {
         tab.local_action_in_flight || tab.remote_op_in_flight
+    }
+
+    fn is_unsupported_discard_status(status: GitFileStatus) -> bool {
+        matches!(status, GitFileStatus::Renamed | GitFileStatus::Typechange)
     }
 
     pub fn stage_all(&mut self, scope_root: &Path, cx: &mut Context<Self>) {
@@ -854,7 +1790,7 @@ impl WorkspaceState {
         let paths: Vec<PathBuf> = diff_tab
             .multi_select
             .iter()
-            .filter(|k| k.section == DiffSectionKind::Unstaged)
+            .filter(|k| matches!(k.section, DiffSectionKind::Unstaged))
             .map(|k| k.relative_path.clone())
             .collect();
         if paths.is_empty() {
@@ -912,6 +1848,78 @@ impl WorkspaceState {
         cx.notify();
     }
 
+    pub fn discard_all_unstaged(&mut self, scope_root: &Path, cx: &mut Context<Self>) {
+        let outcome = {
+            let Some(diff_tab) = self.diff_tabs.get(scope_root) else {
+                return;
+            };
+            if Self::any_action_in_flight(diff_tab) {
+                return;
+            }
+            let Some(index_document) = diff_tab.index.document.as_ref() else {
+                return;
+            };
+            if index_document.merge_state.is_some() {
+                Err("Discard actions are unavailable while a merge is active.".to_string())
+            } else if let Some(warning) = index_document.repo_state_warning.as_ref() {
+                Err(warning.clone())
+            } else if index_document.unstaged_files.is_empty() {
+                Ok(false)
+            } else {
+                Ok(true)
+            }
+        };
+
+        match outcome {
+            Ok(true) => {
+                if let Some(diff_tab) = self.diff_tabs.get_mut(scope_root) {
+                    diff_tab.local_action_in_flight = true;
+                }
+                self.services.git.discard_all_unstaged(scope_root);
+                cx.notify();
+            }
+            Ok(false) => {}
+            Err(message) => self.show_diff_action_warning(scope_root, message, cx),
+        }
+    }
+
+    pub fn discard_selected_file(&mut self, scope_root: &Path, cx: &mut Context<Self>) {
+        let outcome = self.validate_discard_selected_file(scope_root);
+        match outcome {
+            Ok(relative_path) => {
+                if let Some(diff_tab) = self.diff_tabs.get_mut(scope_root) {
+                    diff_tab.local_action_in_flight = true;
+                }
+                self.services
+                    .git
+                    .discard_unstaged_file(scope_root, relative_path);
+                cx.notify();
+            }
+            Err(message) => self.show_diff_action_warning(scope_root, message, cx),
+        }
+    }
+
+    pub fn discard_selected_hunk(
+        &mut self,
+        scope_root: &Path,
+        hunk_index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let outcome = self.validate_discard_selected_hunk(scope_root, hunk_index);
+        match outcome {
+            Ok((relative_path, target)) => {
+                if let Some(diff_tab) = self.diff_tabs.get_mut(scope_root) {
+                    diff_tab.local_action_in_flight = true;
+                }
+                self.services
+                    .git
+                    .discard_unstaged_hunk(scope_root, relative_path, target);
+                cx.notify();
+            }
+            Err(message) => self.show_diff_action_warning(scope_root, message, cx),
+        }
+    }
+
     pub fn commit_staged(&mut self, scope_root: &Path, cx: &mut Context<Self>) {
         let Some(diff_tab) = self.diff_tabs.get_mut(scope_root) else {
             return;
@@ -933,6 +1941,115 @@ impl WorkspaceState {
         }
         diff_tab.local_action_in_flight = true;
         self.services.git.commit_staged(scope_root, message);
+        cx.notify();
+    }
+
+    pub fn enter_stash_mode(&mut self, scope_root: &Path, cx: &mut Context<Self>) {
+        let Some(diff_tab) = self.diff_tabs.get_mut(scope_root) else {
+            return;
+        };
+        diff_tab.view_mode = DiffTabViewMode::Stashes;
+        cx.notify();
+        self.request_stash_list(scope_root);
+    }
+
+    pub fn exit_stash_mode(&mut self, scope_root: &Path, cx: &mut Context<Self>) {
+        let Some(diff_tab) = self.diff_tabs.get_mut(scope_root) else {
+            return;
+        };
+        diff_tab.view_mode = DiffTabViewMode::WorkingTree;
+        cx.notify();
+    }
+
+    pub fn select_stash(&mut self, scope_root: &Path, stash_oid: Oid, cx: &mut Context<Self>) {
+        let Some(diff_tab) = self.diff_tabs.get_mut(scope_root) else {
+            return;
+        };
+        diff_tab.view_mode = DiffTabViewMode::Stashes;
+        diff_tab.stash.expanded_stash = Some(stash_oid);
+        cx.notify();
+        self.request_stash_detail(scope_root, stash_oid);
+    }
+
+    pub fn select_stash_file(
+        &mut self,
+        scope_root: &Path,
+        selection: StashFileSelection,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(diff_tab) = self.diff_tabs.get_mut(scope_root) else {
+            return;
+        };
+        diff_tab.view_mode = DiffTabViewMode::Stashes;
+        diff_tab.stash.expanded_stash = Some(selection.stash_oid);
+        diff_tab.stash.selected_stash = Some(selection.stash_oid);
+        cx.notify();
+        self.request_stash_file_diff(scope_root, selection);
+    }
+
+    pub fn create_stash(
+        &mut self,
+        scope_root: &Path,
+        message: Option<String>,
+        keep_index: bool,
+        include_untracked: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(diff_tab) = self.diff_tabs.get_mut(scope_root) else {
+            return;
+        };
+        if Self::any_action_in_flight(diff_tab) {
+            return;
+        }
+        diff_tab.local_action_in_flight = true;
+        self.services
+            .git
+            .create_stash(scope_root, message, keep_index, include_untracked);
+        cx.notify();
+    }
+
+    pub fn apply_selected_stash(&mut self, scope_root: &Path, cx: &mut Context<Self>) {
+        let Some(stash_oid) = self.selected_stash_oid(scope_root) else {
+            return;
+        };
+        let Some(diff_tab) = self.diff_tabs.get_mut(scope_root) else {
+            return;
+        };
+        if Self::any_action_in_flight(diff_tab) {
+            return;
+        }
+        diff_tab.local_action_in_flight = true;
+        self.services.git.apply_stash(scope_root, stash_oid);
+        cx.notify();
+    }
+
+    pub fn pop_selected_stash(&mut self, scope_root: &Path, cx: &mut Context<Self>) {
+        let Some(stash_oid) = self.selected_stash_oid(scope_root) else {
+            return;
+        };
+        let Some(diff_tab) = self.diff_tabs.get_mut(scope_root) else {
+            return;
+        };
+        if Self::any_action_in_flight(diff_tab) {
+            return;
+        }
+        diff_tab.local_action_in_flight = true;
+        self.services.git.pop_stash(scope_root, stash_oid);
+        cx.notify();
+    }
+
+    pub fn drop_selected_stash(&mut self, scope_root: &Path, cx: &mut Context<Self>) {
+        let Some(stash_oid) = self.selected_stash_oid(scope_root) else {
+            return;
+        };
+        let Some(diff_tab) = self.diff_tabs.get_mut(scope_root) else {
+            return;
+        };
+        if Self::any_action_in_flight(diff_tab) {
+            return;
+        }
+        diff_tab.local_action_in_flight = true;
+        self.services.git.drop_stash(scope_root, stash_oid);
         cx.notify();
     }
 
@@ -960,6 +2077,25 @@ impl WorkspaceState {
         cx.notify();
     }
 
+    pub fn dispatch_publish(
+        &mut self,
+        scope_root: &Path,
+        remote_name: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(diff_tab) = self.diff_tabs.get_mut(scope_root) else {
+            return;
+        };
+        if Self::any_action_in_flight(diff_tab) {
+            return;
+        }
+        diff_tab.remote_op_in_flight = true;
+        self.services
+            .git
+            .publish_current_branch(scope_root, remote_name);
+        cx.notify();
+    }
+
     pub fn dispatch_merge_back(&mut self, scope_root: &Path, cx: &mut Context<Self>) {
         let Some(diff_tab) = self.diff_tabs.get(scope_root) else {
             return;
@@ -977,6 +2113,362 @@ impl WorkspaceState {
             .git
             .merge_managed_branch(scope_root, source_ref);
         cx.notify();
+    }
+
+    pub fn dispatch_complete_merge(&mut self, scope_root: &Path, cx: &mut Context<Self>) {
+        let Some(diff_tab) = self.diff_tabs.get_mut(scope_root) else {
+            return;
+        };
+        if Self::any_action_in_flight(diff_tab)
+            || diff_tab
+                .index
+                .document
+                .as_ref()
+                .and_then(|document| document.merge_state.as_ref())
+                .is_none_or(|merge_state| !merge_state.can_complete)
+        {
+            return;
+        }
+        diff_tab.local_action_in_flight = true;
+        self.services.git.complete_merge(scope_root);
+        cx.notify();
+    }
+
+    pub fn dispatch_abort_merge(&mut self, scope_root: &Path, cx: &mut Context<Self>) {
+        let Some(diff_tab) = self.diff_tabs.get_mut(scope_root) else {
+            return;
+        };
+        if Self::any_action_in_flight(diff_tab)
+            || diff_tab
+                .index
+                .document
+                .as_ref()
+                .and_then(|document| document.merge_state.as_ref())
+                .is_none_or(|merge_state| !merge_state.can_abort)
+        {
+            return;
+        }
+        diff_tab.local_action_in_flight = true;
+        self.services.git.abort_merge(scope_root);
+        cx.notify();
+    }
+
+    pub fn save_conflict_document(&mut self, scope_root: &Path, cx: &mut Context<Self>) {
+        let Some(selection) = self
+            .diff_tabs
+            .get(scope_root)
+            .and_then(|tab| tab.selected_file.clone())
+        else {
+            return;
+        };
+        if selection.section != DiffSectionKind::Conflicted {
+            return;
+        }
+
+        let (current_generation, state) = {
+            let Some(diff_tab) = self.diff_tabs.get(scope_root) else {
+                return;
+            };
+            if Self::any_action_in_flight(diff_tab) {
+                return;
+            }
+            (
+                diff_tab
+                    .index
+                    .document
+                    .as_ref()
+                    .map(|document| document.snapshot.generation),
+                diff_tab
+                    .conflict_editor
+                    .documents
+                    .get(&selection.relative_path)
+                    .cloned(),
+            )
+        };
+
+        let Some(ConflictDocumentState::Loaded(document)) = state else {
+            if let Some(diff_tab) = self.diff_tabs.get_mut(scope_root) {
+                diff_tab.last_action_banner = Some(ActionBanner {
+                    kind: ActionBannerKind::Warning,
+                    message: "This conflicted file cannot be edited in OrcaShell.".to_string(),
+                });
+                cx.notify();
+            }
+            return;
+        };
+
+        let file_path = scope_root.join(&selection.relative_path);
+        if let Err(error) = fs::write(&file_path, document.raw_text.as_bytes()) {
+            if let Some(diff_tab) = self.diff_tabs.get_mut(scope_root) {
+                diff_tab.last_action_banner = Some(ActionBanner {
+                    kind: ActionBannerKind::Error,
+                    message: format!(
+                        "Could not save {}: {error}",
+                        selection.relative_path.display()
+                    ),
+                });
+                cx.notify();
+            }
+            return;
+        }
+
+        self.reload_conflict_document(
+            scope_root,
+            current_generation.unwrap_or(document.generation),
+            &selection,
+            true,
+        );
+        self.services.git.request_snapshot(scope_root, None);
+
+        if let Some(diff_tab) = self.diff_tabs.get_mut(scope_root) {
+            let banner = match diff_tab
+                .conflict_editor
+                .documents
+                .get(&selection.relative_path)
+            {
+                Some(ConflictDocumentState::Loaded(saved)) if saved.parse_error.is_some() => {
+                    ActionBanner {
+                        kind: ActionBannerKind::Warning,
+                        message: format!(
+                            "Saved {}, but the conflict markers are malformed.",
+                            selection.relative_path.display()
+                        ),
+                    }
+                }
+                Some(ConflictDocumentState::Loaded(saved)) if saved.blocks.is_empty() => {
+                    ActionBanner {
+                        kind: ActionBannerKind::Success,
+                        message: format!(
+                            "Saved {}. It can now be marked resolved.",
+                            selection.relative_path.display()
+                        ),
+                    }
+                }
+                Some(ConflictDocumentState::Loaded(_)) => ActionBanner {
+                    kind: ActionBannerKind::Success,
+                    message: format!("Saved {}.", selection.relative_path.display()),
+                },
+                Some(ConflictDocumentState::Unavailable(unavailable)) => ActionBanner {
+                    kind: ActionBannerKind::Warning,
+                    message: unavailable.message.clone(),
+                },
+                None => ActionBanner {
+                    kind: ActionBannerKind::Success,
+                    message: format!("Saved {}.", selection.relative_path.display()),
+                },
+            };
+            diff_tab.last_action_banner = Some(banner);
+            cx.notify();
+        }
+    }
+
+    pub fn reset_conflict_document(&mut self, scope_root: &Path, cx: &mut Context<Self>) {
+        let Some(selection) = self
+            .diff_tabs
+            .get(scope_root)
+            .and_then(|tab| tab.selected_file.clone())
+        else {
+            return;
+        };
+        if selection.section != DiffSectionKind::Conflicted {
+            return;
+        }
+
+        let (current_generation, state) = {
+            let Some(diff_tab) = self.diff_tabs.get(scope_root) else {
+                return;
+            };
+            if Self::any_action_in_flight(diff_tab) {
+                return;
+            }
+            (
+                diff_tab
+                    .index
+                    .document
+                    .as_ref()
+                    .map(|document| document.snapshot.generation),
+                diff_tab
+                    .conflict_editor
+                    .documents
+                    .get(&selection.relative_path)
+                    .cloned(),
+            )
+        };
+
+        let Some(ConflictDocumentState::Loaded(document)) = state else {
+            return;
+        };
+        if document.raw_text == document.initial_raw_text {
+            return;
+        }
+
+        let file_path = scope_root.join(&selection.relative_path);
+        if let Err(error) = fs::write(&file_path, document.initial_raw_text.as_bytes()) {
+            if let Some(diff_tab) = self.diff_tabs.get_mut(scope_root) {
+                diff_tab.last_action_banner = Some(ActionBanner {
+                    kind: ActionBannerKind::Error,
+                    message: format!(
+                        "Could not reset {}: {error}",
+                        selection.relative_path.display()
+                    ),
+                });
+                cx.notify();
+            }
+            return;
+        }
+
+        self.reload_conflict_document(
+            scope_root,
+            current_generation.unwrap_or(document.generation),
+            &selection,
+            false,
+        );
+        self.services.git.request_snapshot(scope_root, None);
+
+        if let Some(diff_tab) = self.diff_tabs.get_mut(scope_root) {
+            diff_tab.last_action_banner = Some(ActionBanner {
+                kind: ActionBannerKind::Success,
+                message: format!(
+                    "Reset {} to its original conflict state.",
+                    selection.relative_path.display()
+                ),
+            });
+            cx.notify();
+        }
+    }
+
+    pub fn mark_conflicts_resolved(&mut self, scope_root: &Path, cx: &mut Context<Self>) {
+        let selections: Vec<DiffSelectionKey> = {
+            let Some(diff_tab) = self.diff_tabs.get(scope_root) else {
+                return;
+            };
+            if Self::any_action_in_flight(diff_tab) {
+                return;
+            }
+            if diff_tab.index.document.as_ref().is_some_and(|document| {
+                document.merge_state.is_none() && document.repo_state_warning.is_some()
+            }) {
+                return;
+            }
+            self.conflict_resolution_targets(scope_root)
+        };
+        if selections.is_empty() {
+            return;
+        }
+
+        for selection in &selections {
+            if let Err(message) = self.validate_conflict_path_for_resolution(scope_root, selection)
+            {
+                if let Some(diff_tab) = self.diff_tabs.get_mut(scope_root) {
+                    diff_tab.last_action_banner = Some(ActionBanner {
+                        kind: ActionBannerKind::Warning,
+                        message,
+                    });
+                    cx.notify();
+                }
+                return;
+            }
+        }
+
+        if let Some(diff_tab) = self.diff_tabs.get_mut(scope_root) {
+            diff_tab.local_action_in_flight = true;
+        }
+        self.services.git.stage_paths(
+            scope_root,
+            selections
+                .into_iter()
+                .map(|selection| selection.relative_path)
+                .collect(),
+        );
+        cx.notify();
+    }
+
+    pub fn show_diff_action_warning(
+        &mut self,
+        scope_root: &Path,
+        message: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(diff_tab) = self.diff_tabs.get_mut(scope_root) else {
+            return;
+        };
+        diff_tab.last_action_banner = Some(ActionBanner {
+            kind: ActionBannerKind::Warning,
+            message,
+        });
+        cx.notify();
+    }
+
+    fn validate_discard_selected_file(&self, scope_root: &Path) -> Result<PathBuf, String> {
+        let Some(diff_tab) = self.diff_tabs.get(scope_root) else {
+            return Err("Diff tab is no longer available.".to_string());
+        };
+        if Self::any_action_in_flight(diff_tab) {
+            return Err("Another git action is already in progress.".to_string());
+        }
+        let Some(index_document) = diff_tab.index.document.as_ref() else {
+            return Err("The diff index is not loaded yet.".to_string());
+        };
+        if index_document.merge_state.is_some() {
+            return Err("Discard actions are unavailable while a merge is active.".to_string());
+        }
+        if let Some(warning) = index_document.repo_state_warning.as_ref() {
+            return Err(warning.clone());
+        }
+        let Some(selection) = diff_tab.selected_file.as_ref() else {
+            return Err("No file is selected.".to_string());
+        };
+        if selection.section != DiffSectionKind::Unstaged {
+            return Err("Discard actions only apply to unstaged file diffs.".to_string());
+        }
+        let Some(file_document) = diff_tab.file.document.as_ref() else {
+            return Err("The selected file diff is not ready yet.".to_string());
+        };
+        if file_document.selection != *selection {
+            return Err("The selected file diff is being refreshed.".to_string());
+        }
+        let latest_generation = self
+            .git_scopes
+            .get(scope_root)
+            .map(|snapshot| snapshot.generation);
+        if latest_generation.is_some_and(|generation| file_document.generation < generation) {
+            return Err(
+                "Displayed diff is stale. Wait for refresh to finish and try again.".to_string(),
+            );
+        }
+        if Self::is_unsupported_discard_status(file_document.file.status) {
+            return Err(
+                "Discard File is unavailable for renamed or typechanged files.".to_string(),
+            );
+        }
+        Ok(selection.relative_path.clone())
+    }
+
+    fn validate_discard_selected_hunk(
+        &self,
+        scope_root: &Path,
+        hunk_index: usize,
+    ) -> Result<(PathBuf, DiscardHunkTarget), String> {
+        let relative_path = self.validate_discard_selected_file(scope_root)?;
+        let Some(diff_tab) = self.diff_tabs.get(scope_root) else {
+            return Err("Diff tab is no longer available.".to_string());
+        };
+        let Some(file_document) = diff_tab.file.document.as_ref() else {
+            return Err("The selected file diff is not ready yet.".to_string());
+        };
+        if Self::is_unsupported_discard_status(file_document.file.status) {
+            return Err(
+                "Discard Hunk is unavailable for renamed or typechanged files.".to_string(),
+            );
+        }
+        let Some(target) = file_document.discard_hunk_target(hunk_index) else {
+            return Err(format!(
+                "Hunk {} is no longer available in {}.",
+                hunk_index,
+                relative_path.display()
+            ));
+        };
+        Ok((relative_path, target))
     }
 
     pub fn begin_remove_worktree_confirm(&mut self, scope_root: &Path, cx: &mut Context<Self>) {
@@ -1060,6 +2552,10 @@ impl WorkspaceState {
             diff_tab.last_action_banner = None;
             cx.notify();
         }
+    }
+
+    fn selected_stash_oid(&self, scope_root: &Path) -> Option<Oid> {
+        self.diff_tabs.get(scope_root)?.stash.selected_stash
     }
 
     // ── Diff tab multi-select ───────────────────────────────────────────
@@ -1195,6 +2691,31 @@ impl WorkspaceState {
         true
     }
 
+    fn open_or_focus_repository_graph_tab_internal(&mut self, project_id: &str) -> bool {
+        let Some(project_name) = self.project(project_id).map(|project| project.name.clone())
+        else {
+            return false;
+        };
+
+        let tab_id = Self::repository_graph_tab_id(project_id);
+        let title = Self::repository_graph_title(&project_name);
+        if let Some(tab) = self.auxiliary_tabs.iter_mut().find(|tab| tab.id == tab_id) {
+            tab.title = title;
+        } else {
+            self.auxiliary_tabs.push(AuxiliaryTabState {
+                id: tab_id.clone(),
+                title,
+                kind: AuxiliaryTabKind::RepositoryGraph {
+                    project_id: project_id.to_string(),
+                },
+            });
+        }
+
+        self.ensure_repository_graph_state(project_id);
+        self.active_auxiliary_tab_id = Some(tab_id);
+        true
+    }
+
     fn open_or_focus_diff_tab_internal(
         &mut self,
         scope_root: PathBuf,
@@ -1238,6 +2759,7 @@ impl WorkspaceState {
         self.active_auxiliary_tab_id = Some(tab_id);
         self.services.git.request_snapshot(&scope_root, None);
         self.request_diff_index_refresh(&scope_root);
+        self.request_stash_list(&scope_root);
         true
     }
 
@@ -1264,11 +2786,12 @@ impl WorkspaceState {
         match event {
             GitEvent::SnapshotUpdated {
                 terminal_ids,
+                request_path,
                 scope_root,
                 result,
                 ..
             } => {
-                self.apply_snapshot_update(terminal_ids, scope_root, result);
+                self.apply_snapshot_update(terminal_ids, request_path, scope_root, result);
                 cx.notify();
             }
             GitEvent::ManagedWorktreeCreated {
@@ -1356,6 +2879,68 @@ impl WorkspaceState {
                 self.apply_file_diff_update(scope_root, generation, selection, result);
                 cx.notify();
             }
+            GitEvent::RepositoryGraphLoaded {
+                scope_root,
+                request_revision,
+                result,
+            } => {
+                self.apply_repository_graph_update(scope_root, request_revision, result);
+                cx.notify();
+            }
+            GitEvent::CommitDetailLoaded {
+                scope_root,
+                oid,
+                request_revision,
+                result,
+            } => {
+                self.apply_repository_commit_detail_update(
+                    scope_root,
+                    oid,
+                    request_revision,
+                    result,
+                );
+                cx.notify();
+            }
+            GitEvent::CommitFileDiffLoaded {
+                scope_root,
+                selection,
+                request_revision,
+                result,
+            } => {
+                self.apply_repository_commit_file_diff_update(
+                    scope_root,
+                    selection,
+                    request_revision,
+                    result,
+                );
+                cx.notify();
+            }
+            GitEvent::StashListLoaded {
+                scope_root,
+                request_revision,
+                result,
+            } => {
+                self.apply_stash_list_update(scope_root, request_revision, result);
+                cx.notify();
+            }
+            GitEvent::StashDetailLoaded {
+                scope_root,
+                stash_oid,
+                request_revision,
+                result,
+            } => {
+                self.apply_stash_detail_update(scope_root, stash_oid, request_revision, result);
+                cx.notify();
+            }
+            GitEvent::StashFileDiffLoaded {
+                scope_root,
+                selection,
+                request_revision,
+                result,
+            } => {
+                self.apply_stash_file_diff_update(scope_root, selection, request_revision, result);
+                cx.notify();
+            }
             GitEvent::FeedCaptureCompleted {
                 project_id,
                 scope_root,
@@ -1380,13 +2965,82 @@ impl WorkspaceState {
                 self.apply_local_action_completion(scope_root, action, result);
                 cx.notify();
             }
+            GitEvent::MergeConflictEntered {
+                request_scope,
+                affected_scope,
+                conflicted_files,
+                trigger,
+            } => {
+                self.handle_merge_conflict_entered(
+                    request_scope,
+                    affected_scope,
+                    conflicted_files,
+                    trigger,
+                );
+                cx.notify();
+            }
             GitEvent::RemoteOpCompleted {
                 scope_root,
                 kind,
+                fetch_origin,
+                refresh_graph,
                 result,
             } => {
-                self.apply_remote_op_completion(scope_root, kind, result);
+                self.apply_remote_op_completion(
+                    scope_root,
+                    kind,
+                    fetch_origin,
+                    refresh_graph,
+                    result,
+                );
                 cx.notify();
+            }
+        }
+    }
+
+    fn handle_merge_conflict_entered(
+        &mut self,
+        request_scope: PathBuf,
+        affected_scope: PathBuf,
+        conflicted_files: Vec<PathBuf>,
+        trigger: MergeConflictTrigger,
+    ) {
+        if let Some(diff_tab) = self.diff_tabs.get_mut(&affected_scope) {
+            diff_tab.view_mode = DiffTabViewMode::WorkingTree;
+        }
+        let preferred_file =
+            conflicted_files
+                .first()
+                .cloned()
+                .map(|relative_path| DiffSelectionKey {
+                    section: DiffSectionKind::Conflicted,
+                    relative_path,
+                });
+
+        self.open_diff_tab_for_scope_and_file_optimistic(&affected_scope, preferred_file);
+        self.services.git.request_snapshot(&affected_scope, None);
+        self.request_diff_index_refresh(&affected_scope);
+
+        if request_scope != affected_scope {
+            if let Some(diff_tab) = self.diff_tabs.get_mut(&request_scope) {
+                let message = match trigger {
+                    MergeConflictTrigger::Pull => {
+                        "Pull conflicts opened in the affected diff tab.".to_string()
+                    }
+                    MergeConflictTrigger::MergeBack => {
+                        "Merge conflicts must be resolved in the source scope diff tab.".to_string()
+                    }
+                    MergeConflictTrigger::StashApply => {
+                        "Stash apply conflicts opened in the affected diff tab.".to_string()
+                    }
+                    MergeConflictTrigger::StashPop => {
+                        "Stash pop conflicts opened in the affected diff tab.".to_string()
+                    }
+                };
+                diff_tab.last_action_banner = Some(ActionBanner {
+                    kind: ActionBannerKind::Warning,
+                    message,
+                });
             }
         }
     }
@@ -1394,8 +3048,9 @@ impl WorkspaceState {
     fn apply_snapshot_update(
         &mut self,
         terminal_ids: Vec<String>,
+        request_path: PathBuf,
         scope_root: Option<PathBuf>,
-        result: Result<GitSnapshotSummary, String>,
+        result: Result<GitSnapshotSummary, SnapshotLoadError>,
     ) {
         match result {
             Ok(snapshot) => {
@@ -1410,14 +3065,37 @@ impl WorkspaceState {
                 self.refresh_diff_tab_if_stale(&scope_root, snapshot.generation);
                 self.refresh_live_feeds_for_scope_if_stale(&scope_root, snapshot.generation);
             }
-            Err(message) => {
-                if let Some(scope_root) = scope_root {
-                    self.mark_diff_scope_unavailable(&scope_root, message.clone());
-                    self.record_live_feed_scope_error(&scope_root, message);
-                    self.detach_scope(&scope_root);
-                }
-                for terminal_id in terminal_ids {
-                    self.detach_terminal_scope(&terminal_id);
+            Err(error) => {
+                let is_scope_refresh = terminal_ids.is_empty();
+                let scope_refresh_root = if is_scope_refresh {
+                    scope_root.clone().or_else(|| Some(request_path.clone()))
+                } else {
+                    None
+                };
+
+                match error.kind() {
+                    SnapshotLoadErrorKind::Unavailable => {
+                        if let Some(scope_root) = scope_refresh_root {
+                            let message = error.message().to_string();
+                            self.mark_diff_scope_unavailable(&scope_root, message.clone());
+                            self.record_live_feed_scope_error(&scope_root, message);
+                        }
+                    }
+                    SnapshotLoadErrorKind::NotRepository if is_scope_refresh => {
+                        if let Some(scope_root) = scope_refresh_root {
+                            let message = error.message().to_string();
+                            self.mark_diff_scope_unavailable(&scope_root, message.clone());
+                            self.record_live_feed_scope_error(&scope_root, message);
+                            if scope_root == request_path {
+                                self.detach_scope(&scope_root);
+                            }
+                        }
+                    }
+                    SnapshotLoadErrorKind::NotRepository => {
+                        for terminal_id in terminal_ids {
+                            self.detach_terminal_scope(&terminal_id);
+                        }
+                    }
                 }
             }
         }
@@ -1450,18 +3128,26 @@ impl WorkspaceState {
 
                     // Selection fallback chain per spec Section 6:
                     // 1. Same (section, path) if still exists
-                    // 2. First file in staged_files
-                    // 3. First file in unstaged_files
+                    // 2. First file in conflicted_files
+                    // 3. First file in staged_files
+                    // 4. First file in unstaged_files
                     // 4. None (empty state)
                     let selected_file = diff_tab
                         .selected_file
                         .clone()
                         .filter(|key| {
                             let files = match key.section {
+                                DiffSectionKind::Conflicted => &document.conflicted_files,
                                 DiffSectionKind::Staged => &document.staged_files,
                                 DiffSectionKind::Unstaged => &document.unstaged_files,
                             };
                             files.iter().any(|f| f.relative_path == key.relative_path)
+                        })
+                        .or_else(|| {
+                            document.conflicted_files.first().map(|f| DiffSelectionKey {
+                                section: DiffSectionKind::Conflicted,
+                                relative_path: f.relative_path.clone(),
+                            })
                         })
                         .or_else(|| {
                             document.staged_files.first().map(|f| DiffSelectionKey {
@@ -1479,11 +3165,21 @@ impl WorkspaceState {
                     // Prune stale keys from multi_select
                     diff_tab.multi_select.retain(|key| {
                         let files = match key.section {
+                            DiffSectionKind::Conflicted => &document.conflicted_files,
                             DiffSectionKind::Staged => &document.staged_files,
                             DiffSectionKind::Unstaged => &document.unstaged_files,
                         };
                         files.iter().any(|f| f.relative_path == key.relative_path)
                     });
+                    let conflicted_paths = document
+                        .conflicted_files
+                        .iter()
+                        .map(|file| file.relative_path.clone())
+                        .collect::<HashSet<_>>();
+                    diff_tab
+                        .conflict_editor
+                        .documents
+                        .retain(|path, _| conflicted_paths.contains(path));
 
                     diff_tab.index.document = Some(document);
                     diff_tab.selected_file = selected_file.clone();
@@ -1545,12 +3241,439 @@ impl WorkspaceState {
         }
     }
 
+    fn apply_repository_graph_update(
+        &mut self,
+        scope_root: PathBuf,
+        request_revision: u64,
+        result: Result<RepositoryGraphDocument, String>,
+    ) {
+        let project_ids: Vec<String> = self
+            .repository_graph_tabs
+            .iter()
+            .filter(|(_, tab)| tab.scope_root == scope_root)
+            .map(|(project_id, _)| project_id.clone())
+            .collect();
+        if project_ids.is_empty() {
+            return;
+        }
+
+        let mut detail_requests = Vec::new();
+        match result {
+            Ok(document) => {
+                let occupied_local_branches =
+                    self.load_repository_branch_occupancy(&document.repo_root);
+                for project_id in project_ids {
+                    let Some(tab) = self.repository_graph_tabs.get_mut(&project_id) else {
+                        continue;
+                    };
+                    if request_revision != REPOSITORY_GRAPH_AUTO_REFRESH_REVISION
+                        && request_revision < tab.graph.requested_revision
+                    {
+                        continue;
+                    }
+
+                    tab.scope_root = document.scope_root.clone();
+                    tab.graph.document = Some(document.clone());
+                    tab.graph.error = None;
+                    tab.graph.loading = false;
+                    tab.occupied_local_branches = occupied_local_branches.clone();
+
+                    if let Some(oid) = Self::reconcile_repository_graph_selection(tab) {
+                        detail_requests.push((project_id.clone(), oid));
+                    }
+                }
+            }
+            Err(message) => {
+                for project_id in project_ids {
+                    let Some(tab) = self.repository_graph_tabs.get_mut(&project_id) else {
+                        continue;
+                    };
+                    if request_revision != REPOSITORY_GRAPH_AUTO_REFRESH_REVISION
+                        && request_revision < tab.graph.requested_revision
+                    {
+                        continue;
+                    }
+                    tab.graph.loading = false;
+                    tab.graph.error = Some(message.clone());
+                }
+            }
+        }
+
+        for (project_id, oid) in detail_requests {
+            self.request_repository_commit_detail(&project_id, oid);
+        }
+    }
+
+    fn apply_repository_commit_detail_update(
+        &mut self,
+        scope_root: PathBuf,
+        oid: Oid,
+        request_revision: u64,
+        result: Result<CommitDetailDocument, String>,
+    ) {
+        for tab in self
+            .repository_graph_tabs
+            .values_mut()
+            .filter(|tab| tab.scope_root == scope_root && tab.selected_commit == Some(oid))
+        {
+            if request_revision < tab.commit_detail.requested_revision {
+                continue;
+            }
+
+            tab.commit_detail.loading = false;
+            match &result {
+                Ok(detail) => {
+                    tab.commit_detail.document = Some(detail.clone());
+                    tab.commit_detail.error = None;
+                    if let Some(selection) = tab.selected_commit_file.as_ref() {
+                        let still_present = detail
+                            .changed_files
+                            .iter()
+                            .any(|file| file.path == selection.relative_path);
+                        if !still_present {
+                            tab.selected_commit_file = None;
+                            tab.commit_file_diff = AsyncDocumentState::default();
+                        }
+                    }
+                }
+                Err(message) => {
+                    tab.commit_detail.error = Some(message.clone());
+                }
+            }
+        }
+    }
+
+    fn apply_repository_commit_file_diff_update(
+        &mut self,
+        scope_root: PathBuf,
+        selection: CommitFileSelection,
+        request_revision: u64,
+        result: Result<CommitFileDiffDocument, String>,
+    ) {
+        for tab in self
+            .repository_graph_tabs
+            .values_mut()
+            .filter(|tab| tab.scope_root == scope_root)
+        {
+            if request_revision < tab.commit_file_diff.requested_revision {
+                continue;
+            }
+            if tab.selected_commit_file.as_ref() != Some(&selection) {
+                continue;
+            }
+
+            tab.commit_file_diff.loading = false;
+            match &result {
+                Ok(document) => {
+                    tab.commit_file_diff.document = Some(document.clone());
+                    tab.commit_file_diff.error = None;
+                }
+                Err(message) => {
+                    tab.selected_commit_file = None;
+                    tab.commit_file_diff.document = None;
+                    tab.commit_file_diff.error = Some(message.clone());
+                    tab.action_banner = Some(ActionBanner {
+                        kind: ActionBannerKind::Error,
+                        message: message.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    fn apply_stash_list_update(
+        &mut self,
+        scope_root: PathBuf,
+        request_revision: u64,
+        result: Result<StashListDocument, String>,
+    ) {
+        let mut detail_request = None;
+        let Some(diff_tab) = self.diff_tabs.get_mut(&scope_root) else {
+            return;
+        };
+        if request_revision != 0 && request_revision < diff_tab.stash.list.requested_revision {
+            return;
+        }
+
+        diff_tab.stash.list.loading = false;
+        match result {
+            Ok(document) => {
+                diff_tab.stash.list.document = Some(document.clone());
+                diff_tab.stash.list.error = None;
+
+                let has_entry =
+                    |oid: Oid| document.entries.iter().any(|entry| entry.stash_oid == oid);
+                let next_selected = diff_tab
+                    .stash
+                    .selected_stash
+                    .filter(|oid| has_entry(*oid))
+                    .or_else(|| document.entries.first().map(|entry| entry.stash_oid));
+                let next_expanded = diff_tab
+                    .stash
+                    .expanded_stash
+                    .filter(|oid| has_entry(*oid))
+                    .or(next_selected);
+
+                let selection_changed = diff_tab.stash.selected_stash != next_selected;
+                diff_tab.stash.selected_stash = next_selected;
+                diff_tab.stash.expanded_stash = next_expanded;
+
+                if selection_changed {
+                    diff_tab.stash.detail = AsyncDocumentState::default();
+                    diff_tab.stash.selected_file = None;
+                    diff_tab.stash.file_diff = AsyncDocumentState::default();
+                }
+
+                if diff_tab.stash.selected_stash.is_none() {
+                    diff_tab.stash.detail = AsyncDocumentState::default();
+                    diff_tab.stash.selected_file = None;
+                    diff_tab.stash.file_diff = AsyncDocumentState::default();
+                } else if let Some(stash_oid) = diff_tab.stash.selected_stash {
+                    if diff_tab
+                        .stash
+                        .detail
+                        .document
+                        .as_ref()
+                        .is_none_or(|detail| detail.stash_oid != stash_oid)
+                        && !diff_tab.stash.detail.loading
+                    {
+                        detail_request = Some(stash_oid);
+                    }
+                }
+            }
+            Err(message) => {
+                diff_tab.stash.list.error = Some(message);
+            }
+        }
+
+        if let Some(stash_oid) = detail_request {
+            self.request_stash_detail(&scope_root, stash_oid);
+        }
+    }
+
+    fn apply_stash_detail_update(
+        &mut self,
+        scope_root: PathBuf,
+        stash_oid: Oid,
+        request_revision: u64,
+        result: Result<StashDetailDocument, String>,
+    ) {
+        let mut file_request = None;
+        let Some(diff_tab) = self.diff_tabs.get_mut(&scope_root) else {
+            return;
+        };
+        if request_revision < diff_tab.stash.detail.requested_revision
+            || diff_tab.stash.selected_stash != Some(stash_oid)
+        {
+            return;
+        }
+
+        diff_tab.stash.detail.loading = false;
+        match result {
+            Ok(detail) => {
+                diff_tab.stash.detail.document = Some(detail.clone());
+                diff_tab.stash.detail.error = None;
+                if let Some(selection) = diff_tab.stash.selected_file.as_ref() {
+                    let still_present = detail
+                        .files
+                        .iter()
+                        .any(|file| file.relative_path == selection.relative_path);
+                    if !still_present {
+                        diff_tab.stash.selected_file = None;
+                        diff_tab.stash.file_diff = AsyncDocumentState::default();
+                    } else if diff_tab
+                        .stash
+                        .file_diff
+                        .document
+                        .as_ref()
+                        .is_none_or(|document| document.selection != *selection)
+                        && !diff_tab.stash.file_diff.loading
+                    {
+                        file_request = Some(selection.clone());
+                    }
+                }
+            }
+            Err(message) => {
+                diff_tab.stash.detail.document = None;
+                diff_tab.stash.detail.error = Some(message);
+                diff_tab.stash.selected_file = None;
+                diff_tab.stash.file_diff = AsyncDocumentState::default();
+            }
+        }
+
+        if let Some(selection) = file_request {
+            self.request_stash_file_diff(&scope_root, selection);
+        }
+    }
+
+    fn apply_stash_file_diff_update(
+        &mut self,
+        scope_root: PathBuf,
+        selection: StashFileSelection,
+        request_revision: u64,
+        result: Result<StashFileDiffDocument, String>,
+    ) {
+        let Some(diff_tab) = self.diff_tabs.get_mut(&scope_root) else {
+            return;
+        };
+        if request_revision < diff_tab.stash.file_diff.requested_revision
+            || diff_tab.stash.selected_file.as_ref() != Some(&selection)
+        {
+            return;
+        }
+
+        diff_tab.stash.file_diff.loading = false;
+        match result {
+            Ok(document) => {
+                diff_tab.stash.file_diff.document = Some(document);
+                diff_tab.stash.file_diff.error = None;
+            }
+            Err(message) => {
+                diff_tab.stash.file_diff.document = None;
+                diff_tab.stash.file_diff.error = Some(message.clone());
+                diff_tab.last_action_banner = Some(ActionBanner {
+                    kind: ActionBannerKind::Error,
+                    message,
+                });
+            }
+        }
+    }
+
+    fn reconcile_repository_graph_selection(tab: &mut RepositoryGraphTabState) -> Option<Oid> {
+        let graph = tab.graph.document.as_ref()?;
+
+        if let Some(selected_commit) = tab.selected_commit {
+            let commit_still_present = graph
+                .commits
+                .iter()
+                .any(|commit| commit.oid == selected_commit);
+            if commit_still_present {
+                tab.selected_branch = None;
+                if tab
+                    .commit_detail
+                    .document
+                    .as_ref()
+                    .is_none_or(|detail| detail.oid != selected_commit)
+                    && !tab.commit_detail.loading
+                {
+                    return Some(selected_commit);
+                }
+                return None;
+            }
+
+            tab.selected_commit = None;
+            tab.commit_detail = AsyncDocumentState::default();
+            tab.selected_commit_file = None;
+            tab.commit_file_diff = AsyncDocumentState::default();
+        }
+
+        let branch_is_valid = tab
+            .selected_branch
+            .as_ref()
+            .and_then(|selection| match selection {
+                RepositoryBranchSelection::Local { name } => graph
+                    .local_branches
+                    .iter()
+                    .find(|branch| branch.name == *name)
+                    .map(|branch| RepositoryBranchSelection::Local {
+                        name: branch.name.clone(),
+                    }),
+                RepositoryBranchSelection::Remote { full_ref } => graph
+                    .remote_branches
+                    .iter()
+                    .find(|branch| branch.full_ref == *full_ref)
+                    .map(|branch| RepositoryBranchSelection::Remote {
+                        full_ref: branch.full_ref.clone(),
+                    }),
+            });
+
+        tab.selected_branch =
+            branch_is_valid.or_else(|| Self::default_repository_branch_selection(graph));
+        None
+    }
+
+    fn default_repository_branch_selection(
+        graph: &RepositoryGraphDocument,
+    ) -> Option<RepositoryBranchSelection> {
+        if let Some(branch_name) = match &graph.head {
+            orcashell_git::HeadState::Branch { name, .. } => Some(name),
+            orcashell_git::HeadState::Detached { .. } | orcashell_git::HeadState::Unborn => None,
+        } {
+            if graph
+                .local_branches
+                .iter()
+                .any(|branch| branch.name == *branch_name)
+            {
+                return Some(RepositoryBranchSelection::Local {
+                    name: branch_name.clone(),
+                });
+            }
+        }
+
+        graph
+            .local_branches
+            .first()
+            .map(|branch| RepositoryBranchSelection::Local {
+                name: branch.name.clone(),
+            })
+            .or_else(|| {
+                graph
+                    .remote_branches
+                    .first()
+                    .map(|branch| RepositoryBranchSelection::Remote {
+                        full_ref: branch.full_ref.clone(),
+                    })
+            })
+    }
+
+    fn load_repository_branch_occupancy(&self, repo_root: &Path) -> HashSet<String> {
+        self.services
+            .store
+            .lock()
+            .as_ref()
+            .and_then(|store| store.load_worktrees_for_repo_root(repo_root).ok())
+            .map(|worktrees| {
+                worktrees
+                    .into_iter()
+                    .map(|worktree| worktree.branch_name)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn scope_git_action_in_flight(&self, scope_root: &Path) -> bool {
+        self.diff_tabs
+            .get(scope_root)
+            .is_some_and(|tab| tab.local_action_in_flight || tab.remote_op_in_flight)
+            || self.repository_graph_tabs.values().any(|tab| {
+                tab.scope_root == scope_root
+                    && (tab.fetch_in_flight
+                        || tab.pull_in_flight
+                        || tab.active_branch_action.is_some())
+            })
+    }
+
+    pub(crate) fn repository_toolbar_action_in_flight(&self, scope_root: &Path) -> bool {
+        self.diff_tabs
+            .get(scope_root)
+            .is_some_and(|tab| tab.local_action_in_flight || tab.remote_op_in_flight)
+            || self.repository_graph_tabs.values().any(|tab| {
+                tab.scope_root == scope_root
+                    && (tab.pull_in_flight
+                        || tab.active_branch_action.is_some()
+                        || (tab.fetch_in_flight
+                            && tab.active_fetch_origin != Some(GitFetchOrigin::Automatic)))
+            })
+    }
+
     fn apply_local_action_completion(
         &mut self,
         scope_root: PathBuf,
         action: GitActionKind,
         result: Result<String, String>,
     ) {
+        let banner = Self::action_banner_from_result(&result);
+
         // Handle successful RemoveWorktree specially: delete SQLite row + close diff tab.
         if result.is_ok() && matches!(action, GitActionKind::RemoveWorktree) {
             // Capture managed worktree ID before any state changes.
@@ -1580,35 +3703,84 @@ impl WorkspaceState {
         if let Some(diff_tab) = self.diff_tabs.get_mut(&scope_root) {
             diff_tab.local_action_in_flight = false;
 
-            // Clear multi-select after successful stage/unstage.
-            // Skip success banner for stage/unstage. The tree update is feedback enough.
-            if result.is_ok() && matches!(action, GitActionKind::Stage | GitActionKind::Unstage) {
-                diff_tab.multi_select.clear();
-                diff_tab.selection_anchor = None;
-                diff_tab.last_action_banner = None;
-            } else {
-                let banner = match &result {
-                    Ok(msg) if msg.starts_with("BLOCKED: ") => ActionBanner {
-                        kind: ActionBannerKind::Warning,
-                        message: msg["BLOCKED: ".len()..].to_string(),
-                    },
-                    Ok(msg) => ActionBanner {
-                        kind: ActionBannerKind::Success,
-                        message: msg.clone(),
-                    },
-                    Err(msg) => ActionBanner {
-                        kind: ActionBannerKind::Error,
-                        message: msg.clone(),
-                    },
-                };
-                diff_tab.last_action_banner = Some(banner);
-            }
+            if Self::diff_tab_handles_local_action(&action) {
+                // Skip success banners for the actions where the refreshed diff
+                // is the primary feedback.
+                if matches!(&result, Ok(message) if !message.starts_with("BLOCKED: "))
+                    && matches!(
+                        action,
+                        GitActionKind::Stage
+                            | GitActionKind::Unstage
+                            | GitActionKind::DiscardFile
+                            | GitActionKind::DiscardHunk
+                    )
+                {
+                    diff_tab.multi_select.clear();
+                    diff_tab.selection_anchor = None;
+                    diff_tab.last_action_banner = None;
+                } else {
+                    diff_tab.last_action_banner = Some(banner.clone());
+                }
 
-            // Clear commit message after successful commit
-            if result.is_ok() && matches!(action, GitActionKind::Commit) {
-                diff_tab.commit_message.clear();
-                diff_tab.multi_select.clear();
-                diff_tab.selection_anchor = None;
+                // Clear commit message after successful commit
+                if result.is_ok() && matches!(action, GitActionKind::Commit) {
+                    diff_tab.commit_message.clear();
+                    diff_tab.multi_select.clear();
+                    diff_tab.selection_anchor = None;
+                }
+                if result.is_ok() && matches!(action, GitActionKind::CreateStash) {
+                    diff_tab.view_mode = DiffTabViewMode::Stashes;
+                    diff_tab.stash.selected_stash = None;
+                    diff_tab.stash.expanded_stash = None;
+                    diff_tab.stash.detail = AsyncDocumentState::default();
+                    diff_tab.stash.selected_file = None;
+                    diff_tab.stash.file_diff = AsyncDocumentState::default();
+                }
+                if Self::result_requests_graph_refresh(&result)
+                    && matches!(action, GitActionKind::ApplyStash | GitActionKind::PopStash)
+                {
+                    diff_tab.view_mode = DiffTabViewMode::WorkingTree;
+                }
+            }
+        }
+
+        if matches!(
+            action,
+            GitActionKind::CheckoutLocalBranch
+                | GitActionKind::CheckoutRemoteBranch
+                | GitActionKind::CreateLocalBranch
+                | GitActionKind::DeleteLocalBranch
+        ) {
+            for tab in self
+                .repository_graph_tabs
+                .values_mut()
+                .filter(|tab| tab.scope_root == scope_root)
+            {
+                let completed_action = tab.active_branch_action.take();
+                if Self::result_requests_graph_refresh(&result) {
+                    match completed_action {
+                        Some(RepositoryBranchAction::Create {
+                            new_branch_name, ..
+                        }) => {
+                            tab.selected_branch = Some(RepositoryBranchSelection::Local {
+                                name: new_branch_name,
+                            });
+                        }
+                        Some(RepositoryBranchAction::Delete { branch_name }) => {
+                            if tab.selected_branch.as_ref()
+                                == Some(&RepositoryBranchSelection::Local { name: branch_name })
+                            {
+                                tab.selected_branch = None;
+                            }
+                        }
+                        Some(RepositoryBranchAction::Checkout { .. }) | None => {}
+                    }
+                }
+                tab.action_banner = Some(banner.clone());
+                if Self::result_requests_graph_refresh(&result) {
+                    tab.graph.loading = true;
+                    tab.graph.error = None;
+                }
             }
         }
     }
@@ -1616,28 +3788,116 @@ impl WorkspaceState {
     fn apply_remote_op_completion(
         &mut self,
         scope_root: PathBuf,
-        _kind: GitRemoteKind,
+        kind: GitRemoteKind,
+        fetch_origin: Option<GitFetchOrigin>,
+        refresh_graph: bool,
         result: Result<String, String>,
     ) {
-        if let Some(diff_tab) = self.diff_tabs.get_mut(&scope_root) {
-            diff_tab.remote_op_in_flight = false;
+        let banner = Self::action_banner_from_result(&result);
+        let completed_at = SystemTime::now();
 
-            let banner = match &result {
-                Ok(msg) if msg.starts_with("BLOCKED: ") => ActionBanner {
-                    kind: ActionBannerKind::Warning,
-                    message: msg["BLOCKED: ".len()..].to_string(),
-                },
-                Ok(msg) => ActionBanner {
-                    kind: ActionBannerKind::Success,
-                    message: msg.clone(),
-                },
-                Err(msg) => ActionBanner {
-                    kind: ActionBannerKind::Error,
-                    message: msg.clone(),
-                },
-            };
-            diff_tab.last_action_banner = Some(banner);
+        if let Some(diff_tab) = self.diff_tabs.get_mut(&scope_root) {
+            let tracks_diff_busy =
+                kind != GitRemoteKind::Fetch || fetch_origin != Some(GitFetchOrigin::Automatic);
+            if tracks_diff_busy {
+                diff_tab.remote_op_in_flight = false;
+                if kind != GitRemoteKind::Fetch {
+                    diff_tab.last_action_banner = Some(banner.clone());
+                }
+            }
         }
+
+        if matches!(
+            kind,
+            GitRemoteKind::Fetch | GitRemoteKind::Publish | GitRemoteKind::Pull
+        ) {
+            for tab in self
+                .repository_graph_tabs
+                .values_mut()
+                .filter(|tab| tab.scope_root == scope_root)
+            {
+                if kind == GitRemoteKind::Fetch {
+                    tab.fetch_in_flight = false;
+                    tab.active_fetch_origin = None;
+                    match &result {
+                        Ok(_) => {
+                            tab.last_remote_check_at = Some(completed_at);
+                            tab.last_automatic_fetch_failure_at = None;
+                            if fetch_origin == Some(GitFetchOrigin::Manual) {
+                                tab.action_banner = Some(banner.clone());
+                            }
+                        }
+                        Err(_) => {
+                            if fetch_origin == Some(GitFetchOrigin::Manual) {
+                                tab.action_banner = Some(banner.clone());
+                            } else if fetch_origin == Some(GitFetchOrigin::Automatic) {
+                                tab.last_automatic_fetch_failure_at = Some(completed_at);
+                            }
+                        }
+                    }
+                } else {
+                    if kind == GitRemoteKind::Pull {
+                        tab.pull_in_flight = false;
+                    }
+                    tab.action_banner = Some(banner.clone());
+                }
+                if refresh_graph {
+                    tab.graph.loading = true;
+                    tab.graph.error = None;
+                }
+            }
+        }
+
+        if kind == GitRemoteKind::Publish && refresh_graph {
+            self.request_diff_index_refresh(&scope_root);
+        }
+    }
+
+    fn action_banner_from_result(result: &Result<String, String>) -> ActionBanner {
+        match result {
+            Ok(msg) if msg.starts_with("BLOCKED: ") => ActionBanner {
+                kind: ActionBannerKind::Warning,
+                message: msg["BLOCKED: ".len()..].to_string(),
+            },
+            Ok(msg) if msg.starts_with("CONFLICT: ") => ActionBanner {
+                kind: ActionBannerKind::Warning,
+                message: msg["CONFLICT: ".len()..].to_string(),
+            },
+            Ok(msg) => ActionBanner {
+                kind: ActionBannerKind::Success,
+                message: msg.clone(),
+            },
+            Err(msg) => ActionBanner {
+                kind: ActionBannerKind::Error,
+                message: msg.clone(),
+            },
+        }
+    }
+
+    fn diff_tab_handles_local_action(action: &GitActionKind) -> bool {
+        matches!(
+            action,
+            GitActionKind::Stage
+                | GitActionKind::Unstage
+                | GitActionKind::DiscardAll
+                | GitActionKind::DiscardFile
+                | GitActionKind::DiscardHunk
+                | GitActionKind::Commit
+                | GitActionKind::CreateStash
+                | GitActionKind::ApplyStash
+                | GitActionKind::PopStash
+                | GitActionKind::DropStash
+                | GitActionKind::MergeBack
+                | GitActionKind::CompleteMerge
+                | GitActionKind::AbortMerge
+                | GitActionKind::CreateLocalBranch
+                | GitActionKind::DeleteLocalBranch
+                | GitActionKind::RemoveWorktree
+        )
+    }
+
+    fn result_requests_graph_refresh(result: &Result<String, String>) -> bool {
+        matches!(result, Ok(message) if !message.starts_with("BLOCKED: ") && !message.starts_with("CONFLICT: "))
     }
 
     fn persist_worktree(
@@ -1679,6 +3939,14 @@ impl WorkspaceState {
         format!("Live Feed: {project_name}")
     }
 
+    fn repository_graph_tab_id(project_id: &str) -> String {
+        format!("aux-repository-{project_id}")
+    }
+
+    fn repository_graph_title(project_name: &str) -> String {
+        format!("Repository: {project_name}")
+    }
+
     fn diff_tab_id(scope_root: &Path) -> String {
         let scope = scope_root.to_string_lossy();
         format!(
@@ -1714,9 +3982,13 @@ impl WorkspaceState {
                 AuxiliaryTabKind::Diff { scope_root } => {
                     self.services.git.request_snapshot(&scope_root, None);
                     self.request_diff_index_refresh(&scope_root);
+                    self.request_stash_list(&scope_root);
                 }
                 AuxiliaryTabKind::LiveDiffStream { project_id } => {
                     self.ensure_live_diff_feed_state(&project_id);
+                }
+                AuxiliaryTabKind::RepositoryGraph { project_id } => {
+                    self.ensure_repository_graph_state(&project_id);
                 }
                 AuxiliaryTabKind::Settings => {}
             }
@@ -1740,6 +4012,9 @@ impl WorkspaceState {
             AuxiliaryTabKind::LiveDiffStream { project_id } => {
                 self.cancel_feed_captures_for_project(&project_id);
                 self.live_diff_feeds.remove(&project_id);
+            }
+            AuxiliaryTabKind::RepositoryGraph { project_id } => {
+                self.repository_graph_tabs.remove(&project_id);
             }
             AuxiliaryTabKind::Settings => {}
         }
@@ -1782,6 +4057,30 @@ impl WorkspaceState {
 
         for scope_root in scopes_to_refresh {
             self.request_live_feed_capture(project_id, &scope_root);
+        }
+    }
+
+    fn ensure_repository_graph_state(&mut self, project_id: &str) {
+        let Some(scope_root) = self.resolve_repository_scope_root(project_id) else {
+            return;
+        };
+        let graph_tab = self
+            .repository_graph_tabs
+            .entry(project_id.to_string())
+            .or_insert_with(|| {
+                RepositoryGraphTabState::new(project_id.to_string(), scope_root.clone())
+            });
+        if graph_tab.scope_root != scope_root {
+            graph_tab.scope_root = scope_root;
+        }
+        self.request_repository_graph_refresh(project_id);
+    }
+
+    fn resolve_repository_scope_root(&self, project_id: &str) -> Option<PathBuf> {
+        let project = self.project(project_id)?;
+        match discover_scope(&project.path) {
+            Ok(scope) => Some(scope.scope_root),
+            Err(_) => Some(project.path.clone()),
         }
     }
 
@@ -1921,6 +4220,206 @@ impl WorkspaceState {
         self.services.git.request_diff_index(scope_root);
     }
 
+    fn request_repository_graph_refresh(&mut self, project_id: &str) {
+        let Some(tab) = self.repository_graph_tabs.get_mut(project_id) else {
+            return;
+        };
+        if tab.graph.loading {
+            return;
+        }
+
+        tab.graph.loading = true;
+        tab.graph.error = None;
+        tab.graph.requested_revision += 1;
+        self.services
+            .git
+            .request_repository_graph(&tab.scope_root, tab.graph.requested_revision);
+    }
+
+    fn select_repository_branch_internal(
+        &mut self,
+        project_id: &str,
+        selection: RepositoryBranchSelection,
+    ) -> bool {
+        let Some(tab) = self.repository_graph_tabs.get_mut(project_id) else {
+            return false;
+        };
+        if tab.selected_branch.as_ref() == Some(&selection)
+            && tab.selected_commit.is_none()
+            && tab.selected_commit_file.is_none()
+        {
+            return false;
+        }
+
+        tab.selected_branch = Some(selection);
+        tab.selected_commit = None;
+        tab.commit_detail = AsyncDocumentState::default();
+        tab.selected_commit_file = None;
+        tab.commit_file_diff = AsyncDocumentState::default();
+        true
+    }
+
+    fn back_to_repository_commit_internal(&mut self, project_id: &str) -> bool {
+        let Some(tab) = self.repository_graph_tabs.get_mut(project_id) else {
+            return false;
+        };
+        if tab.selected_commit_file.take().is_some() {
+            tab.commit_file_diff.error = None;
+            return true;
+        }
+        false
+    }
+
+    fn request_repository_commit_detail(&mut self, project_id: &str, oid: Oid) {
+        let Some(tab) = self.repository_graph_tabs.get_mut(project_id) else {
+            return;
+        };
+        if tab.commit_detail.loading
+            && tab
+                .commit_detail
+                .document
+                .as_ref()
+                .is_some_and(|detail| detail.oid == oid)
+        {
+            return;
+        }
+
+        tab.selected_branch = None;
+        tab.selected_commit = Some(oid);
+        tab.selected_commit_file = None;
+        tab.commit_file_diff = AsyncDocumentState::default();
+        tab.commit_detail.document = None;
+        tab.commit_detail.loading = true;
+        tab.commit_detail.error = None;
+        tab.commit_detail.requested_revision += 1;
+        self.services.git.request_commit_detail(
+            &tab.scope_root,
+            oid,
+            tab.commit_detail.requested_revision,
+        );
+    }
+
+    fn request_repository_commit_file_diff(
+        &mut self,
+        project_id: &str,
+        selection: CommitFileSelection,
+    ) {
+        let Some(tab) = self.repository_graph_tabs.get_mut(project_id) else {
+            return;
+        };
+        if tab.selected_commit != Some(selection.commit_oid) {
+            return;
+        }
+        if tab.commit_file_diff.loading && tab.selected_commit_file.as_ref() == Some(&selection) {
+            return;
+        }
+        if tab
+            .commit_file_diff
+            .document
+            .as_ref()
+            .is_some_and(|document| document.selection == selection)
+        {
+            tab.selected_commit_file = Some(selection);
+            tab.commit_file_diff.error = None;
+            return;
+        }
+
+        tab.selected_commit_file = Some(selection.clone());
+        tab.commit_file_diff.document = None;
+        tab.commit_file_diff.loading = true;
+        tab.commit_file_diff.error = None;
+        tab.commit_file_diff.requested_revision += 1;
+        self.services.git.request_commit_file_diff(
+            &tab.scope_root,
+            selection.commit_oid,
+            selection.relative_path.clone(),
+            tab.commit_file_diff.requested_revision,
+        );
+    }
+
+    fn request_stash_list(&mut self, scope_root: &Path) {
+        let Some(diff_tab) = self.diff_tabs.get_mut(scope_root) else {
+            return;
+        };
+        if diff_tab.stash.list.loading {
+            return;
+        }
+
+        diff_tab.stash.list.loading = true;
+        diff_tab.stash.list.error = None;
+        diff_tab.stash.list.requested_revision += 1;
+        self.services
+            .git
+            .request_stash_list(scope_root, diff_tab.stash.list.requested_revision);
+    }
+
+    fn request_stash_detail(&mut self, scope_root: &Path, stash_oid: Oid) {
+        let Some(diff_tab) = self.diff_tabs.get_mut(scope_root) else {
+            return;
+        };
+        if diff_tab.stash.detail.loading
+            && diff_tab
+                .stash
+                .detail
+                .document
+                .as_ref()
+                .is_some_and(|detail| detail.stash_oid == stash_oid)
+        {
+            return;
+        }
+
+        diff_tab.stash.selected_stash = Some(stash_oid);
+        diff_tab.stash.expanded_stash = Some(stash_oid);
+        diff_tab.stash.selected_file = None;
+        diff_tab.stash.file_diff = AsyncDocumentState::default();
+        diff_tab.stash.detail.document = None;
+        diff_tab.stash.detail.loading = true;
+        diff_tab.stash.detail.error = None;
+        diff_tab.stash.detail.requested_revision += 1;
+        self.services.git.request_stash_detail(
+            scope_root,
+            stash_oid,
+            diff_tab.stash.detail.requested_revision,
+        );
+    }
+
+    fn request_stash_file_diff(&mut self, scope_root: &Path, selection: StashFileSelection) {
+        let Some(diff_tab) = self.diff_tabs.get_mut(scope_root) else {
+            return;
+        };
+        if diff_tab.stash.selected_stash != Some(selection.stash_oid) {
+            return;
+        }
+        if diff_tab.stash.file_diff.loading
+            && diff_tab.stash.selected_file.as_ref() == Some(&selection)
+        {
+            return;
+        }
+        if diff_tab
+            .stash
+            .file_diff
+            .document
+            .as_ref()
+            .is_some_and(|document| document.selection == selection)
+        {
+            diff_tab.stash.selected_file = Some(selection);
+            diff_tab.stash.file_diff.error = None;
+            return;
+        }
+
+        diff_tab.stash.selected_file = Some(selection.clone());
+        diff_tab.stash.file_diff.document = None;
+        diff_tab.stash.file_diff.loading = true;
+        diff_tab.stash.file_diff.error = None;
+        diff_tab.stash.file_diff.requested_revision += 1;
+        self.services.git.request_stash_file_diff(
+            scope_root,
+            selection.stash_oid,
+            selection.relative_path.clone(),
+            diff_tab.stash.file_diff.requested_revision,
+        );
+    }
+
     fn request_selected_file_diff(&mut self, scope_root: &Path, selection: DiffSelectionKey) {
         let latest_generation = self.latest_diff_generation(scope_root);
         let Some(diff_tab) = self.diff_tabs.get_mut(scope_root) else {
@@ -1936,6 +4435,33 @@ impl WorkspaceState {
         let Some(generation) = generation else {
             return;
         };
+
+        if selection.section == DiffSectionKind::Conflicted {
+            let should_reload = match diff_tab
+                .conflict_editor
+                .documents
+                .get(&selection.relative_path)
+            {
+                Some(ConflictDocumentState::Loaded(document)) => {
+                    !document.is_dirty && document.generation != generation
+                }
+                Some(ConflictDocumentState::Unavailable(document)) => {
+                    document.generation != generation
+                }
+                None => true,
+            };
+            diff_tab.file = DiffFileState {
+                document: None,
+                error: None,
+                loading: false,
+                requested_generation: Some(generation),
+                requested_selection: Some(selection.clone()),
+            };
+            if should_reload {
+                self.reload_conflict_document(scope_root, generation, &selection, true);
+            }
+            return;
+        }
 
         if diff_tab.file.loading
             && diff_tab.file.requested_generation == Some(generation)
@@ -2816,16 +5342,44 @@ impl WorkspaceState {
                 .diff_tabs
                 .get(&scope_root)
                 .and_then(|tab| tab.selected_file.clone());
+            let selected_stash_file = self
+                .diff_tabs
+                .get(&scope_root)
+                .and_then(|tab| tab.stash.selected_file.clone());
             if let Some(diff_tab) = self.diff_tabs.get_mut(&scope_root) {
                 diff_tab.file.document = None;
                 diff_tab.file.error = None;
                 diff_tab.file.loading = false;
                 diff_tab.file.requested_generation = None;
                 diff_tab.file.requested_selection = None;
+                diff_tab.stash.file_diff.document = None;
+                diff_tab.stash.file_diff.error = None;
+                diff_tab.stash.file_diff.loading = false;
             }
             if let Some(selection) = selected {
                 self.request_selected_file_diff(&scope_root, selection);
             }
+            if let Some(selection) = selected_stash_file {
+                self.request_stash_file_diff(&scope_root, selection);
+            }
+        }
+
+        let repository_refreshes: Vec<(String, CommitFileSelection)> = self
+            .repository_graph_tabs
+            .iter()
+            .filter_map(|(project_id, tab)| {
+                tab.selected_commit_file
+                    .clone()
+                    .map(|selection| (project_id.clone(), selection))
+            })
+            .collect();
+        for (project_id, selection) in repository_refreshes {
+            if let Some(tab) = self.repository_graph_tabs.get_mut(&project_id) {
+                tab.commit_file_diff.document = None;
+                tab.commit_file_diff.error = None;
+                tab.commit_file_diff.loading = false;
+            }
+            self.request_repository_commit_file_diff(&project_id, selection);
         }
     }
 
@@ -2876,8 +5430,6 @@ impl WorkspaceState {
     fn sync_terminal_git_scope(&mut self, terminal_id: &str, cwd: Option<PathBuf>) {
         if let Some(cwd) = cwd {
             self.services.git.request_snapshot(&cwd, Some(terminal_id));
-        } else {
-            self.detach_terminal_scope(terminal_id);
         }
     }
 
@@ -3805,6 +6357,9 @@ impl WorkspaceState {
         let live_diff_tab_id = Self::live_diff_stream_tab_id(project_id);
         let _ = self.close_auxiliary_tab_internal(&live_diff_tab_id);
         self.live_diff_feeds.remove(project_id);
+        let repository_tab_id = Self::repository_graph_tab_id(project_id);
+        let _ = self.close_auxiliary_tab_internal(&repository_tab_id);
+        self.repository_graph_tabs.remove(project_id);
 
         // Collect terminal IDs to destroy
         let ids_to_destroy: Vec<String> = self
@@ -4541,2942 +7096,4 @@ impl Default for WorkspaceState {
 // when compiling tests in this module due to heavy Entity type usage).
 
 #[cfg(test)]
-mod tests {
-    use std::collections::{HashMap, HashSet};
-    use std::fs;
-    use std::path::PathBuf;
-    use std::sync::Arc;
-    use std::time::{Instant, SystemTime};
-
-    use orcashell_daemon_core::git_coordinator::{GitActionKind, GitRemoteKind};
-    use parking_lot::Mutex;
-
-    // Import only the types tests actually need. Avoid `use super::*` which
-    // pulls in GPUI types and blows the gpui_macros proc-macro stack budget
-    // during test compilation (same pattern as orcashell-terminal-view/search.rs).
-    use super::{
-        classify_notification, AuxiliaryTabKind, AuxiliaryTabState, CapturedDiffFailure,
-        CapturedDiffFile, CapturedEventDiff, ChangeFeedEntry, ChangeFeedState, DiffTabState,
-        FeedCaptureState, FeedEntryOrigin, FeedScopeKind, FocusTarget, GitEvent,
-        GitSnapshotSummary, LayoutNode, NotificationTier, ProjectData, ResumableAgentKind,
-        ResumeInjectionTrigger, TerminalRuntimeState, WorkspaceBannerKind, WorkspaceServices,
-        WorkspaceState, FEED_PREVIEW_FILE_CAP, FEED_PREVIEW_LINE_BUDGET, SETTINGS_TAB_ID,
-    };
-    use crate::settings::ThemeId;
-    use orcashell_git::{
-        ChangedFile, DiffDocument, DiffSectionKind, DiffSelectionKey, FeedCaptureResult,
-        FeedEventData, FeedEventFileSummary, FeedEventKind, FeedLayerSnapshot, FeedLayerState,
-        FeedScopeCapture, FileDiffDocument, GitFileStatus, GitTrackingStatus, FEED_EVENT_LINE_CAP,
-    };
-    use orcashell_session::semantic_zone::SemanticState;
-    use orcashell_store::{Store, StoredWorktree};
-    use uuid::Uuid;
-
-    fn term(id: &str) -> LayoutNode {
-        LayoutNode::Terminal {
-            terminal_id: Some(id.to_string()),
-            working_directory: None,
-            zoom_level: None,
-        }
-    }
-
-    fn tabs(children: Vec<LayoutNode>, active_tab: usize) -> LayoutNode {
-        LayoutNode::Tabs {
-            children,
-            active_tab,
-        }
-    }
-
-    fn project(id: &str, layout: LayoutNode) -> ProjectData {
-        ProjectData {
-            id: id.to_string(),
-            name: id.to_string(),
-            path: PathBuf::from(format!("/tmp/{id}")),
-            layout,
-            terminal_names: HashMap::new(),
-        }
-    }
-
-    fn runtime_state(notification_tier: Option<NotificationTier>) -> TerminalRuntimeState {
-        TerminalRuntimeState {
-            shell_label: "zsh".into(),
-            live_title: None,
-            semantic_state: SemanticState::Prompt,
-            last_activity_at: None,
-            last_local_input_at: None,
-            notification_tier,
-            resumable_agent: None,
-            pending_agent_detection: false,
-        }
-    }
-
-    fn workspace_with_store() -> WorkspaceState {
-        let services = WorkspaceServices {
-            git: orcashell_daemon_core::git_coordinator::GitCoordinator::new(),
-            store: Arc::new(Mutex::new(Some(Store::open_in_memory().unwrap()))),
-        };
-        WorkspaceState::new_with_services(services)
-    }
-
-    fn snapshot(scope_root: &str) -> GitSnapshotSummary {
-        snapshot_with(scope_root, 1, "main")
-    }
-
-    fn snapshot_with(scope_root: &str, generation: u64, branch_name: &str) -> GitSnapshotSummary {
-        let scope_root = PathBuf::from(scope_root);
-        GitSnapshotSummary {
-            repo_root: scope_root.clone(),
-            scope_root,
-            generation,
-            content_fingerprint: generation,
-            branch_name: branch_name.into(),
-            is_worktree: false,
-            worktree_name: None,
-            changed_files: 1,
-            insertions: 2,
-            deletions: 1,
-        }
-    }
-
-    fn changed_file(path: &str, status: GitFileStatus) -> ChangedFile {
-        ChangedFile {
-            relative_path: PathBuf::from(path),
-            status,
-            is_binary: false,
-            insertions: 3,
-            deletions: 1,
-        }
-    }
-
-    fn diff_document(
-        scope_root: &str,
-        generation: u64,
-        branch_name: &str,
-        files: Vec<ChangedFile>,
-    ) -> DiffDocument {
-        DiffDocument {
-            snapshot: snapshot_with(scope_root, generation, branch_name),
-            tracking: GitTrackingStatus {
-                upstream_ref: None,
-                ahead: 0,
-                behind: 0,
-            },
-            staged_files: Vec::new(),
-            unstaged_files: files,
-        }
-    }
-
-    fn file_document(scope_root: &str, generation: u64, path: &str) -> FileDiffDocument {
-        FileDiffDocument {
-            generation,
-            selection: DiffSelectionKey {
-                section: DiffSectionKind::Unstaged,
-                relative_path: PathBuf::from(path),
-            },
-            file: changed_file(path, GitFileStatus::Modified),
-            lines: vec![orcashell_git::DiffLineView {
-                kind: orcashell_git::DiffLineKind::Context,
-                old_lineno: Some(1),
-                new_lineno: Some(1),
-                text: format!("{scope_root}:{path}"),
-                highlights: None,
-                inline_changes: None,
-            }],
-        }
-    }
-
-    fn file_document_with_lines(
-        scope_root: &str,
-        generation: u64,
-        path: &str,
-        line_count: usize,
-    ) -> FileDiffDocument {
-        FileDiffDocument {
-            generation,
-            selection: DiffSelectionKey {
-                section: DiffSectionKind::Unstaged,
-                relative_path: PathBuf::from(path),
-            },
-            file: changed_file(path, GitFileStatus::Modified),
-            lines: (0..line_count)
-                .map(|index| orcashell_git::DiffLineView {
-                    kind: orcashell_git::DiffLineKind::Context,
-                    old_lineno: Some((index + 1) as u32),
-                    new_lineno: Some((index + 1) as u32),
-                    text: format!("{scope_root}:{path}:{index}"),
-                    highlights: None,
-                    inline_changes: None,
-                })
-                .collect(),
-        }
-    }
-
-    fn file_document_with_kinds(
-        generation: u64,
-        path: &str,
-        lines: Vec<(orcashell_git::DiffLineKind, &str)>,
-    ) -> FileDiffDocument {
-        FileDiffDocument {
-            generation,
-            selection: DiffSelectionKey {
-                section: DiffSectionKind::Unstaged,
-                relative_path: PathBuf::from(path),
-            },
-            file: changed_file(path, GitFileStatus::Modified),
-            lines: lines
-                .into_iter()
-                .enumerate()
-                .map(|(index, (kind, text))| orcashell_git::DiffLineView {
-                    kind,
-                    old_lineno: Some((index + 1) as u32),
-                    new_lineno: Some((index + 1) as u32),
-                    text: text.to_string(),
-                    highlights: None,
-                    inline_changes: None,
-                })
-                .collect(),
-        }
-    }
-
-    fn feed_file_summary(
-        path: &str,
-        section: DiffSectionKind,
-        status: GitFileStatus,
-    ) -> FeedEventFileSummary {
-        FeedEventFileSummary {
-            relative_path: PathBuf::from(path),
-            staged: matches!(section, DiffSectionKind::Staged),
-            unstaged: matches!(section, DiffSectionKind::Unstaged),
-            status,
-            is_binary: false,
-            insertions: 3,
-            deletions: 1,
-        }
-    }
-
-    fn feed_event_file(
-        scope_root: &str,
-        generation: u64,
-        section: DiffSectionKind,
-        path: &str,
-        line_count: usize,
-    ) -> CapturedDiffFile {
-        CapturedDiffFile {
-            selection: DiffSelectionKey {
-                section,
-                relative_path: PathBuf::from(path),
-            },
-            file: changed_file(path, GitFileStatus::Modified),
-            document: file_document_with_lines(scope_root, generation, path, line_count),
-        }
-    }
-
-    fn feed_failure(path: &str, section: DiffSectionKind, message: &str) -> CapturedDiffFailure {
-        CapturedDiffFailure {
-            selection: DiffSelectionKey {
-                section,
-                relative_path: PathBuf::from(path),
-            },
-            relative_path: PathBuf::from(path),
-            message: message.into(),
-        }
-    }
-
-    fn captured_event(
-        files: Vec<CapturedDiffFile>,
-        failed_files: Vec<CapturedDiffFailure>,
-        truncated: bool,
-    ) -> CapturedEventDiff {
-        let total_rendered_lines = files.iter().map(|file| file.document.lines.len()).sum();
-        let total_rendered_bytes = files
-            .iter()
-            .flat_map(|file| file.document.lines.iter())
-            .map(|line| line.text.len())
-            .sum();
-        CapturedEventDiff {
-            files,
-            failed_files,
-            truncated,
-            total_rendered_lines,
-            total_rendered_bytes,
-        }
-    }
-
-    fn feed_event(
-        kind: FeedEventKind,
-        files: Vec<FeedEventFileSummary>,
-        capture: CapturedEventDiff,
-    ) -> FeedEventData {
-        FeedEventData {
-            kind,
-            changed_file_count: files.len(),
-            insertions: files.iter().map(|file| file.insertions).sum(),
-            deletions: files.iter().map(|file| file.deletions).sum(),
-            files,
-            capture,
-        }
-    }
-
-    fn feed_layer(
-        scope_root: &str,
-        generation: u64,
-        section: DiffSectionKind,
-        path: &str,
-        line_count: usize,
-    ) -> FeedLayerSnapshot {
-        FeedLayerSnapshot {
-            selection: DiffSelectionKey {
-                section,
-                relative_path: PathBuf::from(path),
-            },
-            file: changed_file(path, GitFileStatus::Modified),
-            state: FeedLayerState::Ready(file_document_with_lines(
-                scope_root, generation, path, line_count,
-            )),
-        }
-    }
-
-    fn feed_capture_result(
-        generation: u64,
-        layers: Vec<FeedLayerSnapshot>,
-        event: Option<FeedEventData>,
-    ) -> FeedCaptureResult {
-        FeedCaptureResult {
-            current_capture: FeedScopeCapture { generation, layers },
-            event,
-        }
-    }
-
-    fn init_repo() -> PathBuf {
-        let path = std::env::temp_dir().join(format!("orcashell-ui-test-{}", Uuid::new_v4()));
-        fs::create_dir_all(&path).unwrap();
-        run_git(&path, &["init"]);
-        run_git(&path, &["config", "user.name", "Orca"]);
-        run_git(&path, &["config", "user.email", "orca@example.com"]);
-        fs::write(path.join("tracked.txt"), "hello\n").unwrap();
-        run_git(&path, &["add", "tracked.txt"]);
-        run_git(&path, &["commit", "-m", "init"]);
-        path
-    }
-
-    fn run_git(cwd: &PathBuf, args: &[&str]) {
-        let output = orcashell_platform::command("git")
-            .args(args)
-            .current_dir(cwd)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "git {:?} failed: {}",
-            args,
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    // ── normalize_project_path ──────────────────────────────────────────────
-
-    #[test]
-    fn normalize_project_path_resolves_existing_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let result = WorkspaceState::normalize_project_path(dir.path());
-        // Canonical path must be absolute and the directory must exist.
-        assert!(result.is_absolute());
-        assert!(result.exists());
-    }
-
-    #[test]
-    fn normalize_project_path_fallback_for_nonexistent() {
-        let path = PathBuf::from("/this/does/not/exist/orcashell-unit-test-xyz");
-        let result = WorkspaceState::normalize_project_path(&path);
-        // Falls back to the original path unchanged.
-        assert_eq!(result, path);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn normalize_project_path_resolves_symlink_to_canonical() {
-        let dir = tempfile::tempdir().unwrap();
-        let real = dir.path().join("real");
-        std::fs::create_dir(&real).unwrap();
-        let link = dir.path().join("link");
-        std::os::unix::fs::symlink(&real, &link).unwrap();
-
-        let canonical_real = WorkspaceState::normalize_project_path(&real);
-        let canonical_link = WorkspaceState::normalize_project_path(&link);
-        // Both the real directory and the symlink should resolve to the same canonical path.
-        assert_eq!(canonical_real, canonical_link);
-    }
-
-    #[test]
-    fn select_terminal_clears_only_selected_terminal_notification() {
-        let mut ws = WorkspaceState::new();
-        ws.projects
-            .push(project("proj-1", tabs(vec![term("t1"), term("t2")], 0)));
-        ws.terminal_runtime
-            .insert("t1".into(), runtime_state(Some(NotificationTier::Urgent)));
-        ws.terminal_runtime.insert(
-            "t2".into(),
-            runtime_state(Some(NotificationTier::Informational)),
-        );
-
-        assert!(ws.select_terminal_internal("proj-1", &[1]));
-
-        assert_eq!(
-            ws.terminal_notification_tier("t1"),
-            Some(NotificationTier::Urgent)
-        );
-        assert_eq!(ws.terminal_notification_tier("t2"), None);
-        assert!(ws.focus.is_focused("proj-1", &[1]));
-    }
-
-    #[test]
-    fn select_terminal_updates_active_project_and_root_tab() {
-        let mut ws = WorkspaceState::new();
-        ws.projects
-            .push(project("proj-1", tabs(vec![term("t1"), term("t2")], 0)));
-        ws.auxiliary_tabs.push(AuxiliaryTabState {
-            id: SETTINGS_TAB_ID.into(),
-            title: "Settings".into(),
-            kind: AuxiliaryTabKind::Settings,
-        });
-        ws.active_auxiliary_tab_id = Some(SETTINGS_TAB_ID.into());
-
-        assert!(ws.select_terminal_internal("proj-1", &[1]));
-
-        assert_eq!(ws.active_project_id.as_deref(), Some("proj-1"));
-        assert!(ws.active_auxiliary_tab_id.is_none());
-        assert!(ws.focus.is_focused("proj-1", &[1]));
-        assert_eq!(
-            ws.project("proj-1")
-                .and_then(|project| project.layout.active_tab_index()),
-            Some(1)
-        );
-    }
-
-    #[test]
-    fn diff_tab_open_dedupes_by_scope_and_updates_title() {
-        let mut ws = WorkspaceState::new();
-        let scope_root = PathBuf::from("/tmp/repo");
-        ws.git_scopes.insert(
-            scope_root.clone(),
-            snapshot_with("/tmp/repo", 2, "feature/a"),
-        );
-
-        assert!(ws.open_or_focus_diff_tab_internal(scope_root.clone(), "feature/a".into()));
-        assert!(ws.open_or_focus_diff_tab_internal(scope_root.clone(), "feature/b".into()));
-
-        assert_eq!(ws.auxiliary_tabs.len(), 1);
-        assert_eq!(ws.diff_tabs.len(), 1);
-        assert_eq!(ws.active_diff_scope_root(), Some(scope_root.as_path()));
-        assert_eq!(ws.auxiliary_tabs[0].title, "Diff: feature/b");
-        assert!(ws.diff_tabs[&scope_root].index.loading);
-        assert_eq!(
-            ws.diff_tabs[&scope_root].index.requested_generation,
-            Some(2)
-        );
-    }
-
-    #[test]
-    fn live_diff_feed_open_dedupes_by_project_and_tracks_current_scopes() {
-        let mut ws = WorkspaceState::new();
-        ws.projects
-            .push(project("proj-1", tabs(vec![term("t1"), term("t2")], 0)));
-        ws.terminal_git_scopes
-            .insert("t1".into(), PathBuf::from("/tmp/repo-a"));
-        ws.terminal_git_scopes
-            .insert("t2".into(), PathBuf::from("/tmp/repo-b"));
-
-        assert!(ws.open_or_focus_live_diff_stream_tab_internal("proj-1"));
-        assert!(ws.open_or_focus_live_diff_stream_tab_internal("proj-1"));
-
-        assert_eq!(ws.auxiliary_tabs.len(), 1);
-        assert_eq!(
-            ws.active_auxiliary_tab_id.as_deref(),
-            Some("aux-live-diff-proj-1")
-        );
-        assert_eq!(
-            ws.live_diff_feed_state("proj-1")
-                .map(|feed| feed.tracked_scope_count()),
-            Some(2)
-        );
-        assert_eq!(ws.auxiliary_tabs[0].title, "Live Feed: proj-1");
-    }
-
-    #[test]
-    fn closing_live_diff_auxiliary_tab_discards_feed_state() {
-        let mut ws = WorkspaceState::new();
-        ws.projects
-            .push(project("proj-1", tabs(vec![term("t1")], 0)));
-
-        assert!(ws.open_or_focus_live_diff_stream_tab_internal("proj-1"));
-        assert!(ws.live_diff_feed_state("proj-1").is_some());
-
-        assert!(ws.close_auxiliary_tab_internal("aux-live-diff-proj-1"));
-        assert!(ws.live_diff_feed_state("proj-1").is_none());
-        assert!(ws.auxiliary_tabs.is_empty());
-    }
-
-    #[test]
-    fn live_diff_feed_scope_membership_updates_on_scope_attach_and_detach() {
-        let mut ws = WorkspaceState::new();
-        ws.projects
-            .push(project("proj-1", tabs(vec![term("t1")], 0)));
-
-        assert!(ws.open_or_focus_live_diff_stream_tab_internal("proj-1"));
-        assert_eq!(
-            ws.live_diff_feed_state("proj-1")
-                .map(|feed| feed.tracked_scope_count()),
-            Some(0)
-        );
-
-        ws.attach_terminal_scope("t1", PathBuf::from("/tmp/repo-a"));
-        assert_eq!(
-            ws.live_diff_feed_state("proj-1")
-                .map(|feed| feed.tracked_scope_count()),
-            Some(1)
-        );
-
-        ws.detach_terminal_scope("t1");
-        assert_eq!(
-            ws.live_diff_feed_state("proj-1")
-                .map(|feed| feed.tracked_scope_count()),
-            Some(0)
-        );
-    }
-
-    #[test]
-    fn live_diff_feed_bootstraps_dirty_scope_only() {
-        let mut ws = WorkspaceState::new();
-        let scope_root = PathBuf::from("/tmp/repo");
-        ws.projects
-            .push(project("proj-1", tabs(vec![term("t1")], 0)));
-        ws.terminal_git_scopes
-            .insert("t1".into(), scope_root.clone());
-        ws.git_scopes
-            .insert(scope_root.clone(), snapshot_with("/tmp/repo", 1, "main"));
-        assert!(ws.open_or_focus_live_diff_stream_tab_internal("proj-1"));
-
-        ws.apply_live_feed_capture_update(
-            "proj-1",
-            scope_root.clone(),
-            1,
-            1,
-            Ok(feed_capture_result(1, Vec::new(), None)),
-        );
-        assert_eq!(
-            ws.live_diff_feed_state("proj-1")
-                .map(|feed| feed.entries.len()),
-            Some(0)
-        );
-
-        ws.git_scopes
-            .insert(scope_root.clone(), snapshot_with("/tmp/repo", 2, "main"));
-        ws.refresh_live_feeds_for_scope_if_stale(&scope_root, 2);
-        ws.apply_live_feed_capture_update(
-            "proj-1",
-            scope_root,
-            2,
-            2,
-            Ok(feed_capture_result(
-                2,
-                vec![feed_layer(
-                    "/tmp/repo",
-                    2,
-                    DiffSectionKind::Unstaged,
-                    "a.rs",
-                    2,
-                )],
-                Some(feed_event(
-                    FeedEventKind::LiveDelta,
-                    vec![feed_file_summary(
-                        "a.rs",
-                        DiffSectionKind::Unstaged,
-                        GitFileStatus::Modified,
-                    )],
-                    captured_event(
-                        vec![feed_event_file(
-                            "/tmp/repo",
-                            2,
-                            DiffSectionKind::Unstaged,
-                            "a.rs",
-                            2,
-                        )],
-                        Vec::new(),
-                        false,
-                    ),
-                )),
-            )),
-        );
-
-        let feed = ws.live_diff_feed_state("proj-1").unwrap();
-        assert_eq!(feed.entries.len(), 1);
-        assert_eq!(feed.entries[0].origin, FeedEntryOrigin::LiveDelta);
-        assert!(matches!(
-            feed.entries[0].capture_state,
-            FeedCaptureState::Ready(CapturedEventDiff { ref files, .. }) if files.len() == 1
-        ));
-    }
-
-    #[test]
-    fn live_diff_feed_ignores_stale_request_revisions() {
-        let mut ws = WorkspaceState::new();
-        let scope_root = PathBuf::from("/tmp/repo");
-        ws.projects
-            .push(project("proj-1", tabs(vec![term("t1")], 0)));
-        ws.terminal_git_scopes
-            .insert("t1".into(), scope_root.clone());
-        ws.git_scopes
-            .insert(scope_root.clone(), snapshot_with("/tmp/repo", 2, "main"));
-        assert!(ws.open_or_focus_live_diff_stream_tab_internal("proj-1"));
-
-        {
-            let scope_state = ws
-                .live_diff_feeds
-                .get_mut("proj-1")
-                .and_then(|feed| feed.tracked_scopes.get_mut(&scope_root))
-                .unwrap();
-            scope_state.latest_request_revision = 2;
-        }
-
-        ws.apply_live_feed_capture_update(
-            "proj-1",
-            scope_root,
-            2,
-            1,
-            Ok(feed_capture_result(
-                2,
-                vec![feed_layer(
-                    "/tmp/repo",
-                    2,
-                    DiffSectionKind::Unstaged,
-                    "a.rs",
-                    1,
-                )],
-                Some(feed_event(
-                    FeedEventKind::BootstrapSnapshot,
-                    vec![feed_file_summary(
-                        "a.rs",
-                        DiffSectionKind::Unstaged,
-                        GitFileStatus::Modified,
-                    )],
-                    captured_event(
-                        vec![feed_event_file(
-                            "/tmp/repo",
-                            2,
-                            DiffSectionKind::Unstaged,
-                            "a.rs",
-                            1,
-                        )],
-                        Vec::new(),
-                        false,
-                    ),
-                )),
-            )),
-        );
-
-        assert_eq!(
-            ws.live_diff_feed_state("proj-1")
-                .map(|feed| feed.entries.len()),
-            Some(0)
-        );
-    }
-
-    #[test]
-    fn live_diff_feed_dirty_to_clean_appends_ready_clean_event() {
-        let mut ws = WorkspaceState::new();
-        let scope_root = PathBuf::from("/tmp/repo");
-        ws.projects
-            .push(project("proj-1", tabs(vec![term("t1")], 0)));
-        ws.terminal_git_scopes
-            .insert("t1".into(), scope_root.clone());
-        ws.git_scopes
-            .insert(scope_root.clone(), snapshot_with("/tmp/repo", 2, "main"));
-        assert!(ws.open_or_focus_live_diff_stream_tab_internal("proj-1"));
-
-        ws.apply_live_feed_capture_update(
-            "proj-1",
-            scope_root.clone(),
-            2,
-            1,
-            Ok(feed_capture_result(
-                2,
-                vec![feed_layer(
-                    "/tmp/repo",
-                    2,
-                    DiffSectionKind::Unstaged,
-                    "a.rs",
-                    2,
-                )],
-                Some(feed_event(
-                    FeedEventKind::BootstrapSnapshot,
-                    vec![feed_file_summary(
-                        "a.rs",
-                        DiffSectionKind::Unstaged,
-                        GitFileStatus::Modified,
-                    )],
-                    captured_event(
-                        vec![feed_event_file(
-                            "/tmp/repo",
-                            2,
-                            DiffSectionKind::Unstaged,
-                            "a.rs",
-                            2,
-                        )],
-                        Vec::new(),
-                        false,
-                    ),
-                )),
-            )),
-        );
-        ws.git_scopes
-            .insert(scope_root.clone(), snapshot_with("/tmp/repo", 3, "main"));
-        ws.refresh_live_feeds_for_scope_if_stale(&scope_root, 3);
-        ws.apply_live_feed_capture_update(
-            "proj-1",
-            scope_root,
-            3,
-            2,
-            Ok(feed_capture_result(
-                3,
-                Vec::new(),
-                Some(feed_event(
-                    FeedEventKind::LiveDelta,
-                    Vec::new(),
-                    captured_event(Vec::new(), Vec::new(), false),
-                )),
-            )),
-        );
-
-        let feed = ws.live_diff_feed_state("proj-1").unwrap();
-        assert_eq!(feed.entries.len(), 2);
-        let clean_entry = &feed.entries[1];
-        assert_eq!(clean_entry.origin, FeedEntryOrigin::LiveDelta);
-        assert_eq!(clean_entry.changed_file_count, 0);
-        assert!(matches!(
-            clean_entry.capture_state,
-            FeedCaptureState::Ready(CapturedEventDiff {
-                ref files,
-                ref failed_files,
-                truncated: false,
-                total_rendered_lines: 0,
-                total_rendered_bytes: 0,
-            }) if files.is_empty() && failed_files.is_empty()
-        ));
-    }
-
-    #[test]
-    fn live_diff_feed_retention_prunes_oldest_entries() {
-        let mut ws = WorkspaceState::new();
-        let scope_root = PathBuf::from("/tmp/repo");
-        ws.projects
-            .push(project("proj-1", tabs(vec![term("t1")], 0)));
-        ws.terminal_git_scopes
-            .insert("t1".into(), scope_root.clone());
-        ws.git_scopes
-            .insert(scope_root.clone(), snapshot_with("/tmp/repo", 1, "main"));
-        assert!(ws.open_or_focus_live_diff_stream_tab_internal("proj-1"));
-
-        let event = feed_event(
-            FeedEventKind::LiveDelta,
-            vec![feed_file_summary(
-                "a.rs",
-                DiffSectionKind::Unstaged,
-                GitFileStatus::Modified,
-            )],
-            captured_event(
-                vec![feed_event_file(
-                    "/tmp/repo",
-                    1,
-                    DiffSectionKind::Unstaged,
-                    "a.rs",
-                    1,
-                )],
-                Vec::new(),
-                false,
-            ),
-        );
-
-        for generation in 1..=2_001 {
-            ws.append_live_feed_entry("proj-1", &scope_root, generation, &event);
-        }
-
-        let feed = ws.live_diff_feed_state("proj-1").unwrap();
-        assert_eq!(feed.entries.len(), 2_000);
-        assert_eq!(feed.entries.front().map(|entry| entry.id), Some(2));
-        assert_eq!(feed.entries.back().map(|entry| entry.id), Some(2_001));
-    }
-
-    #[test]
-    fn live_diff_feed_capture_result_maps_truncated_events() {
-        let mut ws = WorkspaceState::new();
-        let scope_root = PathBuf::from("/tmp/repo");
-        ws.projects
-            .push(project("proj-1", tabs(vec![term("t1")], 0)));
-        ws.terminal_git_scopes
-            .insert("t1".into(), scope_root.clone());
-        ws.git_scopes
-            .insert(scope_root.clone(), snapshot_with("/tmp/repo", 2, "main"));
-        assert!(ws.open_or_focus_live_diff_stream_tab_internal("proj-1"));
-
-        ws.apply_live_feed_capture_update(
-            "proj-1",
-            scope_root,
-            2,
-            1,
-            Ok(feed_capture_result(
-                2,
-                vec![feed_layer(
-                    "/tmp/repo",
-                    2,
-                    DiffSectionKind::Unstaged,
-                    "a.rs",
-                    FEED_EVENT_LINE_CAP,
-                )],
-                Some(feed_event(
-                    FeedEventKind::BootstrapSnapshot,
-                    vec![feed_file_summary(
-                        "a.rs",
-                        DiffSectionKind::Unstaged,
-                        GitFileStatus::Modified,
-                    )],
-                    captured_event(
-                        vec![feed_event_file(
-                            "/tmp/repo",
-                            2,
-                            DiffSectionKind::Unstaged,
-                            "a.rs",
-                            FEED_EVENT_LINE_CAP,
-                        )],
-                        Vec::new(),
-                        true,
-                    ),
-                )),
-            )),
-        );
-
-        let feed = ws.live_diff_feed_state("proj-1").unwrap();
-        assert!(matches!(
-            &feed.entries[0].capture_state,
-            FeedCaptureState::Truncated(CapturedEventDiff { files, total_rendered_lines, .. })
-                if files.len() == 1 && *total_rendered_lines == FEED_EVENT_LINE_CAP
-        ));
-    }
-
-    #[test]
-    fn live_diff_feed_capture_result_maps_all_failures_to_failed_state() {
-        let mut ws = WorkspaceState::new();
-        let scope_root = PathBuf::from("/tmp/repo");
-        ws.projects
-            .push(project("proj-1", tabs(vec![term("t1")], 0)));
-        ws.terminal_git_scopes
-            .insert("t1".into(), scope_root.clone());
-        ws.git_scopes
-            .insert(scope_root.clone(), snapshot_with("/tmp/repo", 2, "main"));
-        assert!(ws.open_or_focus_live_diff_stream_tab_internal("proj-1"));
-
-        ws.apply_live_feed_capture_update(
-            "proj-1",
-            scope_root,
-            2,
-            1,
-            Ok(feed_capture_result(
-                2,
-                vec![FeedLayerSnapshot {
-                    selection: DiffSelectionKey {
-                        section: DiffSectionKind::Unstaged,
-                        relative_path: PathBuf::from("a.rs"),
-                    },
-                    file: changed_file("a.rs", GitFileStatus::Modified),
-                    state: FeedLayerState::Unavailable {
-                        message: "capture failed".into(),
-                    },
-                }],
-                Some(feed_event(
-                    FeedEventKind::BootstrapSnapshot,
-                    vec![feed_file_summary(
-                        "a.rs",
-                        DiffSectionKind::Unstaged,
-                        GitFileStatus::Modified,
-                    )],
-                    captured_event(
-                        Vec::new(),
-                        vec![feed_failure(
-                            "a.rs",
-                            DiffSectionKind::Unstaged,
-                            "capture failed",
-                        )],
-                        false,
-                    ),
-                )),
-            )),
-        );
-
-        let feed = ws.live_diff_feed_state("proj-1").unwrap();
-        assert!(matches!(
-            feed.entries[0].capture_state,
-            FeedCaptureState::Failed { ref message } if message.contains("1 file")
-        ));
-    }
-
-    #[test]
-    fn live_diff_feed_scope_error_persists_until_failing_scope_recovers() {
-        let mut ws = WorkspaceState::new();
-        let scope_root_a = PathBuf::from("/tmp/repo-a");
-        let scope_root_b = PathBuf::from("/tmp/repo-b");
-        ws.projects
-            .push(project("proj-1", tabs(vec![term("t1"), term("t2")], 0)));
-        ws.terminal_git_scopes
-            .insert("t1".into(), scope_root_a.clone());
-        ws.terminal_git_scopes
-            .insert("t2".into(), scope_root_b.clone());
-        ws.git_scopes.insert(
-            scope_root_a.clone(),
-            snapshot_with("/tmp/repo-a", 2, "main"),
-        );
-        ws.git_scopes.insert(
-            scope_root_b.clone(),
-            snapshot_with("/tmp/repo-b", 2, "main"),
-        );
-        assert!(ws.open_or_focus_live_diff_stream_tab_internal("proj-1"));
-
-        ws.apply_live_feed_capture_update("proj-1", scope_root_a.clone(), 2, 1, Err("boom".into()));
-        assert!(ws
-            .live_diff_feed_state("proj-1")
-            .and_then(|feed| feed.latest_scope_error())
-            .is_some_and(|error| error.contains("/tmp/repo-a") && error.contains("boom")));
-
-        ws.apply_live_feed_capture_update(
-            "proj-1",
-            scope_root_b,
-            2,
-            1,
-            Ok(feed_capture_result(
-                2,
-                vec![feed_layer(
-                    "/tmp/repo-b",
-                    2,
-                    DiffSectionKind::Unstaged,
-                    "b.rs",
-                    1,
-                )],
-                Some(feed_event(
-                    FeedEventKind::BootstrapSnapshot,
-                    vec![feed_file_summary(
-                        "b.rs",
-                        DiffSectionKind::Unstaged,
-                        GitFileStatus::Modified,
-                    )],
-                    captured_event(
-                        vec![feed_event_file(
-                            "/tmp/repo-b",
-                            2,
-                            DiffSectionKind::Unstaged,
-                            "b.rs",
-                            1,
-                        )],
-                        Vec::new(),
-                        false,
-                    ),
-                )),
-            )),
-        );
-        assert!(ws
-            .live_diff_feed_state("proj-1")
-            .and_then(|feed| feed.latest_scope_error())
-            .is_some_and(|error| error.contains("/tmp/repo-a") && error.contains("boom")));
-
-        ws.git_scopes.insert(
-            scope_root_a.clone(),
-            snapshot_with("/tmp/repo-a", 3, "main"),
-        );
-        ws.refresh_live_feeds_for_scope_if_stale(&scope_root_a, 3);
-        ws.apply_live_feed_capture_update(
-            "proj-1",
-            scope_root_a,
-            3,
-            2,
-            Ok(feed_capture_result(
-                3,
-                vec![feed_layer(
-                    "/tmp/repo-a",
-                    3,
-                    DiffSectionKind::Unstaged,
-                    "a.rs",
-                    1,
-                )],
-                Some(feed_event(
-                    FeedEventKind::BootstrapSnapshot,
-                    vec![feed_file_summary(
-                        "a.rs",
-                        DiffSectionKind::Unstaged,
-                        GitFileStatus::Modified,
-                    )],
-                    captured_event(
-                        vec![feed_event_file(
-                            "/tmp/repo-a",
-                            3,
-                            DiffSectionKind::Unstaged,
-                            "a.rs",
-                            1,
-                        )],
-                        Vec::new(),
-                        false,
-                    ),
-                )),
-            )),
-        );
-        assert_eq!(
-            ws.live_diff_feed_state("proj-1")
-                .and_then(|feed| feed.latest_scope_error()),
-            None
-        );
-    }
-
-    #[test]
-    fn live_diff_feed_requeues_newer_generation_after_older_response() {
-        let mut ws = WorkspaceState::new();
-        let scope_root = PathBuf::from("/tmp/repo");
-        ws.projects
-            .push(project("proj-1", tabs(vec![term("t1")], 0)));
-        ws.terminal_git_scopes
-            .insert("t1".into(), scope_root.clone());
-        ws.git_scopes
-            .insert(scope_root.clone(), snapshot_with("/tmp/repo", 2, "main"));
-        assert!(ws.open_or_focus_live_diff_stream_tab_internal("proj-1"));
-        ws.git_scopes
-            .insert(scope_root.clone(), snapshot_with("/tmp/repo", 3, "main"));
-        ws.refresh_live_feeds_for_scope_if_stale(&scope_root, 3);
-
-        ws.apply_live_feed_capture_update(
-            "proj-1",
-            scope_root.clone(),
-            2,
-            1,
-            Ok(feed_capture_result(
-                2,
-                vec![feed_layer(
-                    "/tmp/repo",
-                    2,
-                    DiffSectionKind::Unstaged,
-                    "a.rs",
-                    1,
-                )],
-                Some(feed_event(
-                    FeedEventKind::BootstrapSnapshot,
-                    vec![feed_file_summary(
-                        "a.rs",
-                        DiffSectionKind::Unstaged,
-                        GitFileStatus::Modified,
-                    )],
-                    captured_event(
-                        vec![feed_event_file(
-                            "/tmp/repo",
-                            2,
-                            DiffSectionKind::Unstaged,
-                            "a.rs",
-                            1,
-                        )],
-                        Vec::new(),
-                        false,
-                    ),
-                )),
-            )),
-        );
-        assert!(ws
-            .live_diff_feeds
-            .get("proj-1")
-            .and_then(|feed| feed.tracked_scopes.get(&scope_root))
-            .is_some_and(|scope_state| {
-                scope_state.pending_refresh && scope_state.latest_request_revision == 2
-            }));
-
-        ws.apply_live_feed_capture_update(
-            "proj-1",
-            scope_root,
-            3,
-            2,
-            Ok(feed_capture_result(
-                3,
-                Vec::new(),
-                Some(feed_event(
-                    FeedEventKind::LiveDelta,
-                    Vec::new(),
-                    captured_event(Vec::new(), Vec::new(), false),
-                )),
-            )),
-        );
-        let feed = ws.live_diff_feed_state("proj-1").unwrap();
-        assert_eq!(feed.entries.len(), 2);
-        assert_eq!(feed.entries[0].generation, 2);
-        assert_eq!(feed.entries[1].generation, 3);
-    }
-
-    #[test]
-    fn live_diff_feed_paused_follow_accumulates_unread_entries() {
-        let mut ws = WorkspaceState::new();
-        let scope_root = PathBuf::from("/tmp/repo");
-        ws.projects
-            .push(project("proj-1", tabs(vec![term("t1")], 0)));
-        ws.terminal_git_scopes
-            .insert("t1".into(), scope_root.clone());
-        ws.git_scopes
-            .insert(scope_root.clone(), snapshot_with("/tmp/repo", 1, "main"));
-        assert!(ws.open_or_focus_live_diff_stream_tab_internal("proj-1"));
-        assert!(ws.set_live_diff_feed_follow_state("proj-1", false));
-
-        let event = feed_event(
-            FeedEventKind::LiveDelta,
-            vec![feed_file_summary(
-                "a.rs",
-                DiffSectionKind::Unstaged,
-                GitFileStatus::Modified,
-            )],
-            captured_event(
-                vec![feed_event_file(
-                    "/tmp/repo",
-                    1,
-                    DiffSectionKind::Unstaged,
-                    "a.rs",
-                    1,
-                )],
-                Vec::new(),
-                false,
-            ),
-        );
-        ws.append_live_feed_entry("proj-1", &scope_root, 1, &event);
-        ws.append_live_feed_entry("proj-1", &scope_root, 2, &event);
-
-        let feed = ws.live_diff_feed_state("proj-1").unwrap();
-        assert!(!feed.live_follow);
-        assert_eq!(feed.unread_count, 2);
-    }
-
-    #[test]
-    fn live_diff_feed_resume_clears_unread_entries() {
-        let mut ws = WorkspaceState::new();
-        let scope_root = PathBuf::from("/tmp/repo");
-        ws.projects
-            .push(project("proj-1", tabs(vec![term("t1")], 0)));
-        ws.terminal_git_scopes
-            .insert("t1".into(), scope_root.clone());
-        ws.git_scopes
-            .insert(scope_root.clone(), snapshot_with("/tmp/repo", 1, "main"));
-        assert!(ws.open_or_focus_live_diff_stream_tab_internal("proj-1"));
-        assert!(ws.set_live_diff_feed_follow_state("proj-1", false));
-
-        ws.append_live_feed_entry(
-            "proj-1",
-            &scope_root,
-            1,
-            &feed_event(
-                FeedEventKind::LiveDelta,
-                vec![feed_file_summary(
-                    "a.rs",
-                    DiffSectionKind::Unstaged,
-                    GitFileStatus::Modified,
-                )],
-                captured_event(
-                    vec![feed_event_file(
-                        "/tmp/repo",
-                        1,
-                        DiffSectionKind::Unstaged,
-                        "a.rs",
-                        1,
-                    )],
-                    Vec::new(),
-                    false,
-                ),
-            ),
-        );
-        assert!(ws.resume_live_diff_feed("proj-1"));
-
-        let feed = ws.live_diff_feed_state("proj-1").unwrap();
-        assert!(feed.live_follow);
-        assert_eq!(feed.unread_count, 0);
-    }
-
-    #[test]
-    fn live_diff_feed_select_entry_opens_and_closes_detail_pane() {
-        let mut ws = WorkspaceState::new();
-        let scope_root = PathBuf::from("/tmp/repo");
-        ws.projects
-            .push(project("proj-1", tabs(vec![term("t1")], 0)));
-        ws.terminal_git_scopes
-            .insert("t1".into(), scope_root.clone());
-        ws.git_scopes
-            .insert(scope_root.clone(), snapshot_with("/tmp/repo", 1, "main"));
-        assert!(ws.open_or_focus_live_diff_stream_tab_internal("proj-1"));
-
-        ws.append_live_feed_entry(
-            "proj-1",
-            &scope_root,
-            1,
-            &feed_event(
-                FeedEventKind::LiveDelta,
-                vec![feed_file_summary(
-                    "a.rs",
-                    DiffSectionKind::Unstaged,
-                    GitFileStatus::Modified,
-                )],
-                captured_event(
-                    vec![feed_event_file(
-                        "/tmp/repo",
-                        1,
-                        DiffSectionKind::Unstaged,
-                        "a.rs",
-                        1,
-                    )],
-                    Vec::new(),
-                    false,
-                ),
-            ),
-        );
-
-        assert!(ws.select_feed_entry("proj-1", 1));
-        let feed = ws.live_diff_feed_state("proj-1").unwrap();
-        assert_eq!(feed.selected_entry_id, Some(1));
-        assert!(feed.detail_pane_open);
-
-        assert!(ws.close_feed_detail_pane("proj-1"));
-        let feed = ws.live_diff_feed_state("proj-1").unwrap();
-        assert_eq!(feed.selected_entry_id, None);
-        assert!(!feed.detail_pane_open);
-    }
-
-    #[test]
-    fn live_diff_feed_open_diff_routes_scope_and_preferred_file() {
-        let mut ws = WorkspaceState::new();
-        let scope_root = PathBuf::from("/tmp/repo");
-        ws.git_scopes.insert(
-            scope_root.clone(),
-            snapshot_with("/tmp/repo", 4, "feature/live"),
-        );
-
-        let preferred_file = DiffSelectionKey {
-            section: DiffSectionKind::Unstaged,
-            relative_path: PathBuf::from("src/live.rs"),
-        };
-        assert!(ws.open_diff_tab_for_scope_and_file(&scope_root, Some(preferred_file.clone())));
-
-        let diff_tab = ws.diff_tab_state(&scope_root).unwrap();
-        assert_eq!(diff_tab.selected_file.as_ref(), Some(&preferred_file));
-        assert!(diff_tab.index.loading);
-        assert_eq!(diff_tab.index.requested_generation, Some(4));
-    }
-
-    #[test]
-    fn live_diff_feed_open_diff_missing_scope_sets_workspace_error() {
-        let mut ws = WorkspaceState::new();
-        let scope_root = PathBuf::from("/tmp/missing");
-
-        assert!(!ws.open_diff_tab_for_scope_and_file(&scope_root, None));
-        assert_eq!(
-            ws.workspace_banner()
-                .map(|banner| (&banner.kind, banner.message.as_str())),
-            Some((
-                &WorkspaceBannerKind::Error,
-                "The diff scope /tmp/missing is no longer available."
-            ))
-        );
-    }
-
-    #[test]
-    fn focus_terminal_by_id_selects_exact_terminal() {
-        let mut ws = WorkspaceState::new();
-        ws.projects
-            .push(project("proj-1", tabs(vec![term("t1"), term("t2")], 0)));
-        ws.terminal_runtime
-            .insert("t1".into(), runtime_state(Some(NotificationTier::Urgent)));
-        ws.terminal_runtime.insert(
-            "t2".into(),
-            runtime_state(Some(NotificationTier::Informational)),
-        );
-
-        assert!(ws.focus_terminal_by_id("t2"));
-        assert_eq!(ws.active_project_id.as_deref(), Some("proj-1"));
-        assert!(ws.focus.is_focused("proj-1", &[1]));
-        assert_eq!(ws.pending_focus_terminal_id.as_deref(), Some("t2"));
-        assert_eq!(
-            ws.terminal_notification_tier("t1"),
-            Some(NotificationTier::Urgent)
-        );
-        assert_eq!(ws.terminal_notification_tier("t2"), None);
-    }
-
-    #[test]
-    fn focus_terminal_by_id_missing_terminal_sets_workspace_error() {
-        let mut ws = WorkspaceState::new();
-
-        assert!(!ws.focus_terminal_by_id("missing"));
-        assert_eq!(
-            ws.workspace_banner()
-                .map(|banner| (&banner.kind, banner.message.as_str())),
-            Some((
-                &WorkspaceBannerKind::Error,
-                "The source terminal missing is no longer available."
-            ))
-        );
-    }
-
-    #[test]
-    fn live_diff_feed_resolves_managed_worktree_provenance() {
-        let mut ws = workspace_with_store();
-        let scope_root = PathBuf::from("/tmp/repo-worktree");
-        ws.projects
-            .push(project("proj-1", tabs(vec![term("t1")], 0)));
-        ws.terminal_git_scopes
-            .insert("t1".into(), scope_root.clone());
-        ws.git_scopes.insert(
-            scope_root.clone(),
-            snapshot_with("/tmp/repo-worktree", 1, "feature/live"),
-        );
-        assert!(ws.open_or_focus_live_diff_stream_tab_internal("proj-1"));
-
-        {
-            let mut store = ws.services.store.lock();
-            store
-                .as_mut()
-                .unwrap()
-                .save_worktree(&StoredWorktree {
-                    id: "wt-1".into(),
-                    project_id: "proj-1".into(),
-                    repo_root: PathBuf::from("/tmp/repo-root"),
-                    path: scope_root.clone(),
-                    worktree_name: "agent-a".into(),
-                    branch_name: "feature/live".into(),
-                    source_ref: "main".into(),
-                    primary_terminal_id: Some("t1".into()),
-                })
-                .unwrap();
-        }
-
-        ws.append_live_feed_entry(
-            "proj-1",
-            &scope_root,
-            1,
-            &feed_event(
-                FeedEventKind::LiveDelta,
-                vec![feed_file_summary(
-                    "a.rs",
-                    DiffSectionKind::Unstaged,
-                    GitFileStatus::Modified,
-                )],
-                captured_event(
-                    vec![feed_event_file(
-                        "/tmp/repo-worktree",
-                        1,
-                        DiffSectionKind::Unstaged,
-                        "a.rs",
-                        1,
-                    )],
-                    Vec::new(),
-                    false,
-                ),
-            ),
-        );
-
-        let entry = &ws.live_diff_feed_state("proj-1").unwrap().entries[0];
-        assert_eq!(entry.scope_kind, FeedScopeKind::ManagedWorktree);
-        assert_eq!(entry.worktree_name.as_deref(), Some("agent-a"));
-        assert_eq!(entry.source_terminal_id.as_deref(), Some("t1"));
-    }
-
-    #[test]
-    fn closing_live_diff_feed_discards_pending_refresh_and_ignores_late_results() {
-        let mut ws = WorkspaceState::new();
-        let scope_root = PathBuf::from("/tmp/repo");
-        ws.projects
-            .push(project("proj-1", tabs(vec![term("t1")], 0)));
-        ws.terminal_git_scopes
-            .insert("t1".into(), scope_root.clone());
-        ws.git_scopes
-            .insert(scope_root.clone(), snapshot_with("/tmp/repo", 2, "main"));
-        assert!(ws.open_or_focus_live_diff_stream_tab_internal("proj-1"));
-        assert!(ws
-            .live_diff_feeds
-            .get("proj-1")
-            .and_then(|feed| feed.tracked_scopes.get(&scope_root))
-            .is_some_and(|scope_state| scope_state.pending_refresh));
-
-        assert!(ws.close_auxiliary_tab_internal("aux-live-diff-proj-1"));
-        assert!(ws.live_diff_feed_state("proj-1").is_none());
-
-        ws.apply_live_feed_capture_update(
-            "proj-1",
-            scope_root,
-            2,
-            1,
-            Ok(feed_capture_result(
-                1,
-                vec![feed_layer(
-                    "/tmp/repo",
-                    2,
-                    DiffSectionKind::Unstaged,
-                    "a.rs",
-                    1,
-                )],
-                Some(feed_event(
-                    FeedEventKind::BootstrapSnapshot,
-                    vec![feed_file_summary(
-                        "a.rs",
-                        DiffSectionKind::Unstaged,
-                        GitFileStatus::Modified,
-                    )],
-                    captured_event(
-                        vec![feed_event_file(
-                            "/tmp/repo",
-                            2,
-                            DiffSectionKind::Unstaged,
-                            "a.rs",
-                            1,
-                        )],
-                        Vec::new(),
-                        false,
-                    ),
-                )),
-            )),
-        );
-        assert!(ws.live_diff_feed_state("proj-1").is_none());
-    }
-
-    #[test]
-    fn feed_preview_layout_single_file_can_use_full_budget() {
-        let preview = WorkspaceState::build_feed_preview_layout(&CapturedEventDiff {
-            files: vec![CapturedDiffFile {
-                selection: DiffSelectionKey {
-                    section: DiffSectionKind::Unstaged,
-                    relative_path: PathBuf::from("a.rs"),
-                },
-                file: changed_file("a.rs", GitFileStatus::Modified),
-                document: file_document_with_lines("/tmp/repo", 2, "a.rs", 40),
-            }],
-            failed_files: Vec::new(),
-            truncated: false,
-            total_rendered_lines: 40,
-            total_rendered_bytes: 400,
-        });
-
-        assert_eq!(preview.files.len(), 1);
-        assert_eq!(preview.files[0].lines.len(), FEED_PREVIEW_LINE_BUDGET);
-    }
-
-    #[test]
-    fn feed_preview_layout_skips_file_and_hunk_headers() {
-        let preview = WorkspaceState::build_feed_preview_layout(&CapturedEventDiff {
-            files: vec![CapturedDiffFile {
-                selection: DiffSelectionKey {
-                    section: DiffSectionKind::Unstaged,
-                    relative_path: PathBuf::from("a.rs"),
-                },
-                file: changed_file("a.rs", GitFileStatus::Modified),
-                document: file_document_with_kinds(
-                    2,
-                    "a.rs",
-                    vec![
-                        (
-                            orcashell_git::DiffLineKind::FileHeader,
-                            "diff --git a/a.rs b/a.rs",
-                        ),
-                        (orcashell_git::DiffLineKind::HunkHeader, "@@ -1,2 +1,2 @@"),
-                        (orcashell_git::DiffLineKind::Deletion, "old line"),
-                        (orcashell_git::DiffLineKind::Addition, "new line"),
-                    ],
-                ),
-            }],
-            failed_files: Vec::new(),
-            truncated: false,
-            total_rendered_lines: 4,
-            total_rendered_bytes: 64,
-        });
-
-        assert_eq!(preview.files.len(), 1);
-        assert_eq!(
-            preview.files[0]
-                .lines
-                .iter()
-                .map(|line| line.kind)
-                .collect::<Vec<_>>(),
-            vec![
-                orcashell_git::DiffLineKind::Deletion,
-                orcashell_git::DiffLineKind::Addition,
-            ]
-        );
-    }
-
-    #[test]
-    fn feed_preview_layout_evenly_distributes_budget_across_visible_files() {
-        let preview = WorkspaceState::build_feed_preview_layout(&CapturedEventDiff {
-            files: ["a.rs", "b.rs", "c.rs", "d.rs"]
-                .into_iter()
-                .map(|path| CapturedDiffFile {
-                    selection: DiffSelectionKey {
-                        section: DiffSectionKind::Unstaged,
-                        relative_path: PathBuf::from(path),
-                    },
-                    file: changed_file(path, GitFileStatus::Modified),
-                    document: file_document_with_lines("/tmp/repo", 2, path, 20),
-                })
-                .collect(),
-            failed_files: Vec::new(),
-            truncated: false,
-            total_rendered_lines: 80,
-            total_rendered_bytes: 800,
-        });
-
-        assert_eq!(
-            preview
-                .files
-                .iter()
-                .map(|file| file.lines.len())
-                .collect::<Vec<_>>(),
-            vec![6, 6, 6]
-        );
-    }
-
-    #[test]
-    fn feed_preview_layout_evenly_distributes_budget_across_two_files() {
-        let preview = WorkspaceState::build_feed_preview_layout(&CapturedEventDiff {
-            files: ["a.rs", "b.rs"]
-                .into_iter()
-                .map(|path| CapturedDiffFile {
-                    selection: DiffSelectionKey {
-                        section: DiffSectionKind::Unstaged,
-                        relative_path: PathBuf::from(path),
-                    },
-                    file: changed_file(path, GitFileStatus::Modified),
-                    document: file_document_with_lines("/tmp/repo", 2, path, 20),
-                })
-                .collect(),
-            failed_files: Vec::new(),
-            truncated: false,
-            total_rendered_lines: 40,
-            total_rendered_bytes: 400,
-        });
-
-        assert_eq!(
-            preview
-                .files
-                .iter()
-                .map(|file| file.lines.len())
-                .collect::<Vec<_>>(),
-            vec![9, 9]
-        );
-    }
-
-    #[test]
-    fn feed_preview_layout_evenly_distributes_budget_across_three_files() {
-        let preview = WorkspaceState::build_feed_preview_layout(&CapturedEventDiff {
-            files: ["a.rs", "b.rs", "c.rs"]
-                .into_iter()
-                .map(|path| CapturedDiffFile {
-                    selection: DiffSelectionKey {
-                        section: DiffSectionKind::Unstaged,
-                        relative_path: PathBuf::from(path),
-                    },
-                    file: changed_file(path, GitFileStatus::Modified),
-                    document: file_document_with_lines("/tmp/repo", 2, path, 20),
-                })
-                .collect(),
-            failed_files: Vec::new(),
-            truncated: false,
-            total_rendered_lines: 60,
-            total_rendered_bytes: 600,
-        });
-
-        assert_eq!(
-            preview
-                .files
-                .iter()
-                .map(|file| file.lines.len())
-                .collect::<Vec<_>>(),
-            vec![6, 6, 6]
-        );
-    }
-
-    #[test]
-    fn feed_preview_layout_redistributes_budget_from_short_files() {
-        let preview = WorkspaceState::build_feed_preview_layout(&CapturedEventDiff {
-            files: vec![
-                CapturedDiffFile {
-                    selection: DiffSelectionKey {
-                        section: DiffSectionKind::Unstaged,
-                        relative_path: PathBuf::from("short.rs"),
-                    },
-                    file: changed_file("short.rs", GitFileStatus::Modified),
-                    document: file_document_with_lines("/tmp/repo", 2, "short.rs", 1),
-                },
-                CapturedDiffFile {
-                    selection: DiffSelectionKey {
-                        section: DiffSectionKind::Unstaged,
-                        relative_path: PathBuf::from("long-a.rs"),
-                    },
-                    file: changed_file("long-a.rs", GitFileStatus::Modified),
-                    document: file_document_with_lines("/tmp/repo", 2, "long-a.rs", 20),
-                },
-                CapturedDiffFile {
-                    selection: DiffSelectionKey {
-                        section: DiffSectionKind::Unstaged,
-                        relative_path: PathBuf::from("long-b.rs"),
-                    },
-                    file: changed_file("long-b.rs", GitFileStatus::Modified),
-                    document: file_document_with_lines("/tmp/repo", 2, "long-b.rs", 20),
-                },
-            ],
-            failed_files: Vec::new(),
-            truncated: false,
-            total_rendered_lines: 41,
-            total_rendered_bytes: 410,
-        });
-
-        assert_eq!(
-            preview
-                .files
-                .iter()
-                .map(|file| file.lines.len())
-                .collect::<Vec<_>>(),
-            vec![1, 9, 8]
-        );
-    }
-
-    #[test]
-    fn feed_preview_layout_limits_visible_files_and_tracks_hidden_names() {
-        let preview = WorkspaceState::build_feed_preview_layout(&CapturedEventDiff {
-            files: ["a.rs", "b.rs", "c.rs", "d.rs", "e.rs", "f.rs"]
-                .into_iter()
-                .map(|path| CapturedDiffFile {
-                    selection: DiffSelectionKey {
-                        section: DiffSectionKind::Unstaged,
-                        relative_path: PathBuf::from(path),
-                    },
-                    file: changed_file(path, GitFileStatus::Modified),
-                    document: file_document_with_lines("/tmp/repo", 2, path, 10),
-                })
-                .collect(),
-            failed_files: Vec::new(),
-            truncated: false,
-            total_rendered_lines: 60,
-            total_rendered_bytes: 600,
-        });
-
-        assert_eq!(preview.files.len(), FEED_PREVIEW_FILE_CAP);
-        assert_eq!(preview.hidden_file_count, 3);
-        assert_eq!(
-            preview.hidden_file_names,
-            vec![
-                PathBuf::from("d.rs"),
-                PathBuf::from("e.rs"),
-                PathBuf::from("f.rs")
-            ]
-        );
-    }
-
-    #[test]
-    fn closing_diff_auxiliary_tab_clears_cached_state() {
-        let mut ws = WorkspaceState::new();
-        let scope_root = PathBuf::from("/tmp/repo");
-        let tab_id = WorkspaceState::diff_tab_id(&scope_root);
-        ws.auxiliary_tabs.push(AuxiliaryTabState {
-            id: tab_id.clone(),
-            title: "Diff: main".into(),
-            kind: AuxiliaryTabKind::Diff {
-                scope_root: scope_root.clone(),
-            },
-        });
-        ws.active_auxiliary_tab_id = Some(tab_id.clone());
-        ws.diff_tabs
-            .insert(scope_root.clone(), DiffTabState::new(scope_root.clone()));
-
-        assert!(ws.close_auxiliary_tab_internal(&tab_id));
-        assert!(ws.active_auxiliary_tab_id.is_none());
-        assert!(!ws.diff_tabs.contains_key(&scope_root));
-        assert!(ws.auxiliary_tabs.is_empty());
-    }
-
-    #[test]
-    fn diff_index_load_selects_first_file_and_refreshes_title() {
-        let mut ws = WorkspaceState::new();
-        let scope_root = PathBuf::from("/tmp/repo");
-        ws.open_or_focus_diff_tab_internal(scope_root.clone(), "main".into());
-
-        ws.apply_diff_index_update(
-            scope_root.clone(),
-            3,
-            Ok(diff_document(
-                "/tmp/repo",
-                3,
-                "feature/diff",
-                vec![
-                    changed_file("b.txt", GitFileStatus::Modified),
-                    changed_file("z.txt", GitFileStatus::Added),
-                ],
-            )),
-        );
-
-        assert_eq!(
-            ws.diff_tabs[&scope_root]
-                .selected_file
-                .as_ref()
-                .map(|k| k.relative_path.as_path()),
-            Some(PathBuf::from("b.txt").as_path())
-        );
-        assert_eq!(ws.auxiliary_tabs[0].title, "Diff: feature/diff");
-        assert!(ws.diff_tabs[&scope_root].file.loading);
-        assert_eq!(
-            ws.diff_tabs[&scope_root]
-                .file
-                .requested_selection
-                .as_ref()
-                .map(|k| k.relative_path.as_path()),
-            Some(PathBuf::from("b.txt").as_path())
-        );
-        assert_eq!(ws.diff_tabs[&scope_root].file.requested_generation, Some(3));
-    }
-
-    #[test]
-    fn diff_index_update_ignores_stale_generation() {
-        let mut ws = WorkspaceState::new();
-        let scope_root = PathBuf::from("/tmp/repo");
-        let tab_id = WorkspaceState::diff_tab_id(&scope_root);
-        ws.auxiliary_tabs.push(AuxiliaryTabState {
-            id: tab_id.clone(),
-            title: "Diff: feature/new".into(),
-            kind: AuxiliaryTabKind::Diff {
-                scope_root: scope_root.clone(),
-            },
-        });
-        ws.active_auxiliary_tab_id = Some(tab_id);
-        ws.diff_tabs.insert(
-            scope_root.clone(),
-            DiffTabState {
-                scope_root: scope_root.clone(),
-                tree_width: 300.0,
-                index: super::DiffIndexState {
-                    document: Some(diff_document(
-                        "/tmp/repo",
-                        3,
-                        "feature/new",
-                        vec![changed_file("new.rs", GitFileStatus::Modified)],
-                    )),
-                    error: None,
-                    loading: true,
-                    requested_generation: Some(3),
-                },
-                selected_file: Some(DiffSelectionKey {
-                    section: DiffSectionKind::Unstaged,
-                    relative_path: PathBuf::from("new.rs"),
-                }),
-                file: Default::default(),
-                ..DiffTabState::new(scope_root.clone())
-            },
-        );
-
-        ws.apply_diff_index_update(
-            scope_root.clone(),
-            2,
-            Ok(diff_document(
-                "/tmp/repo",
-                2,
-                "feature/old",
-                vec![changed_file("old.rs", GitFileStatus::Modified)],
-            )),
-        );
-
-        let diff_tab = &ws.diff_tabs[&scope_root];
-        assert_eq!(
-            diff_tab
-                .index
-                .document
-                .as_ref()
-                .map(|document| document.snapshot.generation),
-            Some(3)
-        );
-        assert_eq!(
-            diff_tab
-                .selected_file
-                .as_ref()
-                .map(|k| k.relative_path.as_path()),
-            Some(PathBuf::from("new.rs").as_path())
-        );
-        assert!(diff_tab.index.loading);
-        assert_eq!(ws.auxiliary_tabs[0].title, "Diff: feature/new");
-    }
-
-    #[test]
-    fn opening_diff_tab_requests_scope_snapshot_refresh() {
-        let repo = init_repo();
-        let services = WorkspaceServices::default();
-        let events = services.git.subscribe_events();
-        let mut ws = WorkspaceState::new_with_services(services);
-        let scope_root = fs::canonicalize(&repo).unwrap();
-        let scope_root_str = scope_root.display().to_string();
-        ws.git_scopes.insert(
-            scope_root.clone(),
-            snapshot_with(&scope_root_str, 1, "main"),
-        );
-
-        assert!(ws.open_or_focus_diff_tab_internal(scope_root.clone(), "main".into()));
-
-        let mut saw_snapshot = false;
-        for _ in 0..2 {
-            match events.recv_blocking().unwrap() {
-                GitEvent::SnapshotUpdated {
-                    terminal_ids,
-                    scope_root,
-                    result,
-                    ..
-                } => {
-                    assert!(terminal_ids.is_empty());
-                    let snapshot = result.unwrap();
-                    assert_eq!(scope_root.as_deref(), Some(snapshot.scope_root.as_path()));
-                    saw_snapshot = true;
-                    break;
-                }
-                GitEvent::DiffIndexLoaded { .. } => {}
-                other => panic!("unexpected event: {other:?}"),
-            }
-        }
-
-        assert!(saw_snapshot);
-    }
-
-    #[test]
-    fn file_diff_update_ignores_non_selected_paths() {
-        let mut ws = WorkspaceState::new();
-        let scope_root = PathBuf::from("/tmp/repo");
-        ws.diff_tabs.insert(
-            scope_root.clone(),
-            DiffTabState {
-                scope_root: scope_root.clone(),
-                tree_width: 300.0,
-                index: Default::default(),
-                selected_file: Some(DiffSelectionKey {
-                    section: DiffSectionKind::Unstaged,
-                    relative_path: PathBuf::from("selected.rs"),
-                }),
-                file: Default::default(),
-                ..DiffTabState::new(scope_root.clone())
-            },
-        );
-
-        ws.apply_file_diff_update(
-            scope_root.clone(),
-            4,
-            DiffSelectionKey {
-                section: DiffSectionKind::Unstaged,
-                relative_path: PathBuf::from("other.rs"),
-            },
-            Ok(file_document("/tmp/repo", 4, "other.rs")),
-        );
-
-        assert!(ws.diff_tabs[&scope_root].file.document.is_none());
-    }
-
-    #[test]
-    fn file_diff_update_ignores_stale_generation_for_selected_path() {
-        let mut ws = WorkspaceState::new();
-        let scope_root = PathBuf::from("/tmp/repo");
-        ws.diff_tabs.insert(
-            scope_root.clone(),
-            DiffTabState {
-                scope_root: scope_root.clone(),
-                tree_width: 300.0,
-                index: Default::default(),
-                selected_file: Some(DiffSelectionKey {
-                    section: DiffSectionKind::Unstaged,
-                    relative_path: PathBuf::from("selected.rs"),
-                }),
-                file: super::DiffFileState {
-                    document: Some(file_document("/tmp/repo", 5, "selected.rs")),
-                    error: None,
-                    loading: true,
-                    requested_generation: Some(5),
-                    requested_selection: Some(DiffSelectionKey {
-                        section: DiffSectionKind::Unstaged,
-                        relative_path: PathBuf::from("selected.rs"),
-                    }),
-                },
-                ..DiffTabState::new(scope_root.clone())
-            },
-        );
-
-        ws.apply_file_diff_update(
-            scope_root.clone(),
-            4,
-            DiffSelectionKey {
-                section: DiffSectionKind::Unstaged,
-                relative_path: PathBuf::from("selected.rs"),
-            },
-            Ok(file_document("/tmp/repo", 4, "selected.rs")),
-        );
-
-        let file_state = &ws.diff_tabs[&scope_root].file;
-        assert_eq!(
-            file_state
-                .document
-                .as_ref()
-                .map(|document| document.generation),
-            Some(5)
-        );
-        assert!(file_state.loading);
-        assert!(file_state.error.is_none());
-    }
-
-    #[test]
-    fn refresh_diff_theme_requeues_selected_file_when_old_request_is_in_flight() {
-        let mut ws = WorkspaceState::new();
-        let scope_root = PathBuf::from("/tmp/repo");
-        let selection = DiffSelectionKey {
-            section: DiffSectionKind::Unstaged,
-            relative_path: PathBuf::from("src/lib.rs"),
-        };
-        ws.git_scopes
-            .insert(scope_root.clone(), snapshot_with("/tmp/repo", 7, "main"));
-        ws.diff_tabs.insert(
-            scope_root.clone(),
-            DiffTabState {
-                scope_root: scope_root.clone(),
-                tree_width: 300.0,
-                index: super::DiffIndexState {
-                    document: Some(diff_document(
-                        "/tmp/repo",
-                        7,
-                        "main",
-                        vec![changed_file("src/lib.rs", GitFileStatus::Modified)],
-                    )),
-                    error: None,
-                    loading: false,
-                    requested_generation: Some(7),
-                },
-                selected_file: Some(selection.clone()),
-                file: super::DiffFileState {
-                    document: Some(file_document("/tmp/repo", 7, "src/lib.rs")),
-                    error: Some("stale".into()),
-                    loading: true,
-                    requested_generation: Some(7),
-                    requested_selection: Some(selection.clone()),
-                },
-                ..DiffTabState::new(scope_root.clone())
-            },
-        );
-
-        ws.refresh_diff_theme_for(ThemeId::Light);
-
-        let file = &ws.diff_tabs[&scope_root].file;
-        assert!(file.document.is_none());
-        assert!(file.error.is_none());
-        assert!(file.loading);
-        assert_eq!(file.requested_generation, Some(7));
-        assert_eq!(file.requested_selection.as_ref(), Some(&selection));
-    }
-
-    #[test]
-    fn refresh_diff_theme_rehighlights_saved_live_feed_captures() {
-        let mut ws = WorkspaceState::new();
-        let project_id = "proj-1".to_string();
-        let scope_root = PathBuf::from("/tmp/repo");
-
-        let mut feed = ChangeFeedState::new(project_id.clone());
-        feed.entries.push_back(ChangeFeedEntry {
-            id: 1,
-            observed_at: SystemTime::UNIX_EPOCH,
-            origin: FeedEntryOrigin::LiveDelta,
-            scope_root: scope_root.clone(),
-            branch_name: "main".into(),
-            scope_kind: FeedScopeKind::ProjectRoot,
-            worktree_name: None,
-            source_terminal_id: None,
-            generation: 7,
-            changed_file_count: 1,
-            insertions: 1,
-            deletions: 0,
-            files: vec![feed_file_summary(
-                "src/lib.rs",
-                DiffSectionKind::Unstaged,
-                GitFileStatus::Modified,
-            )],
-            capture_state: FeedCaptureState::Ready(CapturedEventDiff {
-                files: vec![CapturedDiffFile {
-                    selection: DiffSelectionKey {
-                        section: DiffSectionKind::Unstaged,
-                        relative_path: PathBuf::from("src/lib.rs"),
-                    },
-                    file: changed_file("src/lib.rs", GitFileStatus::Modified),
-                    document: file_document_with_kinds(
-                        7,
-                        "src/lib.rs",
-                        vec![(
-                            orcashell_git::DiffLineKind::Context,
-                            "fn themed() { let value = 1; }",
-                        )],
-                    ),
-                }],
-                failed_files: Vec::new(),
-                truncated: false,
-                total_rendered_lines: 1,
-                total_rendered_bytes: 29,
-            }),
-        });
-        ws.live_diff_feeds.insert(project_id, feed);
-
-        ws.refresh_diff_theme_for(ThemeId::Light);
-
-        let entry = &ws.live_diff_feeds["proj-1"].entries[0];
-        let FeedCaptureState::Ready(captured) = &entry.capture_state else {
-            panic!("expected ready capture");
-        };
-        assert!(captured.files[0].document.lines[0].highlights.is_some());
-    }
-
-    #[test]
-    fn snapshot_error_marks_open_diff_tab_unavailable() {
-        let mut ws = WorkspaceState::new();
-        let scope_root = PathBuf::from("/tmp/repo");
-        ws.open_or_focus_diff_tab_internal(scope_root.clone(), "main".into());
-
-        ws.apply_snapshot_update(
-            vec![],
-            Some(scope_root.clone()),
-            Err("repo unavailable".into()),
-        );
-
-        let diff_tab = &ws.diff_tabs[&scope_root];
-        assert_eq!(diff_tab.index.error.as_deref(), Some("repo unavailable"));
-        assert!(!diff_tab.index.loading);
-    }
-
-    #[test]
-    fn newer_snapshot_marks_diff_tab_stale_and_requests_reload() {
-        let mut ws = WorkspaceState::new();
-        let scope_root = PathBuf::from("/tmp/repo");
-        ws.open_or_focus_diff_tab_internal(scope_root.clone(), "main".into());
-        ws.diff_tabs.insert(
-            scope_root.clone(),
-            DiffTabState {
-                scope_root: scope_root.clone(),
-                tree_width: 300.0,
-                index: super::DiffIndexState {
-                    document: Some(diff_document(
-                        "/tmp/repo",
-                        1,
-                        "main",
-                        vec![changed_file("src/lib.rs", GitFileStatus::Modified)],
-                    )),
-                    error: None,
-                    loading: false,
-                    requested_generation: Some(1),
-                },
-                selected_file: Some(DiffSelectionKey {
-                    section: DiffSectionKind::Unstaged,
-                    relative_path: PathBuf::from("src/lib.rs"),
-                }),
-                file: super::DiffFileState {
-                    document: Some(file_document("/tmp/repo", 1, "src/lib.rs")),
-                    error: None,
-                    loading: false,
-                    requested_generation: Some(1),
-                    requested_selection: Some(DiffSelectionKey {
-                        section: DiffSectionKind::Unstaged,
-                        relative_path: PathBuf::from("src/lib.rs"),
-                    }),
-                },
-                ..DiffTabState::new(scope_root.clone())
-            },
-        );
-
-        ws.apply_snapshot_update(
-            vec![],
-            Some(scope_root.clone()),
-            Ok(snapshot_with("/tmp/repo", 2, "feature/reload")),
-        );
-
-        assert!(ws.diff_tabs[&scope_root].index.loading);
-        assert_eq!(
-            ws.diff_tabs[&scope_root].index.requested_generation,
-            Some(2)
-        );
-        assert_eq!(ws.auxiliary_tabs[0].title, "Diff: feature/reload");
-    }
-
-    #[test]
-    fn select_terminal_across_projects_preserves_other_notifications() {
-        let mut ws = WorkspaceState::new();
-        ws.projects
-            .push(project("proj-1", tabs(vec![term("t1"), term("t2")], 0)));
-        ws.projects
-            .push(project("proj-2", tabs(vec![term("t3")], 0)));
-        ws.active_project_id = Some("proj-1".into());
-        ws.focus.set_current(FocusTarget {
-            project_id: "proj-1".into(),
-            layout_path: vec![0],
-        });
-        ws.terminal_runtime
-            .insert("t1".into(), runtime_state(Some(NotificationTier::Urgent)));
-        ws.terminal_runtime.insert(
-            "t3".into(),
-            runtime_state(Some(NotificationTier::Informational)),
-        );
-
-        assert!(ws.select_terminal_internal("proj-2", &[0]));
-
-        assert_eq!(ws.active_project_id.as_deref(), Some("proj-2"));
-        assert_eq!(
-            ws.terminal_notification_tier("t1"),
-            Some(NotificationTier::Urgent)
-        );
-        assert_eq!(ws.terminal_notification_tier("t3"), None);
-        assert!(ws.focus.is_focused("proj-2", &[0]));
-    }
-
-    #[test]
-    fn classify_notification_matches_title_and_body() {
-        let patterns = vec!["permission".to_string()];
-
-        assert_eq!(
-            classify_notification("Permission required", "", &patterns),
-            NotificationTier::Urgent
-        );
-        assert_eq!(
-            classify_notification("", "permission required", &patterns),
-            NotificationTier::Urgent
-        );
-        assert_eq!(
-            classify_notification("Done", "all clear", &patterns),
-            NotificationTier::Informational
-        );
-    }
-
-    #[test]
-    fn late_snapshot_does_not_reattach_closed_terminal() {
-        let mut ws = WorkspaceState::new();
-        ws.projects
-            .push(project("proj-1", tabs(vec![term("t2")], 0)));
-
-        let scope_root = PathBuf::from("/tmp/repo");
-        ws.apply_snapshot_update(
-            vec!["t1".into()],
-            Some(scope_root.clone()),
-            Ok(snapshot("/tmp/repo")),
-        );
-
-        assert!(!ws.terminal_git_scopes.contains_key("t1"));
-        assert!(ws.git_scopes.contains_key(&scope_root));
-    }
-
-    #[test]
-    fn snapshot_error_detaches_all_terminals_for_failed_scope() {
-        let mut ws = WorkspaceState::new();
-        let scope_root = PathBuf::from("/tmp/repo");
-        ws.git_scopes
-            .insert(scope_root.clone(), snapshot("/tmp/repo"));
-        ws.terminal_git_scopes
-            .insert("t1".into(), scope_root.clone());
-
-        ws.apply_snapshot_update(vec![], Some(scope_root.clone()), Err("boom".into()));
-
-        assert!(!ws.terminal_git_scopes.contains_key("t1"));
-        assert!(!ws.git_scopes.contains_key(&scope_root));
-    }
-
-    #[test]
-    fn leaving_executing_state_requests_git_refresh() {
-        let repo = init_repo();
-        let services = WorkspaceServices::default();
-        let events = services.git.subscribe_events();
-        let mut ws = WorkspaceState::new_with_services(services);
-        ws.terminal_runtime.insert(
-            "t1".into(),
-            TerminalRuntimeState {
-                shell_label: "zsh".into(),
-                live_title: None,
-                semantic_state: SemanticState::Executing,
-                last_activity_at: None,
-                last_local_input_at: Some(Instant::now()),
-                notification_tier: None,
-                resumable_agent: None,
-                pending_agent_detection: false,
-            },
-        );
-
-        let transition = ws.apply_semantic_state_change(
-            "t1",
-            SemanticState::CommandComplete { exit_code: Some(0) },
-        );
-        assert!(transition.changed);
-        assert!(transition.refresh_git_snapshot);
-
-        ws.sync_terminal_git_scope("t1", Some(repo.clone()));
-
-        match events.recv_blocking().unwrap() {
-            GitEvent::SnapshotUpdated {
-                terminal_ids,
-                scope_root,
-                result,
-                ..
-            } => {
-                assert_eq!(terminal_ids, vec!["t1".to_string()]);
-                let snapshot = result.unwrap();
-                assert_eq!(scope_root.as_deref(), Some(snapshot.scope_root.as_path()));
-                assert_eq!(snapshot.scope_root, fs::canonicalize(repo).unwrap());
-            }
-            other => panic!("unexpected event: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn missing_cwd_detaches_terminal_git_scope() {
-        let mut ws = WorkspaceState::new();
-        let scope_root = PathBuf::from("/tmp/repo");
-        ws.git_scopes
-            .insert(scope_root.clone(), snapshot("/tmp/repo"));
-        ws.terminal_git_scopes
-            .insert("t1".into(), scope_root.clone());
-
-        ws.sync_terminal_git_scope("t1", None);
-
-        assert!(!ws.terminal_git_scopes.contains_key("t1"));
-        assert!(!ws.git_scopes.contains_key(&scope_root));
-    }
-
-    #[test]
-    fn selecting_git_backed_terminal_requests_snapshot_refresh() {
-        let repo = init_repo();
-        let services = WorkspaceServices::default();
-        let events = services.git.subscribe_events();
-        let mut ws = WorkspaceState::new_with_services(services);
-        let mut restored_project = project("proj-1", tabs(vec![term("t1")], 0));
-        restored_project.path = repo.clone();
-        ws.projects.push(restored_project);
-
-        let scope_root = fs::canonicalize(&repo).unwrap();
-        let scope_root_str = scope_root.display().to_string();
-        ws.git_scopes.insert(
-            scope_root.clone(),
-            snapshot_with(&scope_root_str, 1, "main"),
-        );
-        ws.terminal_git_scopes
-            .insert("t1".into(), scope_root.clone());
-
-        assert!(ws.select_terminal_internal("proj-1", &[0]));
-
-        match events.recv_blocking().unwrap() {
-            GitEvent::SnapshotUpdated {
-                terminal_ids,
-                scope_root,
-                result,
-                ..
-            } => {
-                assert_eq!(terminal_ids, vec!["t1".to_string()]);
-                let snapshot = result.unwrap();
-                assert_eq!(scope_root.as_deref(), Some(snapshot.scope_root.as_path()));
-            }
-            other => panic!("unexpected event: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn restored_terminal_cwd_prefers_existing_worktree_directory() {
-        let repo = init_repo();
-        let worktree =
-            orcashell_git::create_managed_worktree(&repo, "wt-12345678").expect("worktree");
-
-        assert_eq!(
-            WorkspaceState::restored_terminal_cwd(&repo, Some(&worktree.path)),
-            worktree.path
-        );
-    }
-
-    #[test]
-    fn restored_terminal_cwd_falls_back_to_project_path_when_missing() {
-        let project_path = PathBuf::from("/tmp/project-root");
-        let missing = project_path.join("missing-worktree");
-
-        assert_eq!(
-            WorkspaceState::restored_terminal_cwd(&project_path, Some(&missing)),
-            project_path
-        );
-    }
-
-    #[test]
-    fn detect_resumable_agent_matches_supported_commands_only() {
-        assert_eq!(
-            WorkspaceState::detect_resumable_agent(Some("codex --last")),
-            Some(ResumableAgentKind::Codex)
-        );
-        assert_eq!(
-            WorkspaceState::detect_resumable_agent(Some("   claude --continue")),
-            Some(ResumableAgentKind::ClaudeCode)
-        );
-        assert_eq!(
-            WorkspaceState::detect_resumable_agent(Some("echo codex")),
-            None
-        );
-        assert_eq!(
-            WorkspaceState::detect_resumable_agent(Some("env FOO=1 codex")),
-            None
-        );
-    }
-
-    #[test]
-    fn entering_executing_enables_pending_agent_detection() {
-        let mut ws = WorkspaceState::new();
-        ws.terminal_runtime.insert("t1".into(), runtime_state(None));
-
-        let transition = ws.apply_semantic_state_change("t1", SemanticState::Executing);
-
-        assert!(transition.changed);
-        assert!(transition.entered_executing);
-        assert!(
-            ws.terminal_runtime
-                .get("t1")
-                .unwrap()
-                .pending_agent_detection
-        );
-    }
-
-    #[test]
-    fn later_title_changes_do_not_retarget_armed_agent() {
-        let mut ws = WorkspaceState::new();
-        let mut runtime = runtime_state(None);
-        runtime.semantic_state = SemanticState::Executing;
-        runtime.pending_agent_detection = true;
-        runtime.live_title = Some("codex --last".into());
-        ws.terminal_runtime.insert("t1".into(), runtime);
-
-        assert_eq!(
-            WorkspaceState::detect_resumable_agent(ws.terminal_runtime["t1"].live_title.as_deref()),
-            Some(ResumableAgentKind::Codex)
-        );
-
-        {
-            let runtime = ws.terminal_runtime.get_mut("t1").unwrap();
-            runtime.resumable_agent = Some(ResumableAgentKind::Codex);
-            runtime.pending_agent_detection = false;
-            runtime.live_title = Some("claude --continue".into());
-        }
-
-        assert_eq!(
-            ws.terminal_runtime["t1"].resumable_agent,
-            Some(ResumableAgentKind::Codex)
-        );
-    }
-
-    #[test]
-    fn build_project_resume_restore_plan_suppresses_duplicate_same_cwd_rows() {
-        let mut ws = workspace_with_store();
-        ws.projects.push(project(
-            "proj-1",
-            tabs(vec![term("term-a"), term("term-b")], 0),
-        ));
-
-        {
-            let mut store = ws.services.store.lock();
-            let store = store.as_mut().unwrap();
-            store
-                .upsert_agent_terminal(&orcashell_store::StoredAgentTerminal {
-                    terminal_id: "term-a".into(),
-                    project_id: "proj-1".into(),
-                    agent_kind: ResumableAgentKind::Codex,
-                    cwd: PathBuf::from("/repo/wt"),
-                    updated_at: String::new(),
-                })
-                .unwrap();
-            store
-                .upsert_agent_terminal(&orcashell_store::StoredAgentTerminal {
-                    terminal_id: "term-b".into(),
-                    project_id: "proj-1".into(),
-                    agent_kind: ResumableAgentKind::Codex,
-                    cwd: PathBuf::from("/repo/wt"),
-                    updated_at: String::new(),
-                })
-                .unwrap();
-            store
-                .upsert_agent_terminal(&orcashell_store::StoredAgentTerminal {
-                    terminal_id: "term-c".into(),
-                    project_id: "proj-1".into(),
-                    agent_kind: ResumableAgentKind::ClaudeCode,
-                    cwd: PathBuf::from("/repo/wt-2"),
-                    updated_at: String::new(),
-                })
-                .unwrap();
-            store.delete_agent_terminal("term-a").unwrap();
-            store
-                .upsert_agent_terminal(&orcashell_store::StoredAgentTerminal {
-                    terminal_id: "term-a".into(),
-                    project_id: "proj-1".into(),
-                    agent_kind: ResumableAgentKind::Codex,
-                    cwd: PathBuf::from("/repo/wt"),
-                    updated_at: String::new(),
-                })
-                .unwrap();
-        }
-
-        let plan = ws.build_project_resume_restore_plan("proj-1");
-
-        assert_eq!(plan.rows_by_terminal_id.len(), 3);
-        assert!(plan.winning_terminal_ids.contains("term-c"));
-        assert_ne!(
-            plan.winning_terminal_ids.contains("term-a"),
-            plan.winning_terminal_ids.contains("term-b")
-        );
-        assert_eq!(plan.suppressed_duplicates, 1);
-    }
-
-    #[test]
-    fn prepare_resume_injection_marks_attempted_before_write() {
-        let mut ws = WorkspaceState::new();
-        ws.pending_resume_injections.insert(
-            "term-1".into(),
-            super::PendingResumeInjection {
-                terminal_id: "term-1".into(),
-                agent_kind: ResumableAgentKind::Codex,
-                command: WorkspaceState::resume_command(ResumableAgentKind::Codex),
-                resume_attempted: false,
-            },
-        );
-
-        let prepared =
-            ws.prepare_resume_injection_attempt("term-1", ResumeInjectionTrigger::PromptReady);
-        assert!(prepared.is_some());
-        assert!(
-            ws.pending_resume_injections["term-1"].resume_attempted,
-            "resume attempt should be marked before the write occurs"
-        );
-        assert!(ws
-            .prepare_resume_injection_attempt("term-1", ResumeInjectionTrigger::TimeoutFallback)
-            .is_none());
-    }
-
-    #[test]
-    fn disarm_resumable_agent_clears_persisted_row() {
-        let mut ws = workspace_with_store();
-        ws.projects
-            .push(project("proj-1", tabs(vec![term("term-1")], 0)));
-        let mut runtime = runtime_state(None);
-        runtime.semantic_state = SemanticState::Executing;
-        runtime.resumable_agent = Some(ResumableAgentKind::Codex);
-        runtime.pending_agent_detection = false;
-        ws.terminal_runtime.insert("term-1".into(), runtime);
-
-        {
-            let mut store = ws.services.store.lock();
-            store
-                .as_mut()
-                .unwrap()
-                .upsert_agent_terminal(&orcashell_store::StoredAgentTerminal {
-                    terminal_id: "term-1".into(),
-                    project_id: "proj-1".into(),
-                    agent_kind: ResumableAgentKind::Codex,
-                    cwd: PathBuf::from("/repo/wt"),
-                    updated_at: String::new(),
-                })
-                .unwrap();
-        }
-
-        ws.disarm_resumable_agent("term-1");
-
-        assert!(ws
-            .services
-            .store
-            .lock()
-            .as_ref()
-            .unwrap()
-            .load_agent_terminals_for_project("proj-1")
-            .unwrap()
-            .is_empty());
-        assert!(ws.terminal_runtime["term-1"].resumable_agent.is_none());
-    }
-
-    #[test]
-    fn should_queue_resume_injection_requires_winner_and_matching_cwd() {
-        let row = orcashell_store::StoredAgentTerminal {
-            terminal_id: "term-1".into(),
-            project_id: "proj-1".into(),
-            agent_kind: ResumableAgentKind::Codex,
-            cwd: PathBuf::from("/repo/wt"),
-            updated_at: String::new(),
-        };
-        let winners = HashSet::from([String::from("term-1")]);
-
-        assert!(WorkspaceState::should_queue_resume_injection(
-            &row,
-            PathBuf::from("/repo/wt").as_path(),
-            &winners,
-        ));
-        assert!(!WorkspaceState::should_queue_resume_injection(
-            &row,
-            PathBuf::from("/repo/project-root").as_path(),
-            &winners,
-        ));
-        assert!(!WorkspaceState::should_queue_resume_injection(
-            &row,
-            PathBuf::from("/repo/wt").as_path(),
-            &HashSet::new(),
-        ));
-    }
-
-    #[test]
-    fn successful_resume_injection_marks_terminal_for_cleanup() {
-        let mut ws = WorkspaceState::new();
-        ws.terminal_runtime
-            .insert("term-1".into(), runtime_state(None));
-        let prepared = super::PreparedResumeInjection {
-            terminal_id: "term-1".into(),
-            agent_kind: ResumableAgentKind::ClaudeCode,
-            command: WorkspaceState::resume_command(ResumableAgentKind::ClaudeCode),
-            trigger: ResumeInjectionTrigger::PromptReady,
-        };
-
-        ws.mark_resume_injection_succeeded(&prepared);
-
-        assert_eq!(
-            ws.terminal_runtime["term-1"].resumable_agent,
-            Some(ResumableAgentKind::ClaudeCode)
-        );
-        assert!(!ws.terminal_runtime["term-1"].pending_agent_detection);
-    }
-
-    // ── CP2: Action state tests ──────────────────────────────────────
-
-    #[test]
-    fn local_action_completed_stage_clears_flag_no_banner() {
-        let mut ws = WorkspaceState::new();
-        let scope_root = PathBuf::from("/tmp/repo");
-        ws.diff_tabs
-            .insert(scope_root.clone(), DiffTabState::new(scope_root.clone()));
-        ws.diff_tabs
-            .get_mut(&scope_root)
-            .unwrap()
-            .local_action_in_flight = true;
-
-        ws.apply_local_action_completion(
-            scope_root.clone(),
-            GitActionKind::Stage,
-            Ok("Staged successfully".into()),
-        );
-
-        let tab = &ws.diff_tabs[&scope_root];
-        assert!(!tab.local_action_in_flight);
-        // Stage/unstage success skips banner. The tree update is feedback enough.
-        assert!(tab.last_action_banner.is_none());
-    }
-
-    #[test]
-    fn local_action_completed_commit_sets_success_banner() {
-        let mut ws = WorkspaceState::new();
-        let scope_root = PathBuf::from("/tmp/repo");
-        ws.diff_tabs
-            .insert(scope_root.clone(), DiffTabState::new(scope_root.clone()));
-        ws.diff_tabs
-            .get_mut(&scope_root)
-            .unwrap()
-            .local_action_in_flight = true;
-
-        ws.apply_local_action_completion(
-            scope_root.clone(),
-            GitActionKind::Commit,
-            Ok("Committed abc12345".into()),
-        );
-
-        let tab = &ws.diff_tabs[&scope_root];
-        assert!(!tab.local_action_in_flight);
-        assert_eq!(
-            tab.last_action_banner.as_ref().unwrap().kind,
-            super::ActionBannerKind::Success
-        );
-    }
-
-    #[test]
-    fn local_action_completed_error_sets_error_banner_and_keeps_multi_select() {
-        let mut ws = WorkspaceState::new();
-        let scope_root = PathBuf::from("/tmp/repo");
-        let mut tab = DiffTabState::new(scope_root.clone());
-        tab.local_action_in_flight = true;
-        tab.multi_select.insert(DiffSelectionKey {
-            section: DiffSectionKind::Unstaged,
-            relative_path: PathBuf::from("a.txt"),
-        });
-        ws.diff_tabs.insert(scope_root.clone(), tab);
-
-        ws.apply_local_action_completion(
-            scope_root.clone(),
-            GitActionKind::Stage,
-            Err("index locked".into()),
-        );
-
-        let tab = &ws.diff_tabs[&scope_root];
-        assert!(!tab.local_action_in_flight);
-        assert_eq!(
-            tab.last_action_banner.as_ref().unwrap().kind,
-            super::ActionBannerKind::Error
-        );
-        // Multi-select should NOT be cleared on error
-        assert!(!tab.multi_select.is_empty());
-    }
-
-    #[test]
-    fn successful_commit_clears_commit_message_and_multi_select() {
-        let mut ws = WorkspaceState::new();
-        let scope_root = PathBuf::from("/tmp/repo");
-        let mut tab = DiffTabState::new(scope_root.clone());
-        tab.local_action_in_flight = true;
-        tab.commit_message = "my commit".into();
-        tab.multi_select.insert(DiffSelectionKey {
-            section: DiffSectionKind::Staged,
-            relative_path: PathBuf::from("a.txt"),
-        });
-        ws.diff_tabs.insert(scope_root.clone(), tab);
-
-        ws.apply_local_action_completion(
-            scope_root.clone(),
-            GitActionKind::Commit,
-            Ok("Committed abc12345".into()),
-        );
-
-        let tab = &ws.diff_tabs[&scope_root];
-        assert!(tab.commit_message.is_empty());
-        assert!(tab.multi_select.is_empty());
-    }
-
-    #[test]
-    fn remote_op_completed_clears_flag_and_sets_banner() {
-        let mut ws = WorkspaceState::new();
-        let scope_root = PathBuf::from("/tmp/repo");
-        let mut tab = DiffTabState::new(scope_root.clone());
-        tab.remote_op_in_flight = true;
-        ws.diff_tabs.insert(scope_root.clone(), tab);
-
-        ws.apply_remote_op_completion(
-            scope_root.clone(),
-            GitRemoteKind::Push,
-            Ok("Everything up-to-date".into()),
-        );
-
-        let tab = &ws.diff_tabs[&scope_root];
-        assert!(!tab.remote_op_in_flight);
-        assert_eq!(
-            tab.last_action_banner.as_ref().unwrap().kind,
-            super::ActionBannerKind::Success
-        );
-    }
-
-    // ── Multi-select tests ──────────────────────────────────────────
-
-    fn make_key(section: DiffSectionKind, path: &str) -> DiffSelectionKey {
-        DiffSelectionKey {
-            section,
-            relative_path: PathBuf::from(path),
-        }
-    }
-
-    #[test]
-    fn diff_replace_select_clears_and_sets_single() {
-        let mut ws = WorkspaceState::new();
-        let scope = PathBuf::from("/tmp/repo");
-        let mut tab = DiffTabState::new(scope.clone());
-        tab.multi_select
-            .insert(make_key(DiffSectionKind::Unstaged, "a.rs"));
-        tab.multi_select
-            .insert(make_key(DiffSectionKind::Unstaged, "b.rs"));
-        ws.diff_tabs.insert(scope.clone(), tab);
-
-        let key = make_key(DiffSectionKind::Staged, "c.rs");
-        ws.diff_replace_select_internal(&scope, key.clone());
-
-        let tab = &ws.diff_tabs[&scope];
-        assert_eq!(tab.multi_select.len(), 1);
-        assert!(tab.multi_select.contains(&key));
-        assert_eq!(tab.selection_anchor, Some(key));
-    }
-
-    #[test]
-    fn diff_toggle_multi_select_adds_and_removes() {
-        let mut ws = WorkspaceState::new();
-        let scope = PathBuf::from("/tmp/repo");
-        ws.diff_tabs
-            .insert(scope.clone(), DiffTabState::new(scope.clone()));
-
-        let key_a = make_key(DiffSectionKind::Unstaged, "a.rs");
-        let key_b = make_key(DiffSectionKind::Unstaged, "b.rs");
-
-        // Toggle on a
-        ws.diff_toggle_multi_select_internal(&scope, key_a.clone());
-        assert!(ws.diff_tabs[&scope].multi_select.contains(&key_a));
-
-        // Toggle on b (same section)
-        ws.diff_toggle_multi_select_internal(&scope, key_b.clone());
-        assert!(ws.diff_tabs[&scope].multi_select.contains(&key_a));
-        assert!(ws.diff_tabs[&scope].multi_select.contains(&key_b));
-
-        // Toggle off a
-        ws.diff_toggle_multi_select_internal(&scope, key_a.clone());
-        assert!(!ws.diff_tabs[&scope].multi_select.contains(&key_a));
-        assert!(ws.diff_tabs[&scope].multi_select.contains(&key_b));
-    }
-
-    #[test]
-    fn diff_toggle_multi_select_cross_section_clears() {
-        let mut ws = WorkspaceState::new();
-        let scope = PathBuf::from("/tmp/repo");
-        ws.diff_tabs
-            .insert(scope.clone(), DiffTabState::new(scope.clone()));
-
-        let unstaged_key = make_key(DiffSectionKind::Unstaged, "a.rs");
-        let staged_key = make_key(DiffSectionKind::Staged, "b.rs");
-
-        ws.diff_toggle_multi_select_internal(&scope, unstaged_key.clone());
-        assert_eq!(ws.diff_tabs[&scope].multi_select.len(), 1);
-
-        // Toggling a staged key should clear unstaged keys
-        ws.diff_toggle_multi_select_internal(&scope, staged_key.clone());
-        assert_eq!(ws.diff_tabs[&scope].multi_select.len(), 1);
-        assert!(ws.diff_tabs[&scope].multi_select.contains(&staged_key));
-        assert!(!ws.diff_tabs[&scope].multi_select.contains(&unstaged_key));
-    }
-
-    #[test]
-    fn diff_range_select_within_section() {
-        let mut ws = WorkspaceState::new();
-        let scope = PathBuf::from("/tmp/repo");
-        ws.diff_tabs
-            .insert(scope.clone(), DiffTabState::new(scope.clone()));
-
-        let a = make_key(DiffSectionKind::Unstaged, "a.rs");
-        let b = make_key(DiffSectionKind::Unstaged, "b.rs");
-        let c = make_key(DiffSectionKind::Unstaged, "c.rs");
-        let visible = vec![a.clone(), b.clone(), c.clone()];
-
-        // Set anchor at a
-        ws.diff_replace_select_internal(&scope, a.clone());
-
-        // Range select to c
-        ws.diff_range_select_internal(&scope, c.clone(), &visible);
-
-        let tab = &ws.diff_tabs[&scope];
-        assert_eq!(tab.multi_select.len(), 3);
-        assert!(tab.multi_select.contains(&a));
-        assert!(tab.multi_select.contains(&b));
-        assert!(tab.multi_select.contains(&c));
-    }
-
-    #[test]
-    fn diff_range_select_cross_section_falls_back() {
-        let mut ws = WorkspaceState::new();
-        let scope = PathBuf::from("/tmp/repo");
-        ws.diff_tabs
-            .insert(scope.clone(), DiffTabState::new(scope.clone()));
-
-        let staged = make_key(DiffSectionKind::Staged, "a.rs");
-        let unstaged = make_key(DiffSectionKind::Unstaged, "b.rs");
-        let visible = vec![staged.clone(), unstaged.clone()];
-
-        // Set anchor at staged
-        ws.diff_replace_select_internal(&scope, staged.clone());
-
-        // Range select to unstaged (different section) → falls back to replace
-        ws.diff_range_select_internal(&scope, unstaged.clone(), &visible);
-
-        let tab = &ws.diff_tabs[&scope];
-        assert_eq!(tab.multi_select.len(), 1);
-        assert!(tab.multi_select.contains(&unstaged));
-    }
-
-    // ── CP4: Remove-worktree + scope exclusion tests ─────────────────
-
-    #[test]
-    fn remove_confirmation_cancel_restores_normal_state() {
-        let mut ws = WorkspaceState::new();
-        let scope = PathBuf::from("/tmp/repo");
-        let mut tab = DiffTabState::new(scope.clone());
-        tab.managed_worktree = Some(super::ManagedWorktreeSummary {
-            id: "wt-abc12345".into(),
-            branch_name: "orca/wt-abc12345".into(),
-            source_ref: "refs/heads/main".into(),
-        });
-        ws.diff_tabs.insert(scope.clone(), tab);
-
-        // Begin confirmation.
-        {
-            let tab = ws.diff_tabs.get_mut(&scope).unwrap();
-            tab.remove_worktree_confirm = Some(super::RemoveWorktreeConfirm {
-                delete_branch: false,
-            });
-        }
-        assert!(ws.diff_tabs[&scope].remove_worktree_confirm.is_some());
-
-        // Cancel.
-        {
-            let tab = ws.diff_tabs.get_mut(&scope).unwrap();
-            tab.remove_worktree_confirm = None;
-        }
-        assert!(ws.diff_tabs[&scope].remove_worktree_confirm.is_none());
-    }
-
-    #[test]
-    fn remove_confirmation_toggle_delete_branch() {
-        let mut ws = WorkspaceState::new();
-        let scope = PathBuf::from("/tmp/repo");
-        let mut tab = DiffTabState::new(scope.clone());
-        tab.managed_worktree = Some(super::ManagedWorktreeSummary {
-            id: "wt-abc12345".into(),
-            branch_name: "orca/wt-abc12345".into(),
-            source_ref: "refs/heads/main".into(),
-        });
-        tab.remove_worktree_confirm = Some(super::RemoveWorktreeConfirm {
-            delete_branch: false,
-        });
-        ws.diff_tabs.insert(scope.clone(), tab);
-
-        assert!(
-            !ws.diff_tabs[&scope]
-                .remove_worktree_confirm
-                .as_ref()
-                .unwrap()
-                .delete_branch
-        );
-
-        // Toggle.
-        {
-            let tab = ws.diff_tabs.get_mut(&scope).unwrap();
-            if let Some(confirm) = &mut tab.remove_worktree_confirm {
-                confirm.delete_branch = !confirm.delete_branch;
-            }
-        }
-        assert!(
-            ws.diff_tabs[&scope]
-                .remove_worktree_confirm
-                .as_ref()
-                .unwrap()
-                .delete_branch
-        );
-    }
-
-    #[test]
-    fn any_action_in_flight_blocks_all_dispatch() {
-        let mut ws = WorkspaceState::new();
-        let scope = PathBuf::from("/tmp/repo");
-        let mut tab = DiffTabState::new(scope.clone());
-        // Set remote op in flight.
-        tab.remote_op_in_flight = true;
-        // Add staged + unstaged files so stage/unstage/commit can potentially fire.
-        tab.multi_select
-            .insert(make_key(DiffSectionKind::Unstaged, "a.rs"));
-        tab.commit_message = "test".to_string();
-        tab.index.document = Some(diff_document(
-            "/tmp/repo",
-            1,
-            "main",
-            vec![changed_file("a.rs", GitFileStatus::Modified)],
-        ));
-        // Add staged files to the document.
-        if let Some(doc) = &mut tab.index.document {
-            doc.staged_files = vec![changed_file("a.rs", GitFileStatus::Modified)];
-        }
-        ws.diff_tabs.insert(scope.clone(), tab);
-
-        // stage_selected should no-op (guard on any_action_in_flight).
-        let before_flag = ws.diff_tabs[&scope].local_action_in_flight;
-        // We can't call the cx-requiring methods in a unit test, so verify the
-        // guard directly.
-        assert!(WorkspaceState::any_action_in_flight(
-            ws.diff_tabs.get(&scope).unwrap()
-        ));
-        assert!(!before_flag); // local_action_in_flight is not set.
-    }
-
-    #[test]
-    fn successful_remove_closes_tab_and_deletes_sqlite() {
-        let mut ws = WorkspaceState::new();
-        let scope = PathBuf::from("/tmp/repo");
-        let mut tab = DiffTabState::new(scope.clone());
-        tab.managed_worktree = Some(super::ManagedWorktreeSummary {
-            id: "wt-abc12345".into(),
-            branch_name: "orca/wt-abc12345".into(),
-            source_ref: "refs/heads/main".into(),
-        });
-        tab.local_action_in_flight = true;
-        ws.diff_tabs.insert(scope.clone(), tab);
-
-        // Add the auxiliary tab.
-        let tab_id = WorkspaceState::diff_tab_id(&scope);
-        ws.auxiliary_tabs.push(super::AuxiliaryTabState {
-            id: tab_id.clone(),
-            title: "Diff: orca/wt-abc12345".into(),
-            kind: AuxiliaryTabKind::Diff {
-                scope_root: scope.clone(),
-            },
-        });
-
-        // Simulate successful RemoveWorktree completion.
-        ws.apply_local_action_completion(
-            scope.clone(),
-            GitActionKind::RemoveWorktree,
-            Ok("Worktree removed".to_string()),
-        );
-
-        // Tab should be removed.
-        assert!(!ws.diff_tabs.contains_key(&scope));
-        assert!(!ws.auxiliary_tabs.iter().any(|t| t.id == tab_id));
-    }
-
-    #[test]
-    fn close_terminals_by_id_removes_layout_nodes_not_just_sessions() {
-        let mut ws = WorkspaceState::new();
-        ws.projects
-            .push(project("proj-1", tabs(vec![term("t1"), term("t2")], 1)));
-        ws.active_project_id = Some("proj-1".into());
-        ws.focus.set_current(FocusTarget {
-            project_id: "proj-1".into(),
-            layout_path: vec![1],
-        });
-        ws.terminal_runtime.insert("t1".into(), runtime_state(None));
-        ws.terminal_runtime.insert("t2".into(), runtime_state(None));
-
-        ws.close_terminals_by_id_internal(&["t2".to_string()]);
-
-        let project = ws.project("proj-1").unwrap();
-        assert!(project.layout.find_terminal_path("t2").is_none());
-        assert!(project.layout.find_terminal_path("t1").is_some());
-        assert!(!ws.terminal_runtime.contains_key("t2"));
-    }
-
-    #[test]
-    fn failed_remove_preserves_sqlite_row() {
-        let mut ws = WorkspaceState::new();
-        let scope = PathBuf::from("/tmp/repo");
-        let mut tab = DiffTabState::new(scope.clone());
-        tab.managed_worktree = Some(super::ManagedWorktreeSummary {
-            id: "wt-abc12345".into(),
-            branch_name: "orca/wt-abc12345".into(),
-            source_ref: "refs/heads/main".into(),
-        });
-        tab.local_action_in_flight = true;
-        ws.diff_tabs.insert(scope.clone(), tab);
-
-        // Add the auxiliary tab.
-        let tab_id = WorkspaceState::diff_tab_id(&scope);
-        ws.auxiliary_tabs.push(super::AuxiliaryTabState {
-            id: tab_id.clone(),
-            title: "Diff: orca/wt-abc12345".into(),
-            kind: AuxiliaryTabKind::Diff {
-                scope_root: scope.clone(),
-            },
-        });
-
-        // Simulate failed RemoveWorktree completion.
-        ws.apply_local_action_completion(
-            scope.clone(),
-            GitActionKind::RemoveWorktree,
-            Err("worktree removal failed".to_string()),
-        );
-
-        // Tab should still exist with error banner.
-        assert!(ws.diff_tabs.contains_key(&scope));
-        assert!(ws.auxiliary_tabs.iter().any(|t| t.id == tab_id));
-        let diff_tab = &ws.diff_tabs[&scope];
-        assert!(!diff_tab.local_action_in_flight);
-        assert_eq!(
-            diff_tab.last_action_banner.as_ref().unwrap().kind,
-            super::ActionBannerKind::Error
-        );
-    }
-}
+mod tests;

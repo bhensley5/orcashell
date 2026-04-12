@@ -1,0 +1,8 @@
+{
+  "project": "fixture-app",
+  "shell": "zsh",
+  "prompt_tag": "orca/dev",
+  "idle_timeout_ms": 1200,
+  "review_batch_size": 4,
+  "merge_strategy": "balanced"
+}

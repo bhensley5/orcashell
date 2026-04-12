@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_channel::bounded;
 use gpui::*;
@@ -13,6 +14,8 @@ use crate::diff_explorer::DiffExplorerView;
 use crate::live_diff_stream::LiveDiffStreamView;
 use crate::pane::resize::{self, ActiveDrag};
 use crate::pane::LayoutContainer;
+use crate::prompt_dialog::{PromptDialogEvent, PromptDialogOverlay, PromptDialogRequest};
+use crate::repository_browser::RepositoryBrowserView;
 use crate::settings::AppSettings;
 use crate::settings_view::SettingsView;
 use crate::sidebar::Sidebar;
@@ -34,6 +37,7 @@ pub type ContextMenuRequest = Rc<RefCell<Option<(Point<Pixels>, Vec<ContextMenuI
 
 static STARTUP_UPDATE_CHECK_STARTED: AtomicBool = AtomicBool::new(false);
 const DISMISSED_UPDATE_VERSION_KEY: &str = "dismissed_update_version";
+const REPOSITORY_AUTO_FETCH_POLL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum UpdateBannerKind {
@@ -64,6 +68,8 @@ pub struct OrcaAppView {
     active_drag: ActiveDrag,
     context_menu: Option<Entity<ContextMenuOverlay>>,
     menu_request: ContextMenuRequest,
+    prompt_dialog: Option<Entity<PromptDialogOverlay>>,
+    prompt_dialog_request: PromptDialogRequest,
     store: Arc<Mutex<Option<Store>>>,
     #[allow(dead_code)]
     save_task: Option<Task<()>>,
@@ -74,10 +80,13 @@ pub struct OrcaAppView {
     settings_save_task: Option<Task<()>>,
     diff_views: std::collections::HashMap<std::path::PathBuf, Entity<DiffExplorerView>>,
     live_diff_views: std::collections::HashMap<String, Entity<LiveDiffStreamView>>,
+    repository_views: std::collections::HashMap<String, Entity<RepositoryBrowserView>>,
     update_banner: Option<UpdateBannerState>,
     update_check_in_flight: bool,
     #[allow(dead_code)]
     update_check_task: Option<Task<()>>,
+    #[allow(dead_code)]
+    repository_auto_fetch_task: Option<Task<()>>,
 }
 
 /// Transfer GPUI keyboard focus to the currently focused terminal in the workspace.
@@ -136,6 +145,7 @@ impl OrcaAppView {
 
         let active_drag: ActiveDrag = Rc::new(RefCell::new(None));
         let menu_request: ContextMenuRequest = Rc::new(RefCell::new(None));
+        let prompt_dialog_request: PromptDialogRequest = Rc::new(RefCell::new(None));
 
         let ws_clone = workspace.clone();
         let drag_clone = active_drag.clone();
@@ -158,6 +168,19 @@ impl OrcaAppView {
                     let _ = cx.update(|cx| {
                         workspace.update(cx, |ws, cx| ws.handle_git_event(event, cx));
                     });
+                }
+            }
+        }));
+
+        let repository_auto_fetch_task = Some(cx.spawn({
+            let workspace = workspace.clone();
+            async move |this: WeakEntity<Self>, cx: &mut AsyncApp| loop {
+                Timer::after(REPOSITORY_AUTO_FETCH_POLL).await;
+                let updated = this.update(cx, |_this, cx| {
+                    workspace.update(cx, |ws, cx| ws.tick_repository_auto_fetch(cx));
+                });
+                if updated.is_err() {
+                    break;
                 }
             }
         }));
@@ -209,6 +232,9 @@ impl OrcaAppView {
             for view in this.live_diff_views.values() {
                 view.update(cx, |v, cx| v.invalidate_theme_cache(cx));
             }
+            for view in this.repository_views.values() {
+                view.update(cx, |v, cx| v.invalidate_theme_cache(cx));
+            }
             cx.notify();
         })
         .detach();
@@ -225,6 +251,8 @@ impl OrcaAppView {
             active_drag,
             context_menu: None,
             menu_request,
+            prompt_dialog: None,
+            prompt_dialog_request,
             store,
             save_task: None,
             git_event_task,
@@ -232,9 +260,11 @@ impl OrcaAppView {
             settings_save_task: None,
             diff_views: std::collections::HashMap::new(),
             live_diff_views: std::collections::HashMap::new(),
+            repository_views: std::collections::HashMap::new(),
             update_banner: None,
             update_check_in_flight: false,
             update_check_task: None,
+            repository_auto_fetch_task,
         };
         this.start_startup_update_check(cx);
         this
@@ -609,13 +639,15 @@ impl OrcaAppView {
         cx: &mut Context<Self>,
     ) -> Entity<DiffExplorerView> {
         let menu_req = self.menu_request.clone();
+        let prompt_dialog_request = self.prompt_dialog_request.clone();
         self.diff_views
             .entry(scope_root.to_path_buf())
             .or_insert_with(|| {
                 let ws = self.workspace.clone();
                 let scope_root = scope_root.to_path_buf();
                 let mr = menu_req.clone();
-                cx.new(|cx| DiffExplorerView::new(ws, scope_root, mr, cx))
+                let pdr = prompt_dialog_request.clone();
+                cx.new(|cx| DiffExplorerView::new(ws, scope_root, mr, pdr, cx))
             })
             .clone()
     }
@@ -628,7 +660,9 @@ impl OrcaAppView {
             .iter()
             .filter_map(|tab| match &tab.kind {
                 AuxiliaryTabKind::Diff { scope_root } => Some(scope_root.clone()),
-                AuxiliaryTabKind::Settings | AuxiliaryTabKind::LiveDiffStream { .. } => None,
+                AuxiliaryTabKind::Settings
+                | AuxiliaryTabKind::LiveDiffStream { .. }
+                | AuxiliaryTabKind::RepositoryGraph { .. } => None,
             })
             .collect();
         self.diff_views
@@ -650,6 +684,31 @@ impl OrcaAppView {
             .clone()
     }
 
+    fn ensure_repository_view(
+        &mut self,
+        project_id: &str,
+        cx: &mut Context<Self>,
+    ) -> Entity<RepositoryBrowserView> {
+        let workspace = self.workspace.clone();
+        let menu_request = self.menu_request.clone();
+        let prompt_dialog_request = self.prompt_dialog_request.clone();
+        self.repository_views
+            .entry(project_id.to_string())
+            .or_insert_with(|| {
+                let project_id = project_id.to_string();
+                cx.new(|cx| {
+                    RepositoryBrowserView::new(
+                        workspace,
+                        project_id,
+                        menu_request,
+                        prompt_dialog_request,
+                        cx,
+                    )
+                })
+            })
+            .clone()
+    }
+
     fn prune_closed_live_diff_views(&mut self, cx: &App) {
         let open_project_ids: std::collections::HashSet<_> = self
             .workspace
@@ -658,10 +717,29 @@ impl OrcaAppView {
             .iter()
             .filter_map(|tab| match &tab.kind {
                 AuxiliaryTabKind::LiveDiffStream { project_id } => Some(project_id.clone()),
-                AuxiliaryTabKind::Diff { .. } | AuxiliaryTabKind::Settings => None,
+                AuxiliaryTabKind::Diff { .. }
+                | AuxiliaryTabKind::RepositoryGraph { .. }
+                | AuxiliaryTabKind::Settings => None,
             })
             .collect();
         self.live_diff_views
+            .retain(|project_id, _| open_project_ids.contains(project_id));
+    }
+
+    fn prune_closed_repository_views(&mut self, cx: &App) {
+        let open_project_ids: std::collections::HashSet<_> = self
+            .workspace
+            .read(cx)
+            .auxiliary_tabs()
+            .iter()
+            .filter_map(|tab| match &tab.kind {
+                AuxiliaryTabKind::RepositoryGraph { project_id } => Some(project_id.clone()),
+                AuxiliaryTabKind::Diff { .. }
+                | AuxiliaryTabKind::LiveDiffStream { .. }
+                | AuxiliaryTabKind::Settings => None,
+            })
+            .collect();
+        self.repository_views
             .retain(|project_id, _| open_project_ids.contains(project_id));
     }
 
@@ -703,6 +781,7 @@ impl Render for OrcaAppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.prune_closed_diff_views(cx);
         self.prune_closed_live_diff_views(cx);
+        self.prune_closed_repository_views(cx);
         let palette = theme::active(cx);
 
         let workspace = self.workspace.clone();
@@ -918,6 +997,17 @@ impl Render for OrcaAppView {
                     .flex_col()
                     .child(view)
             }
+            Some(crate::workspace::AuxiliaryTabKind::RepositoryGraph { project_id }) => {
+                let view = self.ensure_repository_view(project_id, cx);
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .flex()
+                    .flex_col()
+                    .child(view)
+            }
             None => div()
                 .flex_1()
                 .min_h_0()
@@ -1012,9 +1102,29 @@ impl Render for OrcaAppView {
             self.context_menu = Some(menu);
         }
 
+        if let Some(spec) = self.prompt_dialog_request.borrow_mut().take() {
+            let ws = self.workspace.clone();
+            let dialog = cx.new(|cx| PromptDialogOverlay::new(spec, ws, cx));
+            cx.subscribe(
+                &dialog,
+                |this, _dialog, event: &PromptDialogEvent, cx| match event {
+                    PromptDialogEvent::Dismiss => {
+                        this.prompt_dialog = None;
+                        cx.notify();
+                    }
+                },
+            )
+            .detach();
+            self.prompt_dialog = Some(dialog);
+        }
+
         // Render context menu overlay if present
         if let Some(ref menu) = self.context_menu {
             container = container.child(menu.clone());
+        }
+
+        if let Some(ref dialog) = self.prompt_dialog {
+            container = container.child(dialog.clone());
         }
 
         container

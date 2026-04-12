@@ -9,8 +9,8 @@ pub mod theme;
 use orcashell_store::ThemeId;
 use std::path::Path;
 use std::sync::OnceLock;
-use syntect::easy::HighlightLines;
-use syntect::parsing::{SyntaxDefinition, SyntaxSet};
+use syntect::highlighting::{HighlightIterator, HighlightState, Theme};
+use syntect::parsing::{ParseState, ScopeStack, SyntaxDefinition, SyntaxReference, SyntaxSet};
 
 static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
 
@@ -32,8 +32,18 @@ pub struct HighlightedSpan {
 /// Maintains parse state across calls to `highlight_line`, so multi-line
 /// constructs (block comments, strings) are handled correctly within a
 /// sequence of consecutive lines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HighlighterCheckpoint {
+    parse_state: ParseState,
+    highlight_state: HighlightState,
+}
+
 pub struct Highlighter {
-    inner: HighlightLines<'static>,
+    syntax: &'static SyntaxReference,
+    syntect_highlighter: syntect::highlighting::Highlighter<'static>,
+    parse_state: ParseState,
+    highlight_state: HighlightState,
+    theme: &'static Theme,
     fallback_color: u32,
 }
 
@@ -53,10 +63,50 @@ impl Highlighter {
             .foreground
             .map(|fg| ((fg.r as u32) << 16) | ((fg.g as u32) << 8) | fg.b as u32)
             .unwrap_or(0xD8DAE0);
+        let syntect_highlighter = syntect::highlighting::Highlighter::new(theme);
         Some(Self {
-            inner: HighlightLines::new(syntax, theme),
+            syntax,
+            parse_state: ParseState::new(syntax),
+            highlight_state: HighlightState::new(&syntect_highlighter, ScopeStack::new()),
+            syntect_highlighter,
+            theme,
             fallback_color,
         })
+    }
+
+    /// Resume a highlighter from a saved parser checkpoint.
+    pub fn from_checkpoint(
+        path: &Path,
+        theme_id: ThemeId,
+        checkpoint: HighlighterCheckpoint,
+    ) -> Option<Self> {
+        let ss = syntax_set();
+        let syntax = get_syntax_for_path(path, ss);
+        if std::ptr::eq(syntax, ss.find_syntax_plain_text()) {
+            return None;
+        }
+        let theme = theme::orca_syntax_theme(theme_id);
+        let fallback_color = theme
+            .settings
+            .foreground
+            .map(|fg| ((fg.r as u32) << 16) | ((fg.g as u32) << 8) | fg.b as u32)
+            .unwrap_or(0xD8DAE0);
+        Some(Self {
+            syntax,
+            syntect_highlighter: syntect::highlighting::Highlighter::new(theme),
+            parse_state: checkpoint.parse_state,
+            highlight_state: checkpoint.highlight_state,
+            theme,
+            fallback_color,
+        })
+    }
+
+    /// Snapshot the current parser/highlight state for later resumption.
+    pub fn checkpoint(&self) -> HighlighterCheckpoint {
+        HighlighterCheckpoint {
+            parse_state: self.parse_state.clone(),
+            highlight_state: self.highlight_state.clone(),
+        }
     }
 
     /// Advance parse state for a line without building spans.
@@ -65,7 +115,15 @@ impl Highlighter {
     /// state on context lines) but don't need the highlighted output.
     pub fn advance_state(&mut self, text: &str) {
         let ss = syntax_set();
-        let _ = self.inner.highlight_line(text, ss);
+        if let Ok(ops) = self.parse_state.parse_line(text, ss) {
+            let _ = HighlightIterator::new(
+                &mut self.highlight_state,
+                &ops[..],
+                text,
+                &self.syntect_highlighter,
+            )
+            .count();
+        }
     }
 
     /// Highlight a single line of text, advancing internal parse state.
@@ -74,8 +132,14 @@ impl Highlighter {
     /// NBSP, trailing newlines stripped).
     pub fn highlight_line(&mut self, text: &str) -> Vec<HighlightedSpan> {
         let ss = syntax_set();
-        match self.inner.highlight_line(text, ss) {
-            Ok(ranges) => {
+        match self.parse_state.parse_line(text, ss) {
+            Ok(ops) => {
+                let ranges = HighlightIterator::new(
+                    &mut self.highlight_state,
+                    &ops[..],
+                    text,
+                    &self.syntect_highlighter,
+                );
                 let mut spans = Vec::new();
                 for (style, text) in ranges {
                     let color = ((style.foreground.r as u32) << 16)
@@ -113,6 +177,23 @@ impl Highlighter {
             }
         }
     }
+
+    pub fn theme(&self) -> &'static Theme {
+        self.theme
+    }
+
+    pub fn syntax(&self) -> &'static SyntaxReference {
+        self.syntax
+    }
+}
+
+pub fn highlight_line_for_path(
+    path: &Path,
+    theme_id: ThemeId,
+    text: &str,
+) -> Option<Vec<HighlightedSpan>> {
+    let mut highlighter = Highlighter::for_path(path, theme_id)?;
+    Some(highlighter.highlight_line(text))
 }
 
 fn syntax_set() -> &'static SyntaxSet {
@@ -215,136 +296,4 @@ fn get_syntax_for_path<'a>(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn highlighter_returns_spans_for_rust() {
-        let mut hl = Highlighter::for_path(Path::new("test.rs"), ThemeId::Dark).unwrap();
-        let spans = hl.highlight_line("fn main() {\n");
-        assert!(!spans.is_empty());
-    }
-
-    #[test]
-    fn keywords_get_orca_blue() {
-        let mut hl = Highlighter::for_path(Path::new("test.rs"), ThemeId::Dark).unwrap();
-        let spans = hl.highlight_line("fn main() {\n");
-        let fn_span = spans.iter().find(|s| s.text.starts_with("fn"));
-        assert!(fn_span.is_some(), "expected a span starting with 'fn'");
-        assert_eq!(fn_span.unwrap().color, 0x5E9BFF);
-    }
-
-    #[test]
-    fn strings_get_neon_mint() {
-        let mut hl = Highlighter::for_path(Path::new("test.rs"), ThemeId::Dark).unwrap();
-        // Feed context lines first so the parser state is correct.
-        hl.highlight_line("fn main() {\n");
-        hl.highlight_line("    let x = 42;\n");
-        hl.highlight_line("    // a comment\n");
-        let spans = hl.highlight_line("    println!(\"hello\");\n");
-        let hello_span = spans.iter().find(|s| s.text.contains("hello"));
-        assert!(hello_span.is_some(), "expected a span containing 'hello'");
-        assert_eq!(hello_span.unwrap().color, 0x7EFFC1);
-    }
-
-    #[test]
-    fn comments_get_fog() {
-        let mut hl = Highlighter::for_path(Path::new("test.rs"), ThemeId::Dark).unwrap();
-        hl.highlight_line("fn main() {\n");
-        hl.highlight_line("    let x = 42;\n");
-        let spans = hl.highlight_line("    // a comment\n");
-        for span in &spans {
-            if span.text.trim().is_empty() {
-                continue;
-            }
-            assert_eq!(
-                span.color, 0x9499A8,
-                "comment span '{}' should be FOG",
-                span.text
-            );
-        }
-    }
-
-    #[test]
-    fn whitespace_normalization() {
-        let mut hl = Highlighter::for_path(Path::new("test.rs"), ThemeId::Dark).unwrap();
-        let spans = hl.highlight_line("fn\tmain() {\n");
-        let full_text: String = spans.iter().map(|s| s.text.as_str()).collect();
-        assert!(
-            !full_text.contains(' '),
-            "regular spaces should be replaced with NBSP"
-        );
-        assert!(
-            !full_text.contains('\t'),
-            "tabs should be replaced with 4 NBSPs"
-        );
-    }
-
-    #[test]
-    fn plain_text_returns_none() {
-        assert!(Highlighter::for_path(Path::new("test.xyz_unknown"), ThemeId::Dark).is_none());
-    }
-
-    #[test]
-    fn powershell_highlighting() {
-        assert!(
-            Highlighter::for_path(Path::new("profile.ps1"), ThemeId::Dark).is_some(),
-            ".ps1 should be highlighted as PowerShell"
-        );
-    }
-
-    #[test]
-    fn powershell_module_highlighting() {
-        assert!(
-            Highlighter::for_path(Path::new("module.psm1"), ThemeId::Dark).is_some(),
-            ".psm1 should be highlighted as PowerShell"
-        );
-    }
-
-    #[test]
-    fn powershell_keywords_highlighted() {
-        let mut hl = Highlighter::for_path(Path::new("test.ps1"), ThemeId::Dark).unwrap();
-        let spans = hl.highlight_line("function Get-Item { param($Path) }\n");
-        assert!(
-            !spans.is_empty(),
-            "PowerShell should produce highlighted spans"
-        );
-        // "function" keyword should not be the default bone color
-        let fn_span = spans.iter().find(|s| s.text.contains("function"));
-        assert!(fn_span.is_some(), "expected a span containing 'function'");
-    }
-
-    #[test]
-    fn batch_file_highlighting() {
-        assert!(
-            Highlighter::for_path(Path::new("setup.bat"), ThemeId::Dark).is_some(),
-            ".bat should be highlighted as Batch File"
-        );
-    }
-
-    #[test]
-    fn cmd_file_highlighting() {
-        assert!(
-            Highlighter::for_path(Path::new("build.cmd"), ThemeId::Dark).is_some(),
-            ".cmd should be highlighted as Batch File"
-        );
-    }
-
-    #[test]
-    fn multi_line_comment_state_preserved() {
-        let mut hl = Highlighter::for_path(Path::new("test.rs"), ThemeId::Dark).unwrap();
-        let line1 = hl.highlight_line("/* start of\n");
-        let line2 = hl.highlight_line("   still a comment */\n");
-        // Both lines should be FOG (comment color).
-        for span in line1.iter().chain(line2.iter()) {
-            if span.text.trim().is_empty() {
-                continue;
-            }
-            assert_eq!(
-                span.color, 0x9499A8,
-                "span '{}' should be comment color",
-                span.text
-            );
-        }
-    }
-}
+mod tests;

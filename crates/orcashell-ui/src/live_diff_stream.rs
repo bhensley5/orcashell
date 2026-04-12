@@ -852,6 +852,10 @@ fn render_feed_row(
                                             palette.ORCA_BLUE
                                         }
                                         DiffLineKind::BinaryNotice => palette.STATUS_AMBER,
+                                        DiffLineKind::ConflictMarker => palette.STATUS_AMBER,
+                                        DiffLineKind::ConflictOurs => palette.STATUS_GREEN,
+                                        DiffLineKind::ConflictBase => palette.STATUS_AMBER,
+                                        DiffLineKind::ConflictTheirs => palette.STATUS_CORAL,
                                         DiffLineKind::Context => palette.BONE,
                                     }))
                                     .child(format!("{} {}", diff_line_prefix(line.kind), line.text))
@@ -926,6 +930,10 @@ fn diff_line_prefix(kind: DiffLineKind) -> &'static str {
         DiffLineKind::HunkHeader => "@@",
         DiffLineKind::FileHeader => "diff",
         DiffLineKind::BinaryNotice => "bin",
+        DiffLineKind::ConflictMarker => "!",
+        DiffLineKind::ConflictOurs => "<",
+        DiffLineKind::ConflictBase => "|",
+        DiffLineKind::ConflictTheirs => ">",
         DiffLineKind::Context => " ",
     }
 }

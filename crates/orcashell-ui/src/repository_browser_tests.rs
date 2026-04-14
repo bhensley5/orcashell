@@ -7,13 +7,15 @@ use orcashell_git::{
 };
 
 use crate::repository_browser::{
-    active_lane_by_row, center_pane_mode, clamp_repository_diff_scroll, commit_row_highlight_state,
-    detail_pane_mode, flatten_branch_rail, format_timestamp, graph_lane_accent, lane_shows_node,
-    max_repository_branch_pane_width, max_repository_detail_pane_width, max_repository_diff_scroll,
-    repository_branch_toolbar_state, repository_checkout_action_state,
-    repository_pull_action_state, visible_first_parent_spine, BranchRailRow,
-    CommitRowHighlightState, GraphLaneAccent, RepositoryBranchToolbarState,
-    RepositoryCenterPaneMode, RepositoryDetailPaneMode, RepositoryPullActionState,
+    active_lane_by_row, branch_rail_cache_key, center_pane_mode, clamp_repository_diff_scroll,
+    commit_row_highlight_state, commit_rows_cache_key, detail_pane_mode, flatten_branch_rail,
+    format_timestamp, graph_has_lane_overflow, graph_lane_accent, graph_participating_lanes,
+    lane_shows_node, max_repository_branch_pane_width, max_repository_detail_pane_width,
+    max_repository_diff_scroll, repository_branch_toolbar_state, repository_checkout_action_state,
+    repository_graph_meta_lines, repository_pull_action_state, select_visible_graph_lanes,
+    visible_first_parent_spine, BranchRailBranchKind, BranchRailRow, CommitRowHighlightState,
+    GraphLaneAccent, RepositoryBranchToolbarState, RepositoryCenterPaneMode,
+    RepositoryDetailPaneMode, RepositoryPullActionState,
 };
 use crate::workspace::{AsyncDocumentState, RepositoryBranchSelection, RepositoryGraphTabState};
 
@@ -73,6 +75,87 @@ fn graph_document() -> RepositoryGraphDocument {
     }
 }
 
+fn graph_document_with_long_local_upstream() -> RepositoryGraphDocument {
+    let head_oid = oid(11);
+    RepositoryGraphDocument {
+        scope_root: PathBuf::from("/repo"),
+        repo_root: PathBuf::from("/repo"),
+        head: HeadState::Branch {
+            name: "feature/repository-browser-layout".to_string(),
+            oid: head_oid,
+        },
+        local_branches: vec![LocalBranchEntry {
+            name: "feature/repository-browser-layout".to_string(),
+            full_ref: "refs/heads/feature/repository-browser-layout".to_string(),
+            target: head_oid,
+            is_head: true,
+            upstream: Some(BranchTrackingInfo {
+                remote_name: "customer-mirror".to_string(),
+                remote_ref: "release/2026-hardened".to_string(),
+                ahead: 12,
+                behind: 4,
+            }),
+        }],
+        remote_branches: Vec::new(),
+        commits: Vec::new(),
+        truncated: false,
+    }
+}
+
+fn graph_document_with_long_local_name_and_short_upstream() -> RepositoryGraphDocument {
+    let head_oid = oid(12);
+    RepositoryGraphDocument {
+        scope_root: PathBuf::from("/repo"),
+        repo_root: PathBuf::from("/repo"),
+        head: HeadState::Branch {
+            name: "feature/repository-browser-layout".to_string(),
+            oid: head_oid,
+        },
+        local_branches: vec![LocalBranchEntry {
+            name: "feature/repository-browser-layout".to_string(),
+            full_ref: "refs/heads/feature/repository-browser-layout".to_string(),
+            target: head_oid,
+            is_head: true,
+            upstream: Some(BranchTrackingInfo {
+                remote_name: "origin".to_string(),
+                remote_ref: "main".to_string(),
+                ahead: 2,
+                behind: 1,
+            }),
+        }],
+        remote_branches: Vec::new(),
+        commits: Vec::new(),
+        truncated: false,
+    }
+}
+
+fn graph_document_with_medium_local_name_and_medium_upstream() -> RepositoryGraphDocument {
+    let head_oid = oid(13);
+    RepositoryGraphDocument {
+        scope_root: PathBuf::from("/repo"),
+        repo_root: PathBuf::from("/repo"),
+        head: HeadState::Branch {
+            name: "release/v0.3.0".to_string(),
+            oid: head_oid,
+        },
+        local_branches: vec![LocalBranchEntry {
+            name: "release/v0.3.0".to_string(),
+            full_ref: "refs/heads/release/v0.3.0".to_string(),
+            target: head_oid,
+            is_head: true,
+            upstream: Some(BranchTrackingInfo {
+                remote_name: "origin".to_string(),
+                remote_ref: "release/v0.3.0".to_string(),
+                ahead: 0,
+                behind: 0,
+            }),
+        }],
+        remote_branches: Vec::new(),
+        commits: Vec::new(),
+        truncated: false,
+    }
+}
+
 fn commit(oid: Oid, primary_lane: u16, parent_oids: Vec<Oid>) -> CommitGraphNode {
     CommitGraphNode {
         oid,
@@ -121,6 +204,8 @@ fn tab_state() -> RepositoryGraphTabState {
         active_branch_action: None,
         action_banner: None,
         occupied_local_branches: HashSet::new(),
+        expanded_remote_groups: HashSet::new(),
+        remote_groups_seeded: false,
     }
 }
 
@@ -144,8 +229,9 @@ fn snapshot(changed_files: usize) -> GitSnapshotSummary {
 fn flatten_branch_rail_groups_sections_and_marks_worktree_rows() {
     let mut occupied = HashSet::new();
     occupied.insert("feature/a".to_string());
+    let expanded = HashSet::from(["origin".to_string()]);
 
-    let rows = flatten_branch_rail(&graph_document(), &occupied);
+    let rows = flatten_branch_rail(&graph_document(), &occupied, &expanded, 320.0);
     assert_eq!(rows.len(), 7);
 
     assert!(matches!(
@@ -158,9 +244,11 @@ fn flatten_branch_rail_groups_sections_and_marks_worktree_rows() {
             if row.selection == RepositoryBranchSelection::Local {
                 name: "main".to_string(),
             }
+            && row.kind == BranchRailBranchKind::Local
             && row.is_head
             && !row.is_worktree_occupied
-            && row.metadata.as_deref() == Some("origin/main · +1 / -0")
+            && row.inline_upstream.as_ref().is_some_and(|upstream|
+                upstream.remote_ref == "origin/main" && upstream.ahead == 1 && upstream.behind == 0)
     ));
     assert!(matches!(
         &rows[2],
@@ -168,9 +256,10 @@ fn flatten_branch_rail_groups_sections_and_marks_worktree_rows() {
             if row.selection == RepositoryBranchSelection::Local {
                 name: "feature/a".to_string(),
             }
+            && row.kind == BranchRailBranchKind::Local
             && !row.is_head
             && row.is_worktree_occupied
-            && row.metadata.is_none()
+            && row.inline_upstream.is_none()
     ));
     assert!(matches!(
         &rows[3],
@@ -178,7 +267,7 @@ fn flatten_branch_rail_groups_sections_and_marks_worktree_rows() {
     ));
     assert!(matches!(
         &rows[4],
-        BranchRailRow::RemoteGroup { remote_name } if remote_name == "origin"
+        BranchRailRow::RemoteGroup { remote_name, expanded } if remote_name == "origin" && *expanded
     ));
     assert!(matches!(
         &rows[5],
@@ -187,7 +276,8 @@ fn flatten_branch_rail_groups_sections_and_marks_worktree_rows() {
                 full_ref: "refs/remotes/origin/feature/a".to_string(),
             }
             && row.name == "feature/a"
-            && row.metadata.as_deref() == Some("tracks feature/a")
+            && row.kind == BranchRailBranchKind::Remote
+            && row.inline_upstream.is_none()
     ));
     assert!(matches!(
         &rows[6],
@@ -196,8 +286,142 @@ fn flatten_branch_rail_groups_sections_and_marks_worktree_rows() {
                 full_ref: "refs/remotes/origin/main".to_string(),
             }
             && row.name == "main"
-            && row.metadata.as_deref() == Some("tracks main")
+            && row.kind == BranchRailBranchKind::Remote
+            && row.inline_upstream.is_none()
     ));
+}
+
+#[test]
+fn flatten_branch_rail_collapses_remote_groups_when_not_expanded() {
+    let rows = flatten_branch_rail(&graph_document(), &HashSet::new(), &HashSet::new(), 320.0);
+
+    assert_eq!(rows.len(), 5);
+    assert!(matches!(
+        &rows[4],
+        BranchRailRow::RemoteGroup { remote_name, expanded } if remote_name == "origin" && !expanded
+    ));
+}
+
+#[test]
+fn flatten_branch_rail_moves_long_local_upstream_to_metadata_row_when_narrow() {
+    let rows = flatten_branch_rail(
+        &graph_document_with_long_local_upstream(),
+        &HashSet::new(),
+        &HashSet::new(),
+        220.0,
+    );
+
+    assert_eq!(rows.len(), 4);
+    assert!(matches!(
+        &rows[1],
+        BranchRailRow::Branch(row)
+            if row.selection == RepositoryBranchSelection::Local {
+                name: "feature/repository-browser-layout".to_string(),
+            }
+            && row.inline_upstream.is_none()
+    ));
+    assert!(matches!(
+        &rows[2],
+        BranchRailRow::BranchMeta(row)
+            if row.selection == RepositoryBranchSelection::Local {
+                name: "feature/repository-browser-layout".to_string(),
+            }
+            && row.upstream.remote_ref == "customer-mirror/release/2026-hardened"
+            && row.upstream.ahead == 12
+            && row.upstream.behind == 4
+    ));
+}
+
+#[test]
+fn flatten_branch_rail_moves_upstream_below_when_it_would_ellipsize_branch_name() {
+    let rows = flatten_branch_rail(
+        &graph_document_with_long_local_name_and_short_upstream(),
+        &HashSet::new(),
+        &HashSet::new(),
+        320.0,
+    );
+
+    assert_eq!(rows.len(), 4);
+    assert!(matches!(
+        &rows[1],
+        BranchRailRow::Branch(row)
+            if row.selection == RepositoryBranchSelection::Local {
+                name: "feature/repository-browser-layout".to_string(),
+            }
+            && row.inline_upstream.is_none()
+    ));
+    assert!(matches!(
+        &rows[2],
+        BranchRailRow::BranchMeta(row)
+            if row.selection == RepositoryBranchSelection::Local {
+                name: "feature/repository-browser-layout".to_string(),
+            }
+            && row.upstream.remote_ref == "origin/main"
+            && row.upstream.ahead == 2
+            && row.upstream.behind == 1
+    ));
+}
+
+#[test]
+fn flatten_branch_rail_moves_medium_upstream_below_before_name_starts_truncating() {
+    let rows = flatten_branch_rail(
+        &graph_document_with_medium_local_name_and_medium_upstream(),
+        &HashSet::new(),
+        &HashSet::new(),
+        320.0,
+    );
+
+    assert_eq!(rows.len(), 4);
+    assert!(matches!(
+        &rows[1],
+        BranchRailRow::Branch(row)
+            if row.selection == RepositoryBranchSelection::Local {
+                name: "release/v0.3.0".to_string(),
+            }
+            && row.inline_upstream.is_none()
+    ));
+    assert!(matches!(
+        &rows[2],
+        BranchRailRow::BranchMeta(row)
+            if row.selection == RepositoryBranchSelection::Local {
+                name: "release/v0.3.0".to_string(),
+            }
+            && row.upstream.remote_ref == "origin/release/v0.3.0"
+            && row.upstream.ahead == 0
+            && row.upstream.behind == 0
+    ));
+}
+
+#[test]
+fn repository_graph_meta_reports_truncation_in_header_detail_only() {
+    let mut graph = graph_document();
+    graph.truncated = true;
+
+    assert_eq!(
+        repository_graph_meta_lines(Some(&graph)),
+        ("0 commits".to_string(), Some("bounded view".to_string()))
+    );
+    assert_eq!(
+        repository_graph_meta_lines(None),
+        ("No graph".to_string(), None)
+    );
+}
+
+#[test]
+fn commit_rows_cache_key_ignores_expanded_remote_groups() {
+    let graph = graph_document();
+    let collapsed = HashSet::new();
+    let expanded = HashSet::from(["origin".to_string()]);
+
+    assert_ne!(
+        branch_rail_cache_key(&graph, &HashSet::new(), &collapsed, 320.0),
+        branch_rail_cache_key(&graph, &HashSet::new(), &expanded, 320.0)
+    );
+    assert_ne!(
+        branch_rail_cache_key(&graph, &HashSet::new(), &collapsed, 220.0),
+        branch_rail_cache_key(&graph, &HashSet::new(), &collapsed, 320.0)
+    );
+    assert_eq!(commit_rows_cache_key(&graph), commit_rows_cache_key(&graph));
 }
 
 #[test]
@@ -430,6 +654,119 @@ fn graph_lane_accent_prioritizes_active_lane() {
     assert_eq!(graph_lane_accent(1, None, None), GraphLaneAccent::Amber);
     assert_eq!(graph_lane_accent(2, None, None), GraphLaneAccent::Fog);
     assert_eq!(graph_lane_accent(3, None, None), GraphLaneAccent::Slate);
+}
+
+#[test]
+fn graph_participating_lanes_include_merge_targets() {
+    let merge_commit = CommitGraphNode {
+        oid: oid(21),
+        short_oid: "00000015".to_string(),
+        summary: "merge".to_string(),
+        author_name: "Orca".to_string(),
+        authored_at_unix: 1_700_000_000,
+        parent_oids: vec![oid(20)],
+        primary_lane: 2,
+        row_lanes: vec![
+            GraphLaneSegment {
+                lane: 2,
+                kind: GraphLaneKind::Through,
+                target_lane: None,
+            },
+            GraphLaneSegment {
+                lane: 6,
+                kind: GraphLaneKind::MergeFromRight,
+                target_lane: Some(2),
+            },
+        ],
+        ref_labels: Vec::new(),
+    };
+
+    assert_eq!(graph_participating_lanes(&merge_commit), vec![2, 6]);
+}
+
+#[test]
+fn visible_graph_lanes_clip_to_first_six_actual_lanes() {
+    let commit = CommitGraphNode {
+        oid: oid(30),
+        short_oid: "0000001e".to_string(),
+        summary: "dense".to_string(),
+        author_name: "Orca".to_string(),
+        authored_at_unix: 1_700_000_000,
+        parent_oids: vec![oid(29)],
+        primary_lane: 7,
+        row_lanes: vec![
+            GraphLaneSegment {
+                lane: 0,
+                kind: GraphLaneKind::Through,
+                target_lane: None,
+            },
+            GraphLaneSegment {
+                lane: 1,
+                kind: GraphLaneKind::Through,
+                target_lane: None,
+            },
+            GraphLaneSegment {
+                lane: 2,
+                kind: GraphLaneKind::Through,
+                target_lane: None,
+            },
+            GraphLaneSegment {
+                lane: 3,
+                kind: GraphLaneKind::Through,
+                target_lane: None,
+            },
+            GraphLaneSegment {
+                lane: 6,
+                kind: GraphLaneKind::Through,
+                target_lane: None,
+            },
+            GraphLaneSegment {
+                lane: 7,
+                kind: GraphLaneKind::Through,
+                target_lane: None,
+            },
+            GraphLaneSegment {
+                lane: 8,
+                kind: GraphLaneKind::Through,
+                target_lane: None,
+            },
+        ],
+        ref_labels: Vec::new(),
+    };
+
+    assert_eq!(
+        select_visible_graph_lanes(&commit, Some(6)),
+        vec![0, 1, 2, 3]
+    );
+}
+
+#[test]
+fn lane_overflow_detects_sparse_hidden_high_lane() {
+    let commit = CommitGraphNode {
+        oid: oid(31),
+        short_oid: "0000001f".to_string(),
+        summary: "sparse-dense".to_string(),
+        author_name: "Orca".to_string(),
+        authored_at_unix: 1_700_000_000,
+        parent_oids: vec![oid(30)],
+        primary_lane: 2,
+        row_lanes: vec![
+            GraphLaneSegment {
+                lane: 2,
+                kind: GraphLaneKind::Through,
+                target_lane: None,
+            },
+            GraphLaneSegment {
+                lane: 6,
+                kind: GraphLaneKind::MergeFromRight,
+                target_lane: Some(2),
+            },
+        ],
+        ref_labels: Vec::new(),
+    };
+
+    assert!(graph_has_lane_overflow(&commit));
+    assert_eq!(select_visible_graph_lanes(&commit, Some(2)), vec![2]);
 }
 
 #[test]

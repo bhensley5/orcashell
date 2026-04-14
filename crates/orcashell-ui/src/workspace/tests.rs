@@ -4083,6 +4083,234 @@ fn automatic_repository_fetch_failure_sets_cooldown_without_banner() {
 }
 
 #[test]
+fn repository_graph_update_seeds_expanded_remote_groups_from_head_upstream() {
+    let scope_root = "/tmp/repo";
+    let mut ws = repository_workspace(scope_root);
+    let project_id = "repo-project".to_string();
+    let head_oid = oid(1);
+    let other_oid = oid(2);
+    let graph = RepositoryGraphDocument {
+        scope_root: PathBuf::from(scope_root),
+        repo_root: PathBuf::from(scope_root),
+        head: HeadState::Branch {
+            name: "main".to_string(),
+            oid: head_oid,
+        },
+        local_branches: vec![LocalBranchEntry {
+            name: "main".to_string(),
+            full_ref: "refs/heads/main".to_string(),
+            target: head_oid,
+            is_head: true,
+            upstream: Some(BranchTrackingInfo {
+                remote_name: "origin".to_string(),
+                remote_ref: "main".to_string(),
+                ahead: 0,
+                behind: 0,
+            }),
+        }],
+        remote_branches: vec![
+            RemoteBranchEntry {
+                remote_name: "origin".to_string(),
+                short_name: "main".to_string(),
+                full_ref: "refs/remotes/origin/main".to_string(),
+                target: head_oid,
+                tracked_by_local: Some("main".to_string()),
+            },
+            RemoteBranchEntry {
+                remote_name: "backup".to_string(),
+                short_name: "main".to_string(),
+                full_ref: "refs/remotes/backup/main".to_string(),
+                target: other_oid,
+                tracked_by_local: None,
+            },
+        ],
+        commits: vec![CommitGraphNode {
+            oid: head_oid,
+            short_oid: head_oid.to_string()[..8].to_string(),
+            summary: "head".to_string(),
+            author_name: "Orca".to_string(),
+            authored_at_unix: 1_700_000_000,
+            parent_oids: Vec::new(),
+            primary_lane: 0,
+            row_lanes: vec![GraphLaneSegment {
+                lane: 0,
+                kind: GraphLaneKind::Start,
+                target_lane: None,
+            }],
+            ref_labels: Vec::new(),
+        }],
+        truncated: false,
+    };
+
+    ws.apply_repository_graph_update(PathBuf::from(scope_root), 0, Ok(graph));
+
+    let tab = ws.repository_graph_tabs.get(&project_id).unwrap();
+    assert!(tab.remote_groups_seeded);
+    assert!(tab.expanded_remote_groups.contains("origin"));
+    assert!(!tab.expanded_remote_groups.contains("backup"));
+}
+
+#[test]
+fn selecting_remote_branch_auto_expands_its_group() {
+    let scope_root = "/tmp/repo";
+    let mut ws = repository_workspace(scope_root);
+    let project_id = "repo-project".to_string();
+    let graph = RepositoryGraphDocument {
+        scope_root: PathBuf::from(scope_root),
+        repo_root: PathBuf::from(scope_root),
+        head: HeadState::Branch {
+            name: "main".to_string(),
+            oid: oid(1),
+        },
+        local_branches: vec![LocalBranchEntry {
+            name: "main".to_string(),
+            full_ref: "refs/heads/main".to_string(),
+            target: oid(1),
+            is_head: true,
+            upstream: Some(BranchTrackingInfo {
+                remote_name: "origin".to_string(),
+                remote_ref: "main".to_string(),
+                ahead: 0,
+                behind: 0,
+            }),
+        }],
+        remote_branches: vec![
+            RemoteBranchEntry {
+                remote_name: "origin".to_string(),
+                short_name: "main".to_string(),
+                full_ref: "refs/remotes/origin/main".to_string(),
+                target: oid(1),
+                tracked_by_local: Some("main".to_string()),
+            },
+            RemoteBranchEntry {
+                remote_name: "backup".to_string(),
+                short_name: "feature".to_string(),
+                full_ref: "refs/remotes/backup/feature".to_string(),
+                target: oid(2),
+                tracked_by_local: None,
+            },
+        ],
+        commits: Vec::new(),
+        truncated: false,
+    };
+
+    {
+        let tab = ws.repository_graph_tabs.get_mut(&project_id).unwrap();
+        tab.graph.document = Some(graph);
+        tab.expanded_remote_groups.insert("origin".to_string());
+        tab.remote_groups_seeded = true;
+    }
+
+    assert!(ws.select_repository_branch_internal(
+        &project_id,
+        RepositoryBranchSelection::Remote {
+            full_ref: "refs/remotes/backup/feature".to_string(),
+        },
+    ));
+
+    let tab = ws.repository_graph_tabs.get(&project_id).unwrap();
+    assert!(tab.expanded_remote_groups.contains("origin"));
+    assert!(tab.expanded_remote_groups.contains("backup"));
+}
+
+#[test]
+fn repository_graph_refresh_preserves_user_collapsed_selected_remote_group() {
+    let scope_root = "/tmp/repo";
+    let mut ws = repository_workspace(scope_root);
+    let project_id = "repo-project".to_string();
+    let graph = RepositoryGraphDocument {
+        scope_root: PathBuf::from(scope_root),
+        repo_root: PathBuf::from(scope_root),
+        head: HeadState::Branch {
+            name: "main".to_string(),
+            oid: oid(1),
+        },
+        local_branches: vec![LocalBranchEntry {
+            name: "main".to_string(),
+            full_ref: "refs/heads/main".to_string(),
+            target: oid(1),
+            is_head: true,
+            upstream: Some(BranchTrackingInfo {
+                remote_name: "origin".to_string(),
+                remote_ref: "main".to_string(),
+                ahead: 0,
+                behind: 0,
+            }),
+        }],
+        remote_branches: vec![RemoteBranchEntry {
+            remote_name: "backup".to_string(),
+            short_name: "feature".to_string(),
+            full_ref: "refs/remotes/backup/feature".to_string(),
+            target: oid(2),
+            tracked_by_local: None,
+        }],
+        commits: Vec::new(),
+        truncated: false,
+    };
+
+    {
+        let tab = ws.repository_graph_tabs.get_mut(&project_id).unwrap();
+        tab.selected_branch = Some(RepositoryBranchSelection::Remote {
+            full_ref: "refs/remotes/backup/feature".to_string(),
+        });
+        tab.remote_groups_seeded = true;
+        tab.expanded_remote_groups.clear();
+    }
+
+    ws.apply_repository_graph_update(PathBuf::from(scope_root), 0, Ok(graph));
+
+    let tab = ws.repository_graph_tabs.get(&project_id).unwrap();
+    assert!(!tab.expanded_remote_groups.contains("backup"));
+}
+
+#[test]
+fn repository_graph_refresh_preserves_user_collapsed_local_upstream_group() {
+    let scope_root = "/tmp/repo";
+    let mut ws = repository_workspace(scope_root);
+    let project_id = "repo-project".to_string();
+    let graph = RepositoryGraphDocument {
+        scope_root: PathBuf::from(scope_root),
+        repo_root: PathBuf::from(scope_root),
+        head: HeadState::Detached { oid: oid(9) },
+        local_branches: vec![LocalBranchEntry {
+            name: "feature".to_string(),
+            full_ref: "refs/heads/feature".to_string(),
+            target: oid(2),
+            is_head: false,
+            upstream: Some(BranchTrackingInfo {
+                remote_name: "origin".to_string(),
+                remote_ref: "feature".to_string(),
+                ahead: 0,
+                behind: 0,
+            }),
+        }],
+        remote_branches: vec![RemoteBranchEntry {
+            remote_name: "origin".to_string(),
+            short_name: "feature".to_string(),
+            full_ref: "refs/remotes/origin/feature".to_string(),
+            target: oid(2),
+            tracked_by_local: Some("feature".to_string()),
+        }],
+        commits: Vec::new(),
+        truncated: false,
+    };
+
+    {
+        let tab = ws.repository_graph_tabs.get_mut(&project_id).unwrap();
+        tab.selected_branch = Some(RepositoryBranchSelection::Local {
+            name: "feature".to_string(),
+        });
+        tab.remote_groups_seeded = true;
+        tab.expanded_remote_groups.clear();
+    }
+
+    ws.apply_repository_graph_update(PathBuf::from(scope_root), 0, Ok(graph));
+
+    let tab = ws.repository_graph_tabs.get(&project_id).unwrap();
+    assert!(tab.expanded_remote_groups.is_empty());
+}
+
+#[test]
 fn repository_auto_fetch_due_respects_recent_checks_and_failure_cooldown() {
     let scope_root = "/tmp/repo";
     let mut ws = repository_workspace(scope_root);

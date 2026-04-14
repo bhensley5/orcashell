@@ -337,6 +337,8 @@ pub struct RepositoryGraphTabState {
     pub active_branch_action: Option<RepositoryBranchAction>,
     pub action_banner: Option<ActionBanner>,
     pub occupied_local_branches: HashSet<String>,
+    pub expanded_remote_groups: HashSet<String>,
+    pub remote_groups_seeded: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -514,6 +516,8 @@ impl RepositoryGraphTabState {
             active_branch_action: None,
             action_banner: None,
             occupied_local_branches: HashSet::new(),
+            expanded_remote_groups: HashSet::new(),
+            remote_groups_seeded: false,
         }
     }
 }
@@ -1055,6 +1059,23 @@ impl WorkspaceState {
         if self.select_repository_branch_internal(project_id, selection) {
             cx.notify();
         }
+    }
+
+    pub fn toggle_repository_remote_group(
+        &mut self,
+        project_id: &str,
+        remote_name: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.repository_graph_tabs.get_mut(project_id) else {
+            return;
+        };
+
+        tab.remote_groups_seeded = true;
+        if !tab.expanded_remote_groups.remove(remote_name) {
+            tab.expanded_remote_groups.insert(remote_name.to_string());
+        }
+        cx.notify();
     }
 
     pub fn select_repository_commit(&mut self, project_id: &str, oid: Oid, cx: &mut Context<Self>) {
@@ -3281,6 +3302,7 @@ impl WorkspaceState {
                     if let Some(oid) = Self::reconcile_repository_graph_selection(tab) {
                         detail_requests.push((project_id.clone(), oid));
                     }
+                    Self::sync_repository_remote_group_state(tab);
                 }
             }
             Err(message) => {
@@ -3590,6 +3612,82 @@ impl WorkspaceState {
         tab.selected_branch =
             branch_is_valid.or_else(|| Self::default_repository_branch_selection(graph));
         None
+    }
+
+    fn sync_repository_remote_group_state(tab: &mut RepositoryGraphTabState) {
+        let Some(graph) = tab.graph.document.as_ref() else {
+            return;
+        };
+
+        let available_remotes = graph
+            .remote_branches
+            .iter()
+            .map(|branch| branch.remote_name.clone())
+            .collect::<HashSet<_>>();
+
+        if !tab.remote_groups_seeded {
+            tab.expanded_remote_groups = Self::default_repository_expanded_remote_groups(
+                graph,
+                tab.selected_branch.as_ref(),
+            );
+            tab.remote_groups_seeded = true;
+        } else {
+            tab.expanded_remote_groups
+                .retain(|remote| available_remotes.contains(remote));
+        }
+    }
+
+    fn default_repository_expanded_remote_groups(
+        graph: &RepositoryGraphDocument,
+        selection: Option<&RepositoryBranchSelection>,
+    ) -> HashSet<String> {
+        let mut expanded = HashSet::new();
+        if let HeadState::Branch { name, .. } = &graph.head {
+            if let Some(remote_name) = graph
+                .local_branches
+                .iter()
+                .find(|branch| branch.name == *name)
+                .and_then(|branch| branch.upstream.as_ref())
+                .map(|upstream| upstream.remote_name.clone())
+            {
+                expanded.insert(remote_name);
+            }
+        }
+        if let Some(remote_name) = selection.and_then(|selection| {
+            Self::repository_remote_name_for_remote_selection(graph, selection)
+        }) {
+            expanded.insert(remote_name);
+        }
+        expanded
+    }
+
+    fn expand_repository_remote_group_for_remote_selection(
+        tab: &mut RepositoryGraphTabState,
+        selection: &RepositoryBranchSelection,
+    ) {
+        let Some(graph) = tab.graph.document.as_ref() else {
+            return;
+        };
+        if let Some(remote_name) =
+            Self::repository_remote_name_for_remote_selection(graph, selection)
+        {
+            tab.expanded_remote_groups.insert(remote_name);
+            tab.remote_groups_seeded = true;
+        }
+    }
+
+    fn repository_remote_name_for_remote_selection(
+        graph: &RepositoryGraphDocument,
+        selection: &RepositoryBranchSelection,
+    ) -> Option<String> {
+        match selection {
+            RepositoryBranchSelection::Remote { full_ref } => graph
+                .remote_branches
+                .iter()
+                .find(|branch| branch.full_ref == *full_ref)
+                .map(|branch| branch.remote_name.clone()),
+            RepositoryBranchSelection::Local { .. } => None,
+        }
     }
 
     fn default_repository_branch_selection(
@@ -4251,7 +4349,8 @@ impl WorkspaceState {
             return false;
         }
 
-        tab.selected_branch = Some(selection);
+        tab.selected_branch = Some(selection.clone());
+        Self::expand_repository_remote_group_for_remote_selection(tab, &selection);
         tab.selected_commit = None;
         tab.commit_detail = AsyncDocumentState::default();
         tab.selected_commit_file = None;

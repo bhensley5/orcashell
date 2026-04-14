@@ -17,7 +17,7 @@ Usage:
   ICON_BASENAME=AppIcon2 ORCA_FILL=0.98 ORCA_OFFSET_X=-8 ORCA_OFFSET_Y=-10 python3 scripts/generate-icon.py
 
 Current shipped AppIcon values:
-  ORCA_FILL=1.10
+  ORCA_FILL=1.08
   ORCA_OFFSET_X=-24
   ORCA_OFFSET_Y=-44
 """
@@ -38,7 +38,7 @@ ORCA_OFFSET_X = 0
 ORCA_OFFSET_Y = 0
 
 # The currently adopted launcher icon was generated with:
-#   ORCA_FILL=1.10
+#   ORCA_FILL=1.08
 #   ORCA_OFFSET_X=-24
 #   ORCA_OFFSET_Y=-44
 

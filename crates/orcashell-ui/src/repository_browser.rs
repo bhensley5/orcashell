@@ -30,11 +30,23 @@ use crate::workspace::{
     RepositoryBranchSelection, RepositoryGraphTabState, WorkspaceState,
 };
 
-const BRANCH_ROW_HEIGHT: f32 = 26.0;
+const BRANCH_ROW_HEIGHT: f32 = 28.0;
 const COMMIT_ROW_HEIGHT: f32 = 28.0;
+const BRANCH_ROW_HORIZONTAL_PADDING: f32 = 24.0;
+const BRANCH_ROW_CHECK_WIDTH: f32 = 14.0;
+const BRANCH_ROW_GAP: f32 = 8.0;
+const BRANCH_META_INDENT: f32 = 34.0;
+const BRANCH_META_TEXT_INDENT: f32 = DEFAULT_CHAR_WIDTH * 2.0;
+const BRANCH_BADGE_WIDTH_ESTIMATE: f32 = 32.0;
+const BRANCH_LABEL_CHAR_WIDTH: f32 = DEFAULT_CHAR_WIDTH;
+const BRANCH_META_CHAR_WIDTH: f32 = DEFAULT_CHAR_WIDTH * 0.85;
+const BRANCH_INLINE_FIT_BUFFER: f32 = DEFAULT_CHAR_WIDTH * 4.0;
 const GRAPH_LANE_SIZE: f32 = 14.0;
 const GRAPH_LANE_GAP: f32 = 3.0;
 const GRAPH_COLUMN_WIDTH: f32 = 116.0;
+const MAX_VISIBLE_GRAPH_LANES: usize = 6;
+const GRAPH_OVERFLOW_DOT_SIZE: f32 = 3.0;
+const GRAPH_OVERFLOW_DOT_GAP: f32 = 3.0;
 const DEFAULT_REPOSITORY_BRANCH_PANE_WIDTH: f32 = 280.0;
 const DEFAULT_REPOSITORY_DETAIL_PANE_WIDTH: f32 = 360.0;
 const MIN_REPOSITORY_BRANCH_PANE_WIDTH: f32 = 220.0;
@@ -45,24 +57,53 @@ const REPOSITORY_PANE_DIVIDER_WIDTH: f32 = 4.0;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BranchRailRow {
     SectionHeader { label: String },
-    RemoteGroup { remote_name: String },
+    RemoteGroup { remote_name: String, expanded: bool },
     Branch(BranchRailBranchRow),
+    BranchMeta(BranchRailMetaRow),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BranchRailBranchRow {
     pub selection: RepositoryBranchSelection,
     pub name: String,
-    pub metadata: Option<String>,
+    pub kind: BranchRailBranchKind,
+    pub inline_upstream: Option<BranchRailUpstreamSummary>,
     pub is_head: bool,
     pub is_worktree_occupied: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct RepositoryGraphCacheKey {
+pub(crate) struct BranchRailMetaRow {
+    pub selection: RepositoryBranchSelection,
+    pub upstream: BranchRailUpstreamSummary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BranchRailBranchKind {
+    Local,
+    Remote,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BranchRailUpstreamSummary {
+    pub remote_ref: String,
+    pub ahead: usize,
+    pub behind: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BranchRailCacheKey {
     content_hash: u64,
     occupancy_count: usize,
     occupancy_hash: u64,
+    expanded_remote_count: usize,
+    expanded_remote_hash: u64,
+    layout_width_bucket: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommitRowsCacheKey {
+    content_hash: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,9 +117,10 @@ struct CommitFileCacheKey {
 struct StyledCommitRow {
     commit: CommitGraphNode,
     active_lane: Option<u16>,
-    is_active_spine: bool,
     is_checked_out_tip: bool,
     is_detached_head_tip: bool,
+    visible_lane_ids: Vec<u16>,
+    overflow_gutter_visible: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,7 +191,8 @@ pub struct RepositoryBrowserView {
     prompt_dialog_request: PromptDialogRequest,
     bounds: Rc<RefCell<Bounds<Pixels>>>,
     resize_drag: Option<RepositoryPaneResizeDrag>,
-    graph_cache_key: Option<RepositoryGraphCacheKey>,
+    branch_cache_key: Option<BranchRailCacheKey>,
+    commit_cache_key: Option<CommitRowsCacheKey>,
     branch_rows: Rc<Vec<BranchRailRow>>,
     commit_rows: Rc<Vec<StyledCommitRow>>,
     diff_scroll_handle: UniformListScrollHandle,
@@ -178,7 +221,8 @@ impl RepositoryBrowserView {
             prompt_dialog_request,
             bounds: Rc::new(RefCell::new(Bounds::default())),
             resize_drag: None,
-            graph_cache_key: None,
+            branch_cache_key: None,
+            commit_cache_key: None,
             branch_rows: Rc::new(Vec::new()),
             commit_rows: Rc::new(Vec::new()),
             diff_scroll_handle: UniformListScrollHandle::new(),
@@ -211,7 +255,8 @@ impl RepositoryBrowserView {
     }
 
     fn clear_graph_cache(&mut self) {
-        self.graph_cache_key = None;
+        self.branch_cache_key = None;
+        self.commit_cache_key = None;
         self.branch_rows = Rc::new(Vec::new());
         self.commit_rows = Rc::new(Vec::new());
     }
@@ -233,17 +278,29 @@ impl RepositoryBrowserView {
             return;
         };
 
-        let next_key = graph_cache_key(graph, &graph_state.occupied_local_branches);
-        if self.graph_cache_key.as_ref() == Some(&next_key) {
-            return;
+        let next_branch_key = branch_rail_cache_key(
+            graph,
+            &graph_state.occupied_local_branches,
+            &graph_state.expanded_remote_groups,
+            self.branch_pane_width,
+        );
+        if self.branch_cache_key.as_ref() != Some(&next_branch_key) {
+            let branch_rows = flatten_branch_rail(
+                graph,
+                &graph_state.occupied_local_branches,
+                &graph_state.expanded_remote_groups,
+                self.branch_pane_width,
+            );
+            self.branch_rows = Rc::new(branch_rows);
+            self.branch_cache_key = Some(next_branch_key);
         }
 
-        let branch_rows = flatten_branch_rail(graph, &graph_state.occupied_local_branches);
-        let commit_rows = style_commit_rows(graph);
-
-        self.branch_rows = Rc::new(branch_rows);
-        self.commit_rows = Rc::new(commit_rows);
-        self.graph_cache_key = Some(next_key);
+        let next_commit_key = commit_rows_cache_key(graph);
+        if self.commit_cache_key.as_ref() != Some(&next_commit_key) {
+            let commit_rows = style_commit_rows(graph);
+            self.commit_rows = Rc::new(commit_rows);
+            self.commit_cache_key = Some(next_commit_key);
+        }
     }
 
     fn sync_commit_file_cache(&mut self, cx: &App) {
@@ -449,12 +506,8 @@ impl RepositoryBrowserView {
         toolbar_busy: bool,
         pull_state: &RepositoryPullActionState,
     ) -> Div {
-        let graph_meta = state
-            .graph
-            .document
-            .as_ref()
-            .map(|graph| format!("{} commits", graph.commits.len()))
-            .unwrap_or_else(|| "No graph".to_string());
+        let (graph_meta, graph_meta_detail) =
+            repository_graph_meta_lines(state.graph.document.as_ref());
         let toolbar_state = state
             .graph
             .document
@@ -601,10 +654,25 @@ impl RepositoryBrowserView {
         actions = actions.child(
             div().pl(px(10.0)).flex().items_center().child(
                 div()
-                    .text_size(px(10.0))
-                    .font_family(DIFF_FONT_FAMILY)
-                    .text_color(rgb(palette.SLATE))
-                    .child(graph_meta),
+                    .flex()
+                    .flex_col()
+                    .items_start()
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .font_family(DIFF_FONT_FAMILY)
+                            .text_color(rgb(palette.SLATE))
+                            .child(graph_meta),
+                    )
+                    .when_some(graph_meta_detail, |meta, detail| {
+                        meta.child(
+                            div()
+                                .text_size(px(10.0))
+                                .font_family(DIFF_FONT_FAMILY)
+                                .text_color(rgb(palette.STATUS_AMBER))
+                                .child(detail),
+                        )
+                    }),
             ),
         );
 
@@ -706,17 +774,54 @@ impl RepositoryBrowserView {
                                     .text_color(rgb(palette.FOG))
                                     .child(label.clone())
                                     .into_any_element(),
-                                BranchRailRow::RemoteGroup { remote_name } => div()
-                                    .w_full()
-                                    .h(px(BRANCH_ROW_HEIGHT))
-                                    .px(px(12.0))
-                                    .flex()
-                                    .items_center()
-                                    .text_size(px(11.0))
-                                    .font_family(DIFF_FONT_FAMILY)
-                                    .text_color(rgb(palette.BONE))
-                                    .child(remote_name.clone())
-                                    .into_any_element(),
+                                BranchRailRow::RemoteGroup {
+                                    remote_name,
+                                    expanded,
+                                } => {
+                                    let group_ws = ws.clone();
+                                    let group_project_id = project_id.clone();
+                                    let group_remote = remote_name.clone();
+                                    let group_row = div()
+                                        .w_full()
+                                        .h(px(BRANCH_ROW_HEIGHT))
+                                        .px(px(12.0))
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(8.0))
+                                        .cursor_pointer()
+                                        .hover(|style| {
+                                            style.bg(rgba(theme::with_alpha(palette.CURRENT, 0x70)))
+                                        });
+                                    let group_row = group_row.on_mouse_down(
+                                        MouseButton::Left,
+                                        move |_event, _window, cx| {
+                                            group_ws.update(cx, |ws, cx| {
+                                                ws.toggle_repository_remote_group(
+                                                    &group_project_id,
+                                                    &group_remote,
+                                                    cx,
+                                                );
+                                            });
+                                        },
+                                    );
+                                    group_row
+                                        .child(
+                                            div()
+                                                .w(px(10.0))
+                                                .text_size(px(10.0))
+                                                .font_family(DIFF_FONT_FAMILY)
+                                                .text_color(rgb(palette.FOG))
+                                                .child(if *expanded { "▾" } else { "▸" }),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(11.0))
+                                                .font_family(DIFF_FONT_FAMILY)
+                                                .text_color(rgb(palette.BONE))
+                                                .child(remote_name.clone()),
+                                        )
+                                        .into_any_element()
+                                }
                                 BranchRailRow::Branch(row) => {
                                     let is_selected =
                                         selected_branch.as_ref() == Some(&row.selection);
@@ -760,8 +865,14 @@ impl RepositoryBrowserView {
                                     } else {
                                         palette.BONE
                                     };
-                                    let check_label = if row.is_head { "✓" } else { "" };
-                                    let mut badges = div().flex().items_center().gap(px(6.0));
+                                    let check_label =
+                                        if row.kind == BranchRailBranchKind::Local && row.is_head {
+                                            "✓"
+                                        } else {
+                                            ""
+                                        };
+                                    let mut badges =
+                                        div().flex_shrink_0().flex().items_center().gap(px(6.0));
                                     if row.is_worktree_occupied {
                                         badges = badges.child(pill_label(
                                             "WT",
@@ -777,10 +888,10 @@ impl RepositoryBrowserView {
                                                 .min_w_0()
                                                 .flex()
                                                 .items_center()
-                                                .gap(px(8.0))
+                                                .gap(px(BRANCH_ROW_GAP))
                                                 .child(
                                                     div()
-                                                        .w(px(14.0))
+                                                        .w(px(BRANCH_ROW_CHECK_WIDTH))
                                                         .text_size(px(11.0))
                                                         .font_family(DIFF_FONT_FAMILY)
                                                         .text_color(rgb(palette.ORCA_BLUE))
@@ -790,23 +901,26 @@ impl RepositoryBrowserView {
                                                     div()
                                                         .flex_1()
                                                         .min_w_0()
-                                                        .flex()
-                                                        .items_center()
-                                                        .gap(px(8.0))
-                                                        .child(
+                                                        .w_full()
+                                                        .overflow_hidden()
+                                                        .text_ellipsis()
+                                                        .text_size(px(12.0))
+                                                        .font_family(DIFF_FONT_FAMILY)
+                                                        .text_color(rgb(branch_label_color))
+                                                        .child(row.name.clone()),
+                                                )
+                                                .when_some(
+                                                    row.inline_upstream.clone(),
+                                                    |branch_row, upstream| {
+                                                        let counts_label =
+                                                            branch_upstream_counts_label(&upstream);
+                                                        branch_row.child(
                                                             div()
-                                                                .min_w_0()
-                                                                .overflow_hidden()
-                                                                .text_ellipsis()
-                                                                .text_size(px(12.0))
-                                                                .font_family(DIFF_FONT_FAMILY)
-                                                                .text_color(rgb(branch_label_color))
-                                                                .child(row.name.clone()),
-                                                        )
-                                                        .when_some(
-                                                            row.metadata.clone(),
-                                                            |row_div, metadata| {
-                                                                row_div.child(
+                                                                .flex_shrink_0()
+                                                                .flex()
+                                                                .items_center()
+                                                                .gap(px(BRANCH_ROW_GAP))
+                                                                .child(
                                                                     div()
                                                                         .text_size(px(10.0))
                                                                         .font_family(
@@ -815,13 +929,148 @@ impl RepositoryBrowserView {
                                                                         .text_color(
                                                                             rgb(palette.FOG),
                                                                         )
-                                                                        .child(metadata),
+                                                                        .child(upstream.remote_ref),
                                                                 )
-                                                            },
-                                                        ),
+                                                                .child(
+                                                                    div()
+                                                                        .text_size(px(10.0))
+                                                                        .font_family(
+                                                                            DIFF_FONT_FAMILY,
+                                                                        )
+                                                                        .text_color(
+                                                                            rgb(palette.FOG),
+                                                                        )
+                                                                        .child(counts_label),
+                                                                ),
+                                                        )
+                                                    },
                                                 ),
                                         )
                                         .child(badges)
+                                        .on_click(move |_event, _window, cx| {
+                                            row_ws.update(cx, |ws, cx| {
+                                                ws.select_repository_branch(
+                                                    &row_project_id,
+                                                    click_selection.clone(),
+                                                    cx,
+                                                );
+                                            });
+                                        })
+                                        .on_mouse_down(MouseButton::Right, {
+                                            let row_ws = ws.clone();
+                                            let project_id = project_id.clone();
+                                            move |event: &MouseDownEvent, _window, cx| {
+                                                let Some(graph) = graph.as_ref() else {
+                                                    return;
+                                                };
+                                                row_ws.update(cx, |ws, cx| {
+                                                    ws.select_repository_branch(
+                                                        &project_id,
+                                                        context_selection.clone(),
+                                                        cx,
+                                                    );
+                                                });
+                                                let items = repository_branch_context_menu_items(
+                                                    project_id.clone(),
+                                                    context_scope_root.clone(),
+                                                    graph,
+                                                    &context_selection,
+                                                    scope_busy,
+                                                    prompt_dialog_request.clone(),
+                                                );
+                                                if items.is_empty() {
+                                                    return;
+                                                }
+                                                *menu_request.borrow_mut() =
+                                                    Some((event.position, items));
+                                                cx.stop_propagation();
+                                            }
+                                        })
+                                        .into_any_element()
+                                }
+                                BranchRailRow::BranchMeta(row) => {
+                                    let is_selected =
+                                        selected_branch.as_ref() == Some(&row.selection);
+                                    let click_selection = row.selection.clone();
+                                    let row_ws = ws.clone();
+                                    let row_project_id = project_id.clone();
+                                    let context_selection = row.selection.clone();
+                                    let menu_request = menu_request.clone();
+                                    let prompt_dialog_request = prompt_dialog_request.clone();
+                                    let graph = graph.clone();
+                                    let context_scope_root = scope_root.clone();
+                                    let mut meta_row = div()
+                                        .id(ElementId::Name(
+                                            format!("repo-branch-meta-row-{}-{ix}", project_id)
+                                                .into(),
+                                        ))
+                                        .w_full()
+                                        .h(px(BRANCH_ROW_HEIGHT))
+                                        .pr(px(12.0))
+                                        .pl(px(BRANCH_META_INDENT))
+                                        .flex()
+                                        .items_center()
+                                        .cursor_pointer()
+                                        .border_l_2();
+                                    if is_selected {
+                                        meta_row = meta_row
+                                            .bg(rgba(theme::with_alpha(palette.ORCA_BLUE, 0x14)))
+                                            .border_color(rgb(palette.ORCA_BLUE));
+                                    } else {
+                                        meta_row = meta_row.border_color(rgb(palette.DEEP)).hover(
+                                            |style| {
+                                                style.bg(rgba(theme::with_alpha(
+                                                    palette.CURRENT,
+                                                    0x70,
+                                                )))
+                                            },
+                                        );
+                                    }
+
+                                    meta_row
+                                        .child(
+                                            div()
+                                                .w_full()
+                                                .min_w_0()
+                                                .flex()
+                                                .items_center()
+                                                .justify_between()
+                                                .gap(px(BRANCH_ROW_GAP))
+                                                .child(
+                                                    div()
+                                                        .min_w_0()
+                                                        .flex()
+                                                        .items_center()
+                                                        .gap(px(0.0))
+                                                        .child(
+                                                            div()
+                                                                .w(px(BRANCH_META_TEXT_INDENT))
+                                                                .flex_shrink_0(),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .min_w_0()
+                                                                .overflow_hidden()
+                                                                .text_ellipsis()
+                                                                .text_size(px(10.0))
+                                                                .font_family(DIFF_FONT_FAMILY)
+                                                                .text_color(rgb(palette.FOG))
+                                                                .child(
+                                                                    row.upstream.remote_ref.clone(),
+                                                                ),
+                                                        ),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex_shrink_0()
+                                                        .text_size(px(10.0))
+                                                        .font_family(DIFF_FONT_FAMILY)
+                                                        .text_color(rgb(palette.FOG))
+                                                        .child(branch_upstream_counts_label(
+                                                            &row.upstream,
+                                                        )),
+                                                ),
+                                        )
                                         .on_click(move |_event, _window, cx| {
                                             row_ws.update(cx, |ws, cx| {
                                                 ws.select_repository_branch(
@@ -902,7 +1151,7 @@ impl RepositoryBrowserView {
                     HeadState::Detached { .. } | HeadState::Unborn => None,
                 });
         let palette = palette.clone();
-        let mut pane = div()
+        let pane = div()
             .flex_1()
             .min_w_0()
             .min_h_0()
@@ -930,27 +1179,6 @@ impl RepositoryBrowserView {
                 "No commit graph available",
                 Some("Open a git-backed project to inspect history."),
             ));
-        }
-
-        if state
-            .graph
-            .document
-            .as_ref()
-            .is_some_and(|graph| graph.truncated)
-        {
-            pane = pane.child(
-                div()
-                    .w_full()
-                    .px(px(12.0))
-                    .py(px(8.0))
-                    .bg(rgba(theme::with_alpha(palette.STATUS_AMBER, 0x12)))
-                    .border_b_1()
-                    .border_color(rgb(palette.STATUS_AMBER))
-                    .text_size(px(11.0))
-                    .font_family(DIFF_FONT_FAMILY)
-                    .text_color(rgb(palette.STATUS_AMBER))
-                    .child("Showing the most recent 1500 reachable commits."),
-            );
         }
 
         pane.child(
@@ -1606,27 +1834,51 @@ impl Render for RepositoryBrowserView {
 pub(crate) fn flatten_branch_rail(
     graph: &RepositoryGraphDocument,
     occupied_local_branches: &HashSet<String>,
+    expanded_remote_groups: &HashSet<String>,
+    branch_pane_width: f32,
 ) -> Vec<BranchRailRow> {
     let mut rows = Vec::new();
     rows.push(BranchRailRow::SectionHeader {
         label: "LOCAL".to_string(),
     });
     for branch in &graph.local_branches {
-        let metadata = branch.upstream.as_ref().map(|upstream| {
-            format!(
-                "{}/{} · +{} / -{}",
-                upstream.remote_name, upstream.remote_ref, upstream.ahead, upstream.behind
+        let selection = RepositoryBranchSelection::Local {
+            name: branch.name.clone(),
+        };
+        let upstream = branch
+            .upstream
+            .as_ref()
+            .map(|upstream| BranchRailUpstreamSummary {
+                remote_ref: format!("{}/{}", upstream.remote_name, upstream.remote_ref),
+                ahead: upstream.ahead,
+                behind: upstream.behind,
+            });
+        let show_inline_upstream = upstream.as_ref().is_some_and(|upstream| {
+            local_branch_upstream_fits_inline(
+                &branch.name,
+                upstream,
+                branch_pane_width,
+                occupied_local_branches.contains(&branch.name),
             )
         });
         rows.push(BranchRailRow::Branch(BranchRailBranchRow {
-            selection: RepositoryBranchSelection::Local {
-                name: branch.name.clone(),
-            },
+            selection: selection.clone(),
             name: branch.name.clone(),
-            metadata,
+            kind: BranchRailBranchKind::Local,
+            inline_upstream: if show_inline_upstream {
+                upstream.clone()
+            } else {
+                None
+            },
             is_head: branch.is_head,
             is_worktree_occupied: occupied_local_branches.contains(&branch.name),
         }));
+        if let Some(upstream) = upstream.filter(|_| !show_inline_upstream) {
+            rows.push(BranchRailRow::BranchMeta(BranchRailMetaRow {
+                selection,
+                upstream,
+            }));
+        }
     }
 
     rows.push(BranchRailRow::SectionHeader {
@@ -1638,17 +1890,19 @@ pub(crate) fn flatten_branch_rail(
             current_remote = Some(branch.remote_name.clone());
             rows.push(BranchRailRow::RemoteGroup {
                 remote_name: branch.remote_name.clone(),
+                expanded: expanded_remote_groups.contains(&branch.remote_name),
             });
+        }
+        if !expanded_remote_groups.contains(&branch.remote_name) {
+            continue;
         }
         rows.push(BranchRailRow::Branch(BranchRailBranchRow {
             selection: RepositoryBranchSelection::Remote {
                 full_ref: branch.full_ref.clone(),
             },
             name: branch.short_name.clone(),
-            metadata: branch
-                .tracked_by_local
-                .as_ref()
-                .map(|local| format!("tracks {local}")),
+            kind: BranchRailBranchKind::Remote,
+            inline_upstream: None,
             is_head: false,
             is_worktree_occupied: false,
         }));
@@ -1657,26 +1911,13 @@ pub(crate) fn flatten_branch_rail(
     rows
 }
 
-fn graph_cache_key(
+pub(crate) fn branch_rail_cache_key(
     graph: &RepositoryGraphDocument,
     occupied_local_branches: &HashSet<String>,
-) -> RepositoryGraphCacheKey {
+    expanded_remote_groups: &HashSet<String>,
+    branch_pane_width: f32,
+) -> BranchRailCacheKey {
     let mut hasher = DefaultHasher::new();
-    match &graph.head {
-        orcashell_git::HeadState::Branch { name, oid } => {
-            "branch".hash(&mut hasher);
-            name.hash(&mut hasher);
-            oid.hash(&mut hasher);
-        }
-        orcashell_git::HeadState::Detached { oid } => {
-            "detached".hash(&mut hasher);
-            oid.hash(&mut hasher);
-        }
-        orcashell_git::HeadState::Unborn => {
-            "unborn".hash(&mut hasher);
-        }
-    }
-    graph.truncated.hash(&mut hasher);
     for branch in &graph.local_branches {
         branch.name.hash(&mut hasher);
         branch.full_ref.hash(&mut hasher);
@@ -1696,19 +1937,78 @@ fn graph_cache_key(
         branch.target.hash(&mut hasher);
         branch.tracked_by_local.hash(&mut hasher);
     }
+    BranchRailCacheKey {
+        content_hash: hasher.finish(),
+        occupancy_count: occupied_local_branches.len(),
+        occupancy_hash: hash_occupied_branches(occupied_local_branches),
+        expanded_remote_count: expanded_remote_groups.len(),
+        expanded_remote_hash: hash_expanded_remote_groups(expanded_remote_groups),
+        layout_width_bucket: branch_pane_width.round().clamp(0.0, f32::from(u16::MAX)) as u16,
+    }
+}
+
+fn branch_upstream_counts_label(upstream: &BranchRailUpstreamSummary) -> String {
+    format!("+{} -{}", upstream.ahead, upstream.behind)
+}
+
+fn local_branch_upstream_fits_inline(
+    branch_name: &str,
+    upstream: &BranchRailUpstreamSummary,
+    branch_pane_width: f32,
+    is_worktree_occupied: bool,
+) -> bool {
+    let badge_width = if is_worktree_occupied {
+        BRANCH_BADGE_WIDTH_ESTIMATE
+    } else {
+        0.0
+    };
+    let available_width = (branch_pane_width
+        - BRANCH_ROW_HORIZONTAL_PADDING
+        - BRANCH_ROW_CHECK_WIDTH
+        - (BRANCH_ROW_GAP * 2.0)
+        - badge_width)
+        .max(0.0);
+    let branch_width = branch_name.chars().count() as f32 * BRANCH_LABEL_CHAR_WIDTH;
+    let upstream_width = upstream.remote_ref.chars().count() as f32 * BRANCH_META_CHAR_WIDTH
+        + branch_upstream_counts_label(upstream).chars().count() as f32 * BRANCH_META_CHAR_WIDTH
+        + BRANCH_ROW_GAP;
+    branch_width + upstream_width + BRANCH_INLINE_FIT_BUFFER <= available_width
+}
+
+pub(crate) fn commit_rows_cache_key(graph: &RepositoryGraphDocument) -> CommitRowsCacheKey {
+    let mut hasher = DefaultHasher::new();
+    match &graph.head {
+        orcashell_git::HeadState::Branch { name, oid } => {
+            "branch".hash(&mut hasher);
+            name.hash(&mut hasher);
+            oid.hash(&mut hasher);
+        }
+        orcashell_git::HeadState::Detached { oid } => {
+            "detached".hash(&mut hasher);
+            oid.hash(&mut hasher);
+        }
+        orcashell_git::HeadState::Unborn => {
+            "unborn".hash(&mut hasher);
+        }
+    }
     for commit in &graph.commits {
         commit.oid.hash(&mut hasher);
         commit.summary.hash(&mut hasher);
         commit.authored_at_unix.hash(&mut hasher);
+        commit.primary_lane.hash(&mut hasher);
+        commit.parent_oids.hash(&mut hasher);
+        for segment in &commit.row_lanes {
+            segment.lane.hash(&mut hasher);
+            std::mem::discriminant(&segment.kind).hash(&mut hasher);
+            segment.target_lane.hash(&mut hasher);
+        }
         for label in &commit.ref_labels {
             label.name.hash(&mut hasher);
             label.kind.hash(&mut hasher);
         }
     }
-    RepositoryGraphCacheKey {
+    CommitRowsCacheKey {
         content_hash: hasher.finish(),
-        occupancy_count: occupied_local_branches.len(),
-        occupancy_hash: hash_occupied_branches(occupied_local_branches),
     }
 }
 
@@ -1722,10 +2022,30 @@ fn hash_occupied_branches(branches: &HashSet<String>) -> u64 {
     hasher.finish()
 }
 
+fn hash_expanded_remote_groups(remote_groups: &HashSet<String>) -> u64 {
+    let mut names: Vec<&String> = remote_groups.iter().collect();
+    names.sort();
+    let mut hasher = DefaultHasher::new();
+    for name in names {
+        name.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+pub(crate) fn repository_graph_meta_lines(
+    graph: Option<&RepositoryGraphDocument>,
+) -> (String, Option<String>) {
+    let Some(graph) = graph else {
+        return ("No graph".to_string(), None);
+    };
+
+    let primary = format!("{} commits", graph.commits.len());
+    let detail = graph.truncated.then_some("bounded view".to_string());
+    (primary, detail)
+}
+
 fn style_commit_rows(graph: &RepositoryGraphDocument) -> Vec<StyledCommitRow> {
-    let active_spine = visible_first_parent_spine(graph);
     let active_rows = active_lane_by_row(&graph.commits, &graph.head);
-    let active_spine_set = active_spine.into_iter().collect::<HashSet<_>>();
     let checked_out_tip = match graph.head {
         HeadState::Branch { oid, .. } => Some(oid),
         HeadState::Detached { .. } | HeadState::Unborn => None,
@@ -1742,13 +2062,44 @@ fn style_commit_rows(graph: &RepositoryGraphDocument) -> Vec<StyledCommitRow> {
         .map(|(ix, commit)| StyledCommitRow {
             commit: commit.clone(),
             active_lane: active_rows[ix],
-            is_active_spine: active_spine_set.contains(&commit.oid),
             is_checked_out_tip: checked_out_tip == Some(commit.oid),
             is_detached_head_tip: detached_tip == Some(commit.oid),
+            visible_lane_ids: select_visible_graph_lanes(commit, active_rows[ix]),
+            overflow_gutter_visible: graph_has_lane_overflow(commit),
         })
         .collect()
 }
 
+pub(crate) fn graph_participating_lanes(commit: &CommitGraphNode) -> Vec<u16> {
+    let mut lanes = Vec::new();
+    for segment in &commit.row_lanes {
+        lanes.push(segment.lane);
+        if let Some(target_lane) = segment.target_lane {
+            lanes.push(target_lane);
+        }
+    }
+    lanes.sort_unstable();
+    lanes.dedup();
+    lanes
+}
+
+pub(crate) fn select_visible_graph_lanes(
+    commit: &CommitGraphNode,
+    _active_lane: Option<u16>,
+) -> Vec<u16> {
+    graph_participating_lanes(commit)
+        .into_iter()
+        .filter(|lane| usize::from(*lane) < MAX_VISIBLE_GRAPH_LANES)
+        .collect()
+}
+
+pub(crate) fn graph_has_lane_overflow(commit: &CommitGraphNode) -> bool {
+    graph_participating_lanes(commit)
+        .into_iter()
+        .any(|lane| usize::from(lane) >= MAX_VISIBLE_GRAPH_LANES)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn visible_first_parent_spine(graph: &RepositoryGraphDocument) -> Vec<Oid> {
     let HeadState::Branch { oid: head_oid, .. } = graph.head else {
         return Vec::new();
@@ -2428,24 +2779,33 @@ fn render_commit_row(
 
 fn render_graph_lanes(row_state: &StyledCommitRow, palette: &OrcaTheme) -> Div {
     let row_lanes = &row_state.commit.row_lanes;
-    let lane_count = row_lanes
+    let display_lane_count = row_state
+        .visible_lane_ids
         .iter()
-        .map(|segment| {
-            usize::from(
-                segment
-                    .target_lane
-                    .map_or(segment.lane, |target| target.max(segment.lane)),
-            ) + 1
-        })
+        .copied()
         .max()
-        .unwrap_or(1);
-    let mut lane_cells: Vec<AnyElement> = Vec::with_capacity(lane_count);
+        .map_or(0, |lane| usize::from(lane) + 1);
+    let mut lane_cells: Vec<AnyElement> = Vec::with_capacity(
+        display_lane_count
+            + if row_state.overflow_gutter_visible {
+                1
+            } else {
+                0
+            },
+    );
 
-    for lane in 0..lane_count {
+    for source_display_lane in 0..display_lane_count {
+        let visible_lane = source_display_lane as u16;
         let segment = row_lanes
             .iter()
-            .find(|segment| usize::from(segment.lane) == lane)
+            .find(|segment| segment.lane == visible_lane)
             .copied();
+        let target_display_lane = segment.and_then(|segment| {
+            segment.target_lane.and_then(|target_lane| {
+                (usize::from(target_lane) < MAX_VISIBLE_GRAPH_LANES)
+                    .then_some(usize::from(target_lane))
+            })
+        });
         lane_cells.push(
             div()
                 .w(px(GRAPH_LANE_SIZE))
@@ -2461,10 +2821,16 @@ fn render_graph_lanes(row_state: &StyledCommitRow, palette: &OrcaTheme) -> Div {
                     } else {
                         None
                     },
+                    source_display_lane,
+                    target_display_lane,
                     palette,
                 ))
                 .into_any_element(),
         );
+    }
+
+    if row_state.overflow_gutter_visible {
+        lane_cells.push(render_graph_overflow_gutter(palette));
     }
 
     div()
@@ -2473,6 +2839,7 @@ fn render_graph_lanes(row_state: &StyledCommitRow, palette: &OrcaTheme) -> Div {
         .flex()
         .items_center()
         .gap(px(GRAPH_LANE_GAP))
+        .overflow_hidden()
         .children(lane_cells)
 }
 
@@ -2481,6 +2848,8 @@ fn render_lane_segment(
     primary_lane: u16,
     active_lane: Option<u16>,
     detached_primary_lane: Option<u16>,
+    source_display_lane: usize,
+    target_display_lane: Option<usize>,
     palette: &OrcaTheme,
 ) -> AnyElement {
     let mut lane = div().size_full().relative();
@@ -2509,8 +2878,8 @@ fn render_lane_segment(
                 .bg(rgba(theme::with_alpha(accent, 0xB0))),
         };
         lane = lane.child(vertical);
-        if let Some(target_lane) = segment.target_lane {
-            let lane_span = (f32::from(target_lane) - f32::from(segment.lane))
+        if let Some(target_display_lane) = target_display_lane {
+            let lane_span = (target_display_lane as f32 - source_display_lane as f32)
                 * (GRAPH_LANE_SIZE + GRAPH_LANE_GAP);
             let connector_width = lane_span.abs().max(0.0);
             let connector_left = if lane_span.is_sign_negative() {
@@ -2543,6 +2912,53 @@ fn render_lane_segment(
     }
 
     lane.into_any_element()
+}
+
+fn render_graph_overflow_gutter(palette: &OrcaTheme) -> AnyElement {
+    let total_height = (GRAPH_OVERFLOW_DOT_SIZE * 3.0) + (GRAPH_OVERFLOW_DOT_GAP * 2.0);
+    let start_y = (((COMMIT_ROW_HEIGHT - 6.0) - total_height) * 0.5).max(0.0);
+    let center_x = ((GRAPH_LANE_SIZE - GRAPH_OVERFLOW_DOT_SIZE) * 0.5).max(0.0);
+
+    div()
+        .w(px(GRAPH_LANE_SIZE))
+        .h(px(COMMIT_ROW_HEIGHT - 6.0))
+        .flex_shrink_0()
+        .relative()
+        .child(
+            div()
+                .absolute()
+                .left(px(center_x))
+                .top(px(start_y))
+                .w(px(GRAPH_OVERFLOW_DOT_SIZE))
+                .h(px(GRAPH_OVERFLOW_DOT_SIZE))
+                .rounded(px(GRAPH_OVERFLOW_DOT_SIZE * 0.5))
+                .bg(rgba(theme::with_alpha(palette.SLATE, 0xC0))),
+        )
+        .child(
+            div()
+                .absolute()
+                .left(px(center_x))
+                .top(px(start_y
+                    + GRAPH_OVERFLOW_DOT_SIZE
+                    + GRAPH_OVERFLOW_DOT_GAP))
+                .w(px(GRAPH_OVERFLOW_DOT_SIZE))
+                .h(px(GRAPH_OVERFLOW_DOT_SIZE))
+                .rounded(px(GRAPH_OVERFLOW_DOT_SIZE * 0.5))
+                .bg(rgba(theme::with_alpha(palette.SLATE, 0xC0))),
+        )
+        .child(
+            div()
+                .absolute()
+                .left(px(center_x))
+                .top(px(
+                    start_y + (GRAPH_OVERFLOW_DOT_SIZE + GRAPH_OVERFLOW_DOT_GAP) * 2.0
+                ))
+                .w(px(GRAPH_OVERFLOW_DOT_SIZE))
+                .h(px(GRAPH_OVERFLOW_DOT_SIZE))
+                .rounded(px(GRAPH_OVERFLOW_DOT_SIZE * 0.5))
+                .bg(rgba(theme::with_alpha(palette.SLATE, 0xC0))),
+        )
+        .into_any_element()
 }
 
 fn render_ref_pill(

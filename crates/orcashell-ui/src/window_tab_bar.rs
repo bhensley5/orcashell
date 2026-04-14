@@ -66,6 +66,31 @@ impl WindowTabBar {
     }
 }
 
+fn tab_split_button_enabled(has_terminal: bool, is_active: bool) -> Option<bool> {
+    has_terminal.then_some(is_active)
+}
+
+fn build_tab_split_menu_items() -> Vec<ContextMenuItem> {
+    vec![
+        ContextMenuItem {
+            label: "Split Right".into(),
+            shortcut: Some(platform_shortcut("\u{2318}D", "Ctrl+Shift+D")),
+            action: Box::new(|ws, cx| {
+                ws.split_focused(SplitDirection::Vertical, cx);
+            }),
+            enabled: true,
+        },
+        ContextMenuItem {
+            label: "Split Down".into(),
+            shortcut: Some(platform_shortcut("\u{2318}\u{21E7}D", "Ctrl+Shift+E")),
+            action: Box::new(|ws, cx| {
+                ws.split_focused(SplitDirection::Horizontal, cx);
+            }),
+            enabled: true,
+        },
+    ]
+}
+
 // ── Win32 FFI for window drag (Windows only) ─────────────────────────────
 //
 // Uses a Win32 timer to poll cursor position and move the window. This runs
@@ -617,6 +642,9 @@ impl Render for WindowTabBar {
             // Tab content: inline rename input OR label + badge + close button
             let tab_index = i;
             let show_close = tab_count > 1 || !auxiliary_tabs.is_empty();
+            let split_button_enabled = tab_split_button_enabled(tid.is_some(), is_active);
+            let split_button_menu_request = self.menu_request.clone();
+            let split_button_workspace = workspace.clone();
 
             // Check if this tab's terminal is being renamed
             let is_renaming = tid
@@ -675,11 +703,59 @@ impl Render for WindowTabBar {
                             .text_ellipsis()
                             .child(label),
                     )
+                    .when(split_button_enabled.is_some(), move |el| {
+                        let split_enabled = split_button_enabled.unwrap_or(false);
+                        let menu_request = split_button_menu_request.clone();
+                        let ws_menu = split_button_workspace.clone();
+                        let mut split_button = div()
+                            .id(ElementId::Name(format!("wtab-split-{}", tab_index).into()))
+                            .ml(px(4.0))
+                            .w(px(16.0))
+                            .h(px(16.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .flex_shrink_0()
+                            .rounded(px(3.0))
+                            .text_size(px(14.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .mt(px(-1.0))
+                            .child("\u{25EB}");
+
+                        if split_enabled {
+                            split_button = split_button
+                                .cursor_pointer()
+                                .text_color(rgb(palette.FOG))
+                                .hover(|s| s.text_color(rgb(palette.BONE)).bg(rgb(palette.SURFACE)))
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .on_click(move |event: &ClickEvent, _window, cx| {
+                                    cx.stop_propagation();
+                                    *menu_request.borrow_mut() =
+                                        Some((event.position(), build_tab_split_menu_items()));
+                                    ws_menu.update(cx, |_ws, cx| cx.notify());
+                                });
+                        } else {
+                            split_button = split_button
+                                .text_color(rgb(palette.SLATE))
+                                .opacity(0.5)
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .on_click(|_, _, cx| {
+                                    cx.stop_propagation();
+                                });
+                        }
+
+                        el.child(split_button)
+                    })
                     // Shortcut badge for tabs 1-9
                     .when(i < 9, |el| {
                         el.child(
                             div()
                                 .ml(px(4.0))
+                                .mt(px(1.0))
                                 .text_size(px(10.0))
                                 .text_color(rgb(palette.SLATE))
                                 .flex_shrink_0()
@@ -791,26 +867,8 @@ impl Render for WindowTabBar {
                         let pid_close_others = pid.clone();
                         let pid_rename = pid.clone();
                         let tid_rename = tid_for_menu.clone();
-                        let mut items = vec![
-                            ContextMenuItem {
-                                label: "Split Right".into(),
-                                shortcut: Some(platform_shortcut("\u{2318}D", "Ctrl+Shift+D")),
-                                action: Box::new(|ws, cx| {
-                                    ws.split_focused(SplitDirection::Vertical, cx);
-                                }),
-                                enabled: true,
-                            },
-                            ContextMenuItem {
-                                label: "Split Down".into(),
-                                shortcut: Some(platform_shortcut(
-                                    "\u{2318}\u{21E7}D",
-                                    "Ctrl+Shift+E",
-                                )),
-                                action: Box::new(|ws, cx| {
-                                    ws.split_focused(SplitDirection::Horizontal, cx);
-                                }),
-                                enabled: true,
-                            },
+                        let mut items = build_tab_split_menu_items();
+                        items.extend([
                             ContextMenuItem {
                                 label: "Close Tab".into(),
                                 shortcut: Some(platform_shortcut(
@@ -830,7 +888,7 @@ impl Render for WindowTabBar {
                                 }),
                                 enabled: tab_count > 1,
                             },
-                        ];
+                        ]);
                         // Add Rename option if this tab has a terminal
                         if let Some(tid) = tid_rename {
                             items.push(ContextMenuItem {
@@ -945,5 +1003,28 @@ impl Render for WindowTabBar {
         }
 
         bar
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_tab_split_menu_items, tab_split_button_enabled};
+
+    #[test]
+    fn split_button_only_renders_for_terminal_tabs() {
+        assert_eq!(tab_split_button_enabled(true, true), Some(true));
+        assert_eq!(tab_split_button_enabled(true, false), Some(false));
+        assert_eq!(tab_split_button_enabled(false, true), None);
+        assert_eq!(tab_split_button_enabled(false, false), None);
+    }
+
+    #[test]
+    fn split_menu_contains_only_split_actions() {
+        let items = build_tab_split_menu_items();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].label, "Split Right");
+        assert_eq!(items[1].label, "Split Down");
+        assert!(items.iter().all(|item| item.enabled));
+        assert!(items.iter().all(|item| item.shortcut.is_some()));
     }
 }

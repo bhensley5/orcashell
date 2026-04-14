@@ -9,9 +9,17 @@ Parameters (edit these to tweak the icon):
   RECT_SIZE     - size of the ABYSS rounded rect within 1024 canvas
   ORCA_FILL     - how much of the rect the orca fills (0.0–1.0)
   CORNER_RATIO  - corner radius as fraction of rect size
+  ORCA_OFFSET_X - horizontal nudge in pixels (negative = left)
+  ORCA_OFFSET_Y - vertical nudge in pixels (negative = up)
 
 Usage:
   python3 scripts/generate-icon.py
+  ICON_BASENAME=AppIcon2 ORCA_FILL=0.98 ORCA_OFFSET_X=-8 ORCA_OFFSET_Y=-10 python3 scripts/generate-icon.py
+
+Current shipped AppIcon values:
+  ORCA_FILL=1.08
+  ORCA_OFFSET_X=-24
+  ORCA_OFFSET_Y=-44
 """
 
 from PIL import Image, ImageDraw
@@ -19,23 +27,46 @@ import numpy as np
 import os
 import platform
 import subprocess
+import tempfile
 
 # --- Tunable parameters ---
 TILT_DEGREES = 25
 RECT_SIZE = 1010       # 1024 canvas, ~7px padding per side
-ORCA_FILL = 0.95       # orca fills 95% of the rect
+ORCA_FILL = 0.95       # original fill stays default; override via env for trials
 CORNER_RATIO = 0.2237  # Apple squircle-ish corner radius
+ORCA_OFFSET_X = 0
+ORCA_OFFSET_Y = 0
+
+# The currently adopted launcher icon was generated with:
+#   ORCA_FILL=1.08
+#   ORCA_OFFSET_X=-24
+#   ORCA_OFFSET_Y=-44
 
 ABYSS = (13, 17, 23)
 CANVAS = 1024
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SOURCE = os.path.join(REPO_ROOT, "design", "OrcaShellLogoNoText.png")
-OUT_PNG = os.path.join(REPO_ROOT, "assets", "AppIcon.png")
-OUT_ICNS = os.path.join(REPO_ROOT, "assets", "AppIcon.icns")
+ICON_BASENAME = os.environ.get("ICON_BASENAME", "AppIcon")
+OUT_PNG = os.path.join(REPO_ROOT, "assets", f"{ICON_BASENAME}.png")
+OUT_ICNS = os.path.join(REPO_ROOT, "assets", f"{ICON_BASENAME}.icns")
+
+
+def env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    return float(value) if value is not None else default
+
+
+def env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    return int(value) if value is not None else default
 
 
 def main():
+    orca_fill = env_float("ORCA_FILL", ORCA_FILL)
+    orca_offset_x = env_int("ORCA_OFFSET_X", ORCA_OFFSET_X)
+    orca_offset_y = env_int("ORCA_OFFSET_Y", ORCA_OFFSET_Y)
+
     src = Image.open(SOURCE)
     arr = np.array(src)
 
@@ -59,7 +90,7 @@ def main():
     # Scale orca to fill the rect
     pad = (CANVAS - RECT_SIZE) // 2
     radius = int(RECT_SIZE * CORNER_RATIO)
-    target = int(RECT_SIZE * ORCA_FILL)
+    target = int(RECT_SIZE * orca_fill)
     scale = min(target / rw, target / rh)
     new_w = int(rw * scale)
     new_h = int(rh * scale)
@@ -80,8 +111,8 @@ def main():
     canvas.paste(bg, (0, 0), bg_mask)
 
     # Center orca
-    orca_x = pad + (RECT_SIZE - new_w) // 2
-    orca_y = pad + (RECT_SIZE - new_h) // 2
+    orca_x = pad + (RECT_SIZE - new_w) // 2 + orca_offset_x
+    orca_y = pad + (RECT_SIZE - new_h) // 2 + orca_offset_y
     canvas.paste(rotated, (orca_x, orca_y), rotated)
 
     os.makedirs(os.path.dirname(OUT_PNG), exist_ok=True)
@@ -90,29 +121,91 @@ def main():
 
     # Generate .icns on macOS
     if platform.system() == "Darwin":
-        iconset = "/tmp/AppIcon.iconset"
+        iconset = f"/tmp/{ICON_BASENAME}.iconset"
+        subprocess.run(["rm", "-rf", iconset], check=False)
         os.makedirs(iconset, exist_ok=True)
-        for s in [16, 32, 64, 128, 256, 512, 1024]:
+
+        mac_icon_sizes = [16, 32, 64, 128, 256, 512, 1024]
+        for s in mac_icon_sizes:
             subprocess.run(
-                ["sips", "-z", str(s), str(s), OUT_PNG,
-                 "--out", f"{iconset}/icon_{s}x{s}.png"],
+                [
+                    "sips",
+                    "-z",
+                    str(s),
+                    str(s),
+                    OUT_PNG,
+                    "--out",
+                    f"{iconset}/icon_{s}x{s}.png",
+                ],
+                check=True,
                 capture_output=True,
             )
-        for s in [16, 32, 128, 256, 512]:
-            d = s * 2
-            os.replace(f"{iconset}/icon_{d}x{d}.png", f"{iconset}/icon_{s}x{s}@2x.png")
-            # Re-generate the non-retina version since we just moved it
-            subprocess.run(
-                ["sips", "-z", str(d), str(d), OUT_PNG,
-                 "--out", f"{iconset}/icon_{d}x{d}.png"],
-                capture_output=True,
-            )
-        subprocess.run(["iconutil", "-c", "icns", iconset, "-o", OUT_ICNS])
+            if s < 1024:
+                retina = s * 2
+                subprocess.run(
+                    [
+                        "sips",
+                        "-z",
+                        str(retina),
+                        str(retina),
+                        OUT_PNG,
+                        "--out",
+                        f"{iconset}/icon_{s}x{s}@2x.png",
+                    ],
+                    check=True,
+                    capture_output=True,
+                )
+
+        iconutil = subprocess.run(
+            ["iconutil", "-c", "icns", iconset, "-o", OUT_ICNS],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
         subprocess.run(["rm", "-rf", iconset])
+        if iconutil.returncode != 0:
+            # Some macOS environments reject otherwise-valid iconsets; fall back to
+            # tiff2icns using a multi-image TIFF assembled from standard icon sizes.
+            with tempfile.TemporaryDirectory(prefix=f"{ICON_BASENAME}-tiff-") as temp_dir:
+                tiff_sizes = [16, 32, 48, 128, 256, 512, 1024]
+                tiff_paths = []
+                for size in tiff_sizes:
+                    out_tiff = os.path.join(temp_dir, f"icon_{size}.tiff")
+                    subprocess.run(
+                        [
+                            "sips",
+                            "-s",
+                            "format",
+                            "tiff",
+                            "-z",
+                            str(size),
+                            str(size),
+                            OUT_PNG,
+                            "--out",
+                            out_tiff,
+                        ],
+                        check=True,
+                        capture_output=True,
+                    )
+                    tiff_paths.append(out_tiff)
+
+                merged_tiff = os.path.join(temp_dir, f"{ICON_BASENAME}.tiff")
+                subprocess.run(
+                    ["tiffutil", "-cat", *tiff_paths, "-out", merged_tiff],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                subprocess.run(
+                    ["tiff2icns", merged_tiff, OUT_ICNS],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
         print(f"Saved {OUT_ICNS}")
 
     # Generate .ico (all platforms)
-    OUT_ICO = os.path.join(REPO_ROOT, "assets", "AppIcon.ico")
+    OUT_ICO = os.path.join(REPO_ROOT, "assets", f"{ICON_BASENAME}.ico")
     ico_sizes = [(256, 256), (128, 128), (64, 64), (48, 48), (32, 32), (16, 16)]
     ico_images = [canvas.resize(size, Image.LANCZOS) for size in ico_sizes]
     ico_images[0].save(OUT_ICO, format="ICO", sizes=ico_sizes, append_images=ico_images[1:])

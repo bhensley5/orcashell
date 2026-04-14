@@ -6,7 +6,10 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 #[cfg(test)]
-use std::{sync::atomic::AtomicU64, thread::sleep};
+use std::{
+    sync::atomic::{AtomicU64, AtomicUsize},
+    thread::sleep,
+};
 
 use async_channel::{
     unbounded as async_unbounded, Receiver as AsyncReceiver, Sender as AsyncSender,
@@ -1524,10 +1527,7 @@ fn spawn_repo_browser_worker(
                     } => {
                         #[cfg(test)]
                         {
-                            let delay = repo_browser_worker_test_delay();
-                            if !delay.is_zero() {
-                                sleep(delay);
-                            }
+                            wait_for_repo_browser_test_unblock();
                         }
                         let result =
                             load_repository_graph(&scope_root).map_err(|error| error.to_string());
@@ -1544,10 +1544,7 @@ fn spawn_repo_browser_worker(
                     } => {
                         #[cfg(test)]
                         {
-                            let delay = repo_browser_worker_test_delay();
-                            if !delay.is_zero() {
-                                sleep(delay);
-                            }
+                            wait_for_repo_browser_test_unblock();
                         }
                         let result =
                             load_commit_detail(&scope_root, oid).map_err(|error| error.to_string());
@@ -1565,10 +1562,7 @@ fn spawn_repo_browser_worker(
                     } => {
                         #[cfg(test)]
                         {
-                            let delay = repo_browser_worker_test_delay();
-                            if !delay.is_zero() {
-                                sleep(delay);
-                            }
+                            wait_for_repo_browser_test_unblock();
                         }
                         let theme_id = *inner.diff_theme.lock();
                         let result = load_commit_file_diff(
@@ -1591,10 +1585,7 @@ fn spawn_repo_browser_worker(
                     } => {
                         #[cfg(test)]
                         {
-                            let delay = repo_browser_worker_test_delay();
-                            if !delay.is_zero() {
-                                sleep(delay);
-                            }
+                            wait_for_repo_browser_test_unblock();
                         }
                         let result = list_stashes(&scope_root).map_err(|error| error.to_string());
                         inner.broadcast(GitEvent::StashListLoaded {
@@ -1610,10 +1601,7 @@ fn spawn_repo_browser_worker(
                     } => {
                         #[cfg(test)]
                         {
-                            let delay = repo_browser_worker_test_delay();
-                            if !delay.is_zero() {
-                                sleep(delay);
-                            }
+                            wait_for_repo_browser_test_unblock();
                         }
                         let result = load_stash_detail(&scope_root, stash_oid)
                             .map_err(|error| error.to_string());
@@ -1631,10 +1619,7 @@ fn spawn_repo_browser_worker(
                     } => {
                         #[cfg(test)]
                         {
-                            let delay = repo_browser_worker_test_delay();
-                            if !delay.is_zero() {
-                                sleep(delay);
-                            }
+                            wait_for_repo_browser_test_unblock();
                         }
                         let theme_id = *inner.diff_theme.lock();
                         let result = load_stash_file_diff(
@@ -2534,16 +2519,8 @@ fn normalize_path(path: &Path) -> PathBuf {
 static SNAPSHOT_TEST_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
-static REPO_BROWSER_TEST_DELAY_MS: AtomicU64 = AtomicU64::new(0);
-
-#[cfg(test)]
 fn snapshot_worker_test_delay() -> Duration {
     Duration::from_millis(SNAPSHOT_TEST_DELAY_MS.load(Ordering::Relaxed))
-}
-
-#[cfg(test)]
-fn repo_browser_worker_test_delay() -> Duration {
-    Duration::from_millis(REPO_BROWSER_TEST_DELAY_MS.load(Ordering::Relaxed))
 }
 
 #[cfg(test)]
@@ -2563,19 +2540,29 @@ fn set_snapshot_test_delay(delay: Duration) -> SnapshotDelayGuard {
 }
 
 #[cfg(test)]
-struct RepoBrowserDelayGuard;
+static REPO_BROWSER_TEST_BLOCKERS: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(test)]
-impl Drop for RepoBrowserDelayGuard {
-    fn drop(&mut self) {
-        REPO_BROWSER_TEST_DELAY_MS.store(0, Ordering::Relaxed);
+fn wait_for_repo_browser_test_unblock() {
+    while REPO_BROWSER_TEST_BLOCKERS.load(Ordering::Relaxed) > 0 {
+        sleep(Duration::from_millis(1));
     }
 }
 
 #[cfg(test)]
-fn set_repo_browser_test_delay(delay: Duration) -> RepoBrowserDelayGuard {
-    REPO_BROWSER_TEST_DELAY_MS.store(delay.as_millis() as u64, Ordering::Relaxed);
-    RepoBrowserDelayGuard
+struct RepoBrowserBlockGuard;
+
+#[cfg(test)]
+impl Drop for RepoBrowserBlockGuard {
+    fn drop(&mut self) {
+        REPO_BROWSER_TEST_BLOCKERS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+fn block_repo_browser_worker() -> RepoBrowserBlockGuard {
+    REPO_BROWSER_TEST_BLOCKERS.fetch_add(1, Ordering::Relaxed);
+    RepoBrowserBlockGuard
 }
 
 #[cfg(test)]

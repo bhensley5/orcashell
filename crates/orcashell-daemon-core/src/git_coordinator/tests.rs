@@ -450,7 +450,7 @@ fn repo_browser_errors_propagate_without_blocking_existing_loads() {
 #[test]
 fn repo_browser_worker_does_not_block_diff_worker() {
     let repo = init_repo();
-    let _delay = set_repo_browser_test_delay(Duration::from_millis(80));
+    let block = block_repo_browser_worker();
     let coordinator = GitCoordinator::new();
     let events = coordinator.subscribe_events();
 
@@ -463,6 +463,7 @@ fn repo_browser_worker_does_not_block_diff_worker() {
         "expected DiffIndexLoaded before repo-browser event, got {first:?}"
     );
 
+    drop(block);
     let second = recv_event(&events);
     assert!(
         matches!(second, GitEvent::RepositoryGraphLoaded { .. }),
@@ -473,7 +474,7 @@ fn repo_browser_worker_does_not_block_diff_worker() {
 #[test]
 fn repo_browser_commit_detail_does_not_block_diff_worker() {
     let repo = init_repo();
-    let _delay = set_repo_browser_test_delay(Duration::from_millis(80));
+    let block = block_repo_browser_worker();
     let coordinator = GitCoordinator::new();
     let events = coordinator.subscribe_events();
     let commit_oid = head_oid(repo.path());
@@ -487,6 +488,7 @@ fn repo_browser_commit_detail_does_not_block_diff_worker() {
         "expected DiffIndexLoaded before CommitDetailLoaded, got {first:?}"
     );
 
+    drop(block);
     let second = recv_event(&events);
     assert!(
         matches!(second, GitEvent::CommitDetailLoaded { .. }),
@@ -497,7 +499,7 @@ fn repo_browser_commit_detail_does_not_block_diff_worker() {
 #[test]
 fn repo_browser_commit_file_diff_does_not_block_diff_worker() {
     let repo = init_repo();
-    let _delay = set_repo_browser_test_delay(Duration::from_millis(80));
+    let block = block_repo_browser_worker();
     let coordinator = GitCoordinator::new();
     let events = coordinator.subscribe_events();
     let commit_oid = head_oid(repo.path());
@@ -511,6 +513,7 @@ fn repo_browser_commit_file_diff_does_not_block_diff_worker() {
         "expected DiffIndexLoaded before CommitFileDiffLoaded, got {first:?}"
     );
 
+    drop(block);
     let second = recv_event(&events);
     assert!(
         matches!(second, GitEvent::CommitFileDiffLoaded { .. }),

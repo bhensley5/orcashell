@@ -20,6 +20,9 @@ use alacritty_terminal::index::Side;
 use alacritty_terminal::selection::Selection as AlacSelection;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::TermMode;
+use alacritty_terminal::vte::ansi::{
+    CursorShape as AlacrittyCursorShape, CursorStyle as AlacrittyCursorStyle,
+};
 use gpui::*;
 use orcashell_session::dimensions::TermDimensions;
 use orcashell_session::engine::SessionEngine;
@@ -154,6 +157,21 @@ pub struct TerminalView {
 }
 
 impl TerminalView {
+    fn apply_term_cursor_style(&self, config: &TerminalConfig) {
+        let shape = match config.cursor_shape {
+            CursorShape::Block => AlacrittyCursorShape::Block,
+            CursorShape::Bar => AlacrittyCursorShape::Beam,
+            CursorShape::Underline => AlacrittyCursorShape::Underline,
+        };
+        self.engine
+            .term_arc()
+            .lock()
+            .set_default_cursor_style(AlacrittyCursorStyle {
+                shape,
+                blinking: config.cursor_blink,
+            });
+    }
+
     fn emit_local_input(&self, cx: &mut Context<Self>) {
         cx.emit(TerminalRuntimeEvent::LocalInput {
             terminal_id: self.terminal_id.clone(),
@@ -263,7 +281,7 @@ impl TerminalView {
         );
 
         let base_font_size = config.font_size;
-        Self {
+        let view = Self {
             terminal_id,
             shell_type,
             engine,
@@ -294,7 +312,9 @@ impl TerminalView {
             last_mouse_position: None,
             hovered_link: None,
             plain_url_matcher: PlaintextLinkMatcher::new(),
-        }
+        };
+        view.apply_term_cursor_style(&view.config);
+        view
     }
 
     pub fn focus_handle(&self) -> &FocusHandle {
@@ -314,6 +334,7 @@ impl TerminalView {
     /// Apply new terminal configuration (e.g., from settings changes).
     /// Preserves per-terminal zoom offset relative to the new base font size.
     pub fn apply_config(&mut self, config: TerminalConfig) {
+        self.apply_term_cursor_style(&config);
         let zoom_offset = f32::from(self.config.font_size) - f32::from(self.base_font_size);
         self.base_font_size = config.font_size;
         let zoomed_size = config.font_size + px(zoom_offset);
@@ -1412,7 +1433,6 @@ impl Render for TerminalView {
         let cell_width = self.cell_width;
         let cell_height = self.cell_height;
         let cursor_visible = self.cursor_visible && self.focus_handle.is_focused(window);
-        let cursor_shape = self.config.cursor_shape;
         let hovered_link = self.hovered_link.clone();
 
         let terminal_content = div().flex_1().min_h_0().child({
@@ -1471,7 +1491,6 @@ impl Render for TerminalView {
                         padding,
                         &snapshot,
                         cursor_visible,
-                        cursor_shape,
                         &visible_matches,
                         visible_hovered_link.as_ref(),
                         window,

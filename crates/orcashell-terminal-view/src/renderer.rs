@@ -69,7 +69,7 @@ use alacritty_terminal::selection::SelectionRange;
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::{Term, TermDamage, TermMode};
-use alacritty_terminal::vte::ansi::Color;
+use alacritty_terminal::vte::ansi::{Color, CursorShape as AlacrittyCursorShape};
 use gpui::{
     px, quad, transparent_black, App, Bounds, Edges, Font, FontFeatures, FontStyle, FontWeight,
     Hsla, Pixels, Point, ShapedLine, SharedString, Size, StrikethroughStyle, TextRun,
@@ -311,6 +311,7 @@ pub(crate) struct FrameSnapshot {
     colors: Colors,
     selection_range: Option<SelectionRange>,
     cursor_point: AlacPoint,
+    cursor_shape: AlacrittyCursorShape,
     term_mode: TermMode,
     history_size: usize,
 }
@@ -357,7 +358,7 @@ impl FrameSnapshot {
 /// // Snapshot terminal state under lock, then paint without the lock
 /// let snapshot = renderer.snapshot_frame(&mut term);
 /// drop(term);
-/// renderer.paint_from_snapshot(bounds, padding, &snapshot, cursor_visible, cursor_shape, &matches, window, cx);
+/// renderer.paint_from_snapshot(bounds, padding, &snapshot, cursor_visible, &matches, window, cx);
 /// ```
 ///
 /// # Performance
@@ -754,6 +755,7 @@ impl TerminalRenderer {
         let colors = *term.colors();
         let selection_range = term.selection.as_ref().and_then(|sel| sel.to_range(term));
         let cursor_point = term.grid().cursor.point;
+        let cursor_shape = term.cursor_style().shape;
         let term_mode = *term.mode();
         let history_size = term.grid().history_size();
 
@@ -768,6 +770,7 @@ impl TerminalRenderer {
             colors,
             selection_range,
             cursor_point,
+            cursor_shape,
             term_mode,
             history_size,
         }
@@ -784,7 +787,6 @@ impl TerminalRenderer {
         padding: Edges<Pixels>,
         snapshot: &FrameSnapshot,
         cursor_visible: bool,
-        cursor_shape: crate::terminal_view::CursorShape,
         visible_matches: &[crate::search::VisibleMatch],
         visible_hovered_link: Option<&crate::links::VisibleHoveredLink>,
         window: &mut Window,
@@ -1418,17 +1420,19 @@ impl TerminalRenderer {
                 colors,
             );
 
-            use crate::terminal_view::CursorShape;
-            let (cursor_w, cursor_h, cursor_y_offset, corner_radius) = match cursor_shape {
-                CursorShape::Bar => {
+            let (cursor_w, cursor_h, cursor_y_offset, corner_radius) = match snapshot.cursor_shape {
+                AlacrittyCursorShape::Beam => {
                     let w = self.cell_width * 0.3;
                     (w, self.cell_height, px(0.0), w / 2.0)
                 }
-                CursorShape::Block => (self.cell_width, self.cell_height, px(0.0), px(0.0)),
-                CursorShape::Underline => {
+                AlacrittyCursorShape::Block | AlacrittyCursorShape::HollowBlock => {
+                    (self.cell_width, self.cell_height, px(0.0), px(0.0))
+                }
+                AlacrittyCursorShape::Underline => {
                     let h = px(2.0);
                     (self.cell_width, h, self.cell_height - h, px(0.0))
                 }
+                AlacrittyCursorShape::Hidden => return,
             };
 
             let cursor_bounds = Bounds {

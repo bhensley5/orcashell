@@ -348,7 +348,7 @@ fn main() -> Result<()> {
                                 // so sorting descending by ID gives us registration order.
                                 let mut entries: Vec<(i64, AnyWindowHandle)> =
                                     cx.global::<WindowRegistry>().iter().collect();
-                                entries.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                                entries.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
                                 for (_, handle) in entries.iter() {
                                     if let Some(typed) = handle.downcast::<OrcaAppView>() {
                                         let routed = typed

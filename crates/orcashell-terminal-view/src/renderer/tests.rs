@@ -297,3 +297,33 @@ fn test_cache_invalidation() {
     assert!(cache.validate(24, 80, 1, px(16.0), 1));
     assert!(!cache.validate(30, 80, 1, px(16.0), 1));
 }
+
+#[test]
+fn test_snapshot_uses_terminal_cursor_shape() {
+    use alacritty_terminal::event::VoidListener;
+    use alacritty_terminal::term::{Config, Term};
+    use alacritty_terminal::vte::ansi::{CursorShape, Processor};
+    use orcashell_session::dimensions::TermDimensions;
+
+    let size = TermDimensions::new(80, 24);
+    let mut term = Term::new(Config::default(), &size, VoidListener);
+    let renderer = TerminalRenderer::new(
+        "Fira Code".to_string(),
+        px(14.0),
+        1.0,
+        ColorPalette::default(),
+    );
+
+    assert_eq!(
+        renderer.snapshot_frame(&mut term).cursor_shape,
+        CursorShape::Block
+    );
+
+    Processor::<alacritty_terminal::vte::ansi::StdSyncHandler>::new()
+        .advance(&mut term, b"\x1b[6 q");
+
+    assert_eq!(
+        renderer.snapshot_frame(&mut term).cursor_shape,
+        CursorShape::Beam
+    );
+}

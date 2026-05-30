@@ -953,6 +953,10 @@ impl<T> Term<T> {
         }
     }
 
+    pub fn set_default_cursor_style(&mut self, cursor_style: CursorStyle) {
+        self.config.default_cursor_style = cursor_style;
+    }
+
     pub fn colors(&self) -> &Colors {
         &self.colors
     }

@@ -6058,13 +6058,10 @@ impl WorkspaceState {
 
         let targets: HashSet<&str> = terminal_ids.iter().map(String::as_str).collect();
         for project in &mut self.projects {
-            loop {
-                let Some(path) = targets
-                    .iter()
-                    .find_map(|terminal_id| project.layout.find_terminal_path(terminal_id))
-                else {
-                    break;
-                };
+            while let Some(path) = targets
+                .iter()
+                .find_map(|terminal_id| project.layout.find_terminal_path(terminal_id))
+            {
                 Self::remove_terminal_path_from_project(project, &path);
             }
         }

@@ -846,8 +846,8 @@ mod tests {
     fn pipe_mode_rejects_remote_clients() {
         let mode = pipe_mode();
         assert_ne!(mode & PIPE_REJECT_REMOTE_CLIENTS, 0);
-        assert_ne!(mode & PIPE_TYPE_BYTE, 0);
-        assert_ne!(mode & PIPE_READMODE_BYTE, 0);
+        assert_eq!(mode & PIPE_TYPE_MESSAGE, 0);
+        assert_eq!(mode & PIPE_READMODE_MESSAGE, 0);
     }
 
     #[test]

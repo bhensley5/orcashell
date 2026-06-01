@@ -1,7 +1,11 @@
-use orcashell_daemon_core::server::DaemonServer;
+use orcashell_daemon_core::server::{
+    DaemonServer, OpenProjectEnqueueError, OPEN_PROJECT_QUEUE_CAPACITY,
+};
 use orcashell_ipc::{IpcEndpoint, IpcStream};
 use orcashell_protocol::framing::{read_frame, write_frame};
-use orcashell_protocol::messages::{ClientCommand, DaemonResponse, Envelope, OpenDisposition};
+use orcashell_protocol::messages::{
+    ClientCommand, CommandAuth, DaemonResponse, Envelope, OpenDisposition,
+};
 use orcashell_protocol::version::CURRENT_PROTOCOL_VERSION;
 use std::io;
 use std::path::PathBuf;
@@ -11,14 +15,16 @@ fn test_endpoint(dir: &std::path::Path, name: &str) -> IpcEndpoint {
     #[cfg(unix)]
     {
         let path = dir.join(format!("{name}.sock"));
+        let token = dir.join(format!("{name}.token"));
         let s = path.to_string_lossy().into_owned();
-        IpcEndpoint::new(s.clone(), s)
+        IpcEndpoint::new_with_capability(s.clone(), s, token)
     }
     #[cfg(windows)]
     {
         let unique = dir.file_name().unwrap().to_string_lossy();
         let pipe = format!(r"\\.\pipe\orcashell-test-{unique}-{name}");
-        IpcEndpoint::new(pipe.clone(), pipe)
+        let token = dir.join(format!("{name}.token"));
+        IpcEndpoint::new_with_capability(pipe.clone(), pipe, token)
     }
 }
 
@@ -49,6 +55,13 @@ fn send_envelope(
     serde_json::from_str(response_str).unwrap()
 }
 
+fn command_auth(endpoint: &IpcEndpoint) -> Option<CommandAuth> {
+    endpoint
+        .read_capability_token()
+        .unwrap()
+        .map(|capability| CommandAuth { capability })
+}
+
 /// Non-absolute path → DaemonResponse::Error
 #[test]
 fn open_project_relative_path_rejected() {
@@ -62,6 +75,7 @@ fn open_project_relative_path_rejected() {
 
     let request = Envelope {
         protocol_version: CURRENT_PROTOCOL_VERSION,
+        auth: command_auth(&endpoint),
         payload: ClientCommand::OpenProject {
             path: "relative/path".to_string(),
             disposition: OpenDisposition::NewTab,
@@ -96,6 +110,7 @@ fn open_project_nonexistent_path_rejected() {
 
     let request = Envelope {
         protocol_version: CURRENT_PROTOCOL_VERSION,
+        auth: command_auth(&endpoint),
         payload: ClientCommand::OpenProject {
             path: if cfg!(windows) {
                 r"C:\this\path\definitely\does\not\exist\orcashell-test-x9z".to_string()
@@ -131,11 +146,13 @@ fn open_project_valid_dir_enqueues_with_disposition() {
     };
     std::thread::sleep(Duration::from_millis(100));
 
-    let target_dir = dir.path().to_str().unwrap().to_string();
+    let target_path = std::fs::canonicalize(dir.path()).unwrap();
+    let target_dir = target_path.to_string_lossy().into_owned();
 
     // Test NewTab disposition
     let request_tab = Envelope {
         protocol_version: CURRENT_PROTOCOL_VERSION,
+        auth: command_auth(&endpoint),
         payload: ClientCommand::OpenProject {
             path: target_dir.clone(),
             disposition: OpenDisposition::NewTab,
@@ -150,6 +167,7 @@ fn open_project_valid_dir_enqueues_with_disposition() {
     // Test NewWindow disposition
     let request_win = Envelope {
         protocol_version: CURRENT_PROTOCOL_VERSION,
+        auth: command_auth(&endpoint),
         payload: ClientCommand::OpenProject {
             path: target_dir.clone(),
             disposition: OpenDisposition::NewWindow,
@@ -180,9 +198,78 @@ fn open_project_valid_dir_enqueues_with_disposition() {
     assert!(rx.is_empty(), "no extra items should be enqueued");
 }
 
-/// enqueue_open_project directly → item appears in receiver without IPC
 #[test]
-fn enqueue_open_project_bypasses_ipc() {
+fn open_project_enqueues_canonical_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let endpoint = test_endpoint(dir.path(), "op-canonical");
+
+    let Some(daemon) = start_daemon_or_skip(&endpoint) else {
+        return;
+    };
+    std::thread::sleep(Duration::from_millis(100));
+
+    let request_path = dir.path().join(".");
+    let canonical_path = std::fs::canonicalize(&request_path).unwrap();
+    let request = Envelope {
+        protocol_version: CURRENT_PROTOCOL_VERSION,
+        auth: command_auth(&endpoint),
+        payload: ClientCommand::OpenProject {
+            path: request_path.to_string_lossy().into_owned(),
+            disposition: OpenDisposition::NewTab,
+        },
+    };
+
+    let response = send_envelope(&endpoint, &request);
+    match response.payload {
+        DaemonResponse::ProjectOpened { path } => {
+            assert_eq!(PathBuf::from(path), canonical_path);
+        }
+        other => panic!("expected ProjectOpened, got {other:?}"),
+    }
+
+    let rx = daemon.open_project_receiver();
+    let (queued_path, queued_disposition) = rx.try_recv().expect("expected enqueued item");
+    assert_eq!(queued_path, canonical_path);
+    assert_eq!(queued_disposition, OpenDisposition::NewTab);
+    assert!(rx.is_empty());
+}
+
+#[test]
+fn open_project_without_capability_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let endpoint = test_endpoint(dir.path(), "op-unauthorized");
+
+    let Some(daemon) = start_daemon_or_skip(&endpoint) else {
+        return;
+    };
+    std::thread::sleep(Duration::from_millis(100));
+
+    let request = Envelope {
+        protocol_version: CURRENT_PROTOCOL_VERSION,
+        auth: None,
+        payload: ClientCommand::OpenProject {
+            path: dir.path().to_string_lossy().into_owned(),
+            disposition: OpenDisposition::NewTab,
+        },
+    };
+
+    let response = send_envelope(&endpoint, &request);
+    match response.payload {
+        DaemonResponse::Error { message } => {
+            assert!(
+                message.contains("unauthorized"),
+                "expected unauthorized error in: {message}"
+            );
+        }
+        other => panic!("expected Error, got {other:?}"),
+    }
+
+    assert!(daemon.open_project_receiver().is_empty());
+}
+
+/// enqueue_open_project directly → validated canonical item appears in receiver without IPC
+#[test]
+fn enqueue_open_project_validates_and_canonicalizes_without_ipc() {
     let dir = tempfile::tempdir().unwrap();
     let endpoint = test_endpoint(dir.path(), "op-direct");
 
@@ -190,12 +277,78 @@ fn enqueue_open_project_bypasses_ipc() {
         return;
     };
 
-    let path = dir.path().to_path_buf();
-    daemon.enqueue_open_project(path.clone(), OpenDisposition::NewWindow);
+    let path = dir.path().join(".");
+    let canonical = std::fs::canonicalize(&path).unwrap();
+    daemon
+        .enqueue_open_project(path, OpenDisposition::NewWindow)
+        .unwrap();
 
     let rx = daemon.open_project_receiver();
     let (received_path, received_disp) = rx.try_recv().expect("item should be in receiver");
-    assert_eq!(received_path, path);
+    assert_eq!(received_path, canonical);
     assert_eq!(received_disp, OpenDisposition::NewWindow);
     assert!(rx.is_empty());
+}
+
+#[test]
+fn enqueue_open_project_rejects_invalid_direct_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let endpoint = test_endpoint(dir.path(), "op-direct-invalid");
+
+    let Some(daemon) = start_daemon_or_skip(&endpoint) else {
+        return;
+    };
+
+    let missing = dir.path().join("missing");
+    let err = daemon
+        .enqueue_open_project(missing, OpenDisposition::NewWindow)
+        .expect_err("missing project directory should be rejected");
+
+    assert!(
+        err.to_string().contains("not a directory"),
+        "unexpected error: {err}"
+    );
+    assert!(daemon.open_project_receiver().is_empty());
+}
+
+#[test]
+fn enqueue_open_project_rejects_relative_direct_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let endpoint = test_endpoint(dir.path(), "op-direct-relative");
+
+    let Some(daemon) = start_daemon_or_skip(&endpoint) else {
+        return;
+    };
+
+    let err = daemon
+        .enqueue_open_project(PathBuf::from("relative"), OpenDisposition::NewWindow)
+        .expect_err("relative project path should be rejected");
+
+    assert!(
+        err.to_string().contains("absolute"),
+        "unexpected error: {err}"
+    );
+    assert!(daemon.open_project_receiver().is_empty());
+}
+
+#[test]
+fn enqueue_open_project_reports_full_direct_queue() {
+    let dir = tempfile::tempdir().unwrap();
+    let endpoint = test_endpoint(dir.path(), "op-direct-full");
+
+    let Some(daemon) = start_daemon_or_skip(&endpoint) else {
+        return;
+    };
+
+    for _ in 0..OPEN_PROJECT_QUEUE_CAPACITY {
+        daemon
+            .enqueue_open_project(dir.path().to_path_buf(), OpenDisposition::NewWindow)
+            .unwrap();
+    }
+
+    let err = daemon
+        .enqueue_open_project(dir.path().to_path_buf(), OpenDisposition::NewWindow)
+        .expect_err("bounded open-project queue should report full");
+
+    assert!(matches!(err, OpenProjectEnqueueError::QueueFull));
 }

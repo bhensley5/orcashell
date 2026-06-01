@@ -8,8 +8,29 @@ on:
 permissions:
   contents: write
 
+env:
+  ORCASHELL_UPDATE_MANIFEST_PUBLIC_KEY: ${{ vars.ORCASHELL_UPDATE_MANIFEST_PUBLIC_KEY }}
+
 jobs:
+  validate-release-config:
+    runs-on: ubuntu-latest
+    env:
+      ORCASHELL_UPDATE_MANIFEST_PRIVATE_KEY_PEM_B64: ${{ secrets.ORCASHELL_UPDATE_MANIFEST_PRIVATE_KEY_PEM_B64 }}
+    steps:
+      - name: Validate update manifest signing configuration
+        run: |
+          test -n "$ORCASHELL_UPDATE_MANIFEST_PUBLIC_KEY"
+          test -n "$ORCASHELL_UPDATE_MANIFEST_PRIVATE_KEY_PEM_B64"
+          PUBLIC_KEY_BYTES="$(
+            printf '%s' "$ORCASHELL_UPDATE_MANIFEST_PUBLIC_KEY" \
+              | base64 --decode \
+              | wc -c \
+              | tr -d ' '
+          )"
+          test "$PUBLIC_KEY_BYTES" = "32"
+
   build-macos:
+    needs: validate-release-config
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v5
@@ -105,6 +126,7 @@ jobs:
           path: target/OrcaShell-${{ env.VERSION }}-macos-arm64.dmg
 
   build-linux:
+    needs: validate-release-config
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -145,6 +167,7 @@ jobs:
           path: target/orcashell-${{ env.VERSION }}-linux-x86_64.tar.gz
 
   build-windows:
+    needs: validate-release-config
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
@@ -192,13 +215,73 @@ jobs:
     needs: [build-macos, build-linux, build-windows]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v5
+
+      - name: Derive version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
       - name: Download all artifacts
         uses: actions/download-artifact@v5
         with:
           path: artifacts
 
+      - name: Generate signed update metadata
+        env:
+          ORCASHELL_UPDATE_MANIFEST_PRIVATE_KEY_PEM_B64: ${{ secrets.ORCASHELL_UPDATE_MANIFEST_PRIVATE_KEY_PEM_B64 }}
+        run: |
+          PUBLISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          python3 scripts/release/generate-update-manifest.py \
+            --artifacts-dir artifacts \
+            --version "$VERSION" \
+            --tag "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --published-at "$PUBLISHED_AT" \
+            --output release-metadata/latest.json
+
+          openssl version
+          openssl version | awk '{ print $2 }' | awk -F. '{ exit !($1 >= 3) }'
+          umask 077
+          printf '%s' "$ORCASHELL_UPDATE_MANIFEST_PRIVATE_KEY_PEM_B64" \
+            | base64 --decode > release-metadata/update-manifest-private-key.pem
+          DERIVED_PUBLIC_KEY="$(
+            openssl pkey \
+              -in release-metadata/update-manifest-private-key.pem \
+              -pubout \
+              -outform DER \
+              | tail -c 32 \
+              | base64 -w 0
+          )"
+          test "$DERIVED_PUBLIC_KEY" = "$ORCASHELL_UPDATE_MANIFEST_PUBLIC_KEY"
+          openssl pkey \
+            -in release-metadata/update-manifest-private-key.pem \
+            -pubout \
+            -out release-metadata/update-manifest-public-key.pem
+          openssl pkeyutl \
+            -sign \
+            -rawin \
+            -inkey release-metadata/update-manifest-private-key.pem \
+            -in release-metadata/latest.json \
+            -out release-metadata/latest.json.sig.raw
+          openssl pkeyutl \
+            -verify \
+            -rawin \
+            -pubin \
+            -inkey release-metadata/update-manifest-public-key.pem \
+            -sigfile release-metadata/latest.json.sig.raw \
+            -in release-metadata/latest.json
+          base64 -w 0 release-metadata/latest.json.sig.raw \
+            > release-metadata/latest.json.sig
+          printf '\n' >> release-metadata/latest.json.sig
+          rm -f \
+            release-metadata/update-manifest-private-key.pem \
+            release-metadata/update-manifest-public-key.pem \
+            release-metadata/latest.json.sig.raw
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: artifacts/**/*
+          files: |
+            artifacts/**/*
+            release-metadata/latest.json
+            release-metadata/latest.json.sig

@@ -1,8 +1,17 @@
 use std::io::{self, Read, Write};
 
-const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
+pub const MAX_FRAME_SIZE: usize = 64 * 1024;
 
 pub fn write_frame(writer: &mut dyn Write, bytes: &[u8]) -> io::Result<()> {
+    if bytes.len() > MAX_FRAME_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "frame payload size {} exceeds maximum {MAX_FRAME_SIZE}",
+                bytes.len()
+            ),
+        ));
+    }
     let len: u32 = bytes.len().try_into().map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,

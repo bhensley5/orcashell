@@ -8,4 +8,4 @@ pub use endpoint::{default_endpoint, IpcEndpoint};
 #[cfg(unix)]
 pub use unix::{IpcListener, IpcStream};
 #[cfg(windows)]
-pub use windows::{IpcListener, IpcStream};
+pub use windows::{IpcListener, IpcStream, PIPE_MAX_INSTANCES};

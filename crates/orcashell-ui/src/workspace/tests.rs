@@ -20,7 +20,8 @@ use super::{
     GitSnapshotSummary, LayoutNode, NotificationTier, ProjectData, RepositoryBranchAction,
     RepositoryBranchSelection, ResumableAgentKind, ResumeInjectionTrigger, TerminalRuntimeState,
     WorkspaceBannerKind, WorkspaceServices, WorkspaceState, FEED_PREVIEW_FILE_CAP,
-    FEED_PREVIEW_LINE_BUDGET, SETTINGS_TAB_ID,
+    FEED_PREVIEW_LINE_BUDGET, MAX_NOTIFICATION_BODY_CLASSIFICATION_CHARS,
+    MAX_NOTIFICATION_TITLE_CLASSIFICATION_CHARS, SETTINGS_TAB_ID,
 };
 use crate::settings::ThemeId;
 use orcashell_git::{
@@ -2770,6 +2771,42 @@ fn classify_notification_matches_title_and_body() {
     );
     assert_eq!(
         classify_notification("Done", "all clear", &patterns),
+        NotificationTier::Informational
+    );
+}
+
+#[test]
+fn classify_notification_caps_title_before_matching() {
+    let patterns = vec!["permission".to_string()];
+    let pattern = "permission";
+    let in_window_title =
+        "a".repeat(MAX_NOTIFICATION_TITLE_CLASSIFICATION_CHARS - pattern.len()) + pattern;
+    let out_of_window_title = "a".repeat(MAX_NOTIFICATION_TITLE_CLASSIFICATION_CHARS) + pattern;
+
+    assert_eq!(
+        classify_notification(&in_window_title, "", &patterns),
+        NotificationTier::Urgent
+    );
+    assert_eq!(
+        classify_notification(&out_of_window_title, "", &patterns),
+        NotificationTier::Informational
+    );
+}
+
+#[test]
+fn classify_notification_caps_body_before_matching() {
+    let patterns = vec!["permission".to_string()];
+    let pattern = "permission";
+    let in_window_body =
+        "a".repeat(MAX_NOTIFICATION_BODY_CLASSIFICATION_CHARS - pattern.len()) + pattern;
+    let out_of_window_body = "a".repeat(MAX_NOTIFICATION_BODY_CLASSIFICATION_CHARS) + pattern;
+
+    assert_eq!(
+        classify_notification("", &in_window_body, &patterns),
+        NotificationTier::Urgent
+    );
+    assert_eq!(
+        classify_notification("", &out_of_window_body, &patterns),
         NotificationTier::Informational
     );
 }

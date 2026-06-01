@@ -427,13 +427,37 @@ const FEED_PREVIEW_MIN_LINES_PER_FILE: usize = 3;
 #[allow(dead_code)]
 const FEED_PREVIEW_HIDDEN_NAME_CAP: usize = 3;
 const REPOSITORY_GRAPH_AUTO_REFRESH_REVISION: u64 = 0;
+const MAX_NOTIFICATION_TITLE_CLASSIFICATION_CHARS: usize = 1_024;
+const MAX_NOTIFICATION_BODY_CLASSIFICATION_CHARS: usize = 4_096;
 
 fn classify_notification(title: &str, body: &str, patterns: &[String]) -> NotificationTier {
-    let lower = format!("{title} {body}").to_lowercase();
+    let lower = capped_notification_classification_text(title, body);
     if patterns.iter().any(|p| lower.contains(&p.to_lowercase())) {
         NotificationTier::Urgent
     } else {
         NotificationTier::Informational
+    }
+}
+
+fn capped_notification_classification_text(title: &str, body: &str) -> String {
+    let mut lower = String::with_capacity(
+        title.len().min(MAX_NOTIFICATION_TITLE_CLASSIFICATION_CHARS)
+            + 1
+            + body.len().min(MAX_NOTIFICATION_BODY_CLASSIFICATION_CHARS),
+    );
+    push_lowercase_prefix(
+        &mut lower,
+        title,
+        MAX_NOTIFICATION_TITLE_CLASSIFICATION_CHARS,
+    );
+    lower.push(' ');
+    push_lowercase_prefix(&mut lower, body, MAX_NOTIFICATION_BODY_CLASSIFICATION_CHARS);
+    lower
+}
+
+fn push_lowercase_prefix(output: &mut String, text: &str, max_chars: usize) {
+    for ch in text.chars().take(max_chars) {
+        output.extend(ch.to_lowercase());
     }
 }
 

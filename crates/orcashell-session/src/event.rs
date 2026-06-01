@@ -150,7 +150,7 @@ impl EventListener for EventProxy {
                 let _ = self.event_tx.send(SessionEvent::SemanticPrompt(cmd));
             }
             Event::Notification { title, body } => {
-                debug!("Notification received: title={title:?}");
+                debug!("Notification received");
                 let _ = self
                     .event_tx
                     .send(SessionEvent::Notification { title, body });

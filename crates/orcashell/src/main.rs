@@ -100,13 +100,14 @@ fn main() -> Result<()> {
     // Enqueue cold-launch open-dir request before app.run().  The poll task won't
     // drain the channel until the GPUI event loop starts, so ordering is safe.
     if let (Some(ref dir), Some(ref daemon)) = (&cli_open_dir, &_daemon) {
-        let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.clone());
         let disp = if cli_new_window {
             OpenDisposition::NewWindow
         } else {
             OpenDisposition::NewTab
         };
-        daemon.enqueue_open_project(canonical, disp);
+        if let Err(e) = daemon.enqueue_open_project(dir.clone(), disp) {
+            tracing::warn!("failed to enqueue cold-launch open-project request: {e}");
+        }
     }
 
     // Copy bundled Quick Action workflows to ~/Library/Services/ so macOS discovers them.

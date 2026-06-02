@@ -14,6 +14,7 @@ PLATFORMS = {
     "linux_x86_64": "orcashell-{version}-linux-x86_64.tar.gz",
     "windows_x86_64": "orcashell-{version}-windows-x64.zip",
 }
+DEFAULT_DOWNLOAD_BASE_URL = "https://orcashell.com/downloads"
 
 
 def artifact_path(artifacts_dir: Path, filename: str) -> Path:
@@ -47,9 +48,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    download_base_url = args.download_base_url or (
-        f"https://github.com/{args.repo}/releases/download/{args.tag}"
-    )
+    download_base_url = args.download_base_url or DEFAULT_DOWNLOAD_BASE_URL
     release_notes_url = f"https://github.com/{args.repo}/releases/tag/{args.tag}"
 
     downloads = {}

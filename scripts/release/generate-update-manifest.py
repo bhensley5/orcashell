@@ -17,7 +17,7 @@ PLATFORMS = {
 
 
 def artifact_path(artifacts_dir: Path, filename: str) -> Path:
-    matches = list(artifacts_dir.glob(f"**/{filename}"))
+    matches = [path for path in artifacts_dir.glob(f"**/{filename}") if path.is_file()]
     if len(matches) != 1:
         raise SystemExit(
             f"expected exactly one artifact named {filename}, found {len(matches)}"

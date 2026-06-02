@@ -42,6 +42,14 @@ fn ipc_roundtrip() {
     stream.flush().unwrap();
 
     client.join().unwrap();
+
+    #[cfg(unix)]
+    {
+        let peer = stream
+            .peer_identity()
+            .expect("accepted unix stream should expose peer identity");
+        assert_eq!(peer.uid, unsafe { libc::geteuid() as u32 });
+    }
 }
 
 #[test]
@@ -69,4 +77,58 @@ fn connect_to_nonexistent() {
     );
     let result = IpcStream::connect(&endpoint, Duration::from_secs(1));
     assert!(result.is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_listener_sets_owner_only_socket_permissions() {
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+
+    let dir = tempfile::tempdir().unwrap();
+    let endpoint = test_endpoint(dir.path(), "socket-mode");
+    let _listener = IpcListener::bind(&endpoint).unwrap();
+
+    let metadata = std::fs::symlink_metadata(&endpoint.display_name).unwrap();
+    assert!(metadata.file_type().is_socket());
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_listener_rejects_symlink_socket_path() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let endpoint = test_endpoint(dir.path(), "socket-symlink");
+    let socket_path = std::path::Path::new(&endpoint.display_name);
+    let target = dir.path().join("missing-target.sock");
+    symlink(&target, socket_path).unwrap();
+
+    match IpcListener::bind(&endpoint) {
+        Ok(_) => panic!("expected symlink endpoint to be rejected"),
+        Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied),
+    }
+    assert!(std::fs::symlink_metadata(socket_path)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}
+
+#[cfg(unix)]
+#[test]
+fn default_unix_endpoint_lives_in_private_runtime_dir() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
+    let endpoint = orcashell_ipc::default_endpoint().unwrap();
+    assert_ne!(endpoint.display_name, "/tmp/orcashell.sock");
+
+    let socket_path = Path::new(&endpoint.display_name);
+    let dir = socket_path
+        .parent()
+        .expect("endpoint should have parent dir");
+    let metadata = std::fs::symlink_metadata(dir).unwrap();
+    assert!(metadata.is_dir());
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+    assert!(endpoint.capability_path().is_some());
 }

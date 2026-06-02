@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use orcashell_ipc::{default_endpoint, IpcEndpoint, IpcStream};
 use orcashell_protocol::framing::{read_frame, write_frame};
-use orcashell_protocol::messages::{ClientCommand, DaemonResponse, Envelope};
+use orcashell_protocol::messages::{ClientCommand, CommandAuth, DaemonResponse, Envelope};
 use orcashell_protocol::version::CURRENT_PROTOCOL_VERSION;
 use std::time::Duration;
 
@@ -15,9 +15,18 @@ pub fn send_command(command: ClientCommand) -> Result<DaemonResponse> {
 pub fn send_command_to(endpoint: &IpcEndpoint, command: ClientCommand) -> Result<DaemonResponse> {
     let mut stream = IpcStream::connect(endpoint, CONN_TIMEOUT)
         .context("failed to connect to daemon - is the OrcaShell app running?")?;
+    let auth = if command.requires_auth() {
+        endpoint
+            .read_capability_token()
+            .context("failed to read IPC command capability")?
+            .map(|capability| CommandAuth { capability })
+    } else {
+        None
+    };
 
     let envelope = Envelope {
         protocol_version: CURRENT_PROTOCOL_VERSION,
+        auth,
         payload: command,
     };
 

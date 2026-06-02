@@ -41,6 +41,9 @@ ureq = { version = "3", default-features = false, features = ["rustls"] }
 rusqlite = { version = "0.39", features = ["bundled"] }
 dirs = "6"
 raw-window-handle = "0.6"
+base64 = "0.22"
+ring = "0.17"
+url = "2"
 orcashell-ipc = { path = "crates/orcashell-ipc" }
 orcashell-platform = { path = "crates/orcashell-platform" }
 

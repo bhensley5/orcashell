@@ -1,10 +1,14 @@
 [package]
 name = "orcashell-ipc"
-version = "0.3.3"
+version = "0.3.4"
 edition.workspace = true
 
 [dependencies]
+dirs.workspace = true
 tracing.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
@@ -14,6 +18,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_System_Pipes",
+    "Win32_System_SystemServices",
     "Win32_System_Threading",
 ] }
 

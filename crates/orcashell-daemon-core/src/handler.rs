@@ -6,10 +6,13 @@ use orcashell_protocol::framing::{read_frame, write_frame};
 use orcashell_protocol::messages::{ClientCommand, DaemonResponse, Envelope, OpenDisposition};
 use orcashell_protocol::version::CURRENT_PROTOCOL_VERSION;
 
+use crate::open_project::{enqueue_validated_open_project, OpenProjectEnqueueError};
+
 pub fn handle_connection(
     mut stream: IpcStream,
     endpoint_name: &str,
     open_tx: &async_channel::Sender<(PathBuf, OpenDisposition)>,
+    required_capability: Option<&str>,
 ) -> Result<()> {
     let request_bytes = read_frame(&mut stream).context("failed to read request frame")?;
 
@@ -24,6 +27,7 @@ pub fn handle_connection(
     {
         Envelope {
             protocol_version: CURRENT_PROTOCOL_VERSION,
+            auth: None,
             payload: DaemonResponse::Error {
                 message: format!(
                     "protocol version mismatch: client={}.{}, daemon={}.{}",
@@ -38,6 +42,7 @@ pub fn handle_connection(
         match envelope.payload {
             ClientCommand::DaemonStatus => Envelope {
                 protocol_version: CURRENT_PROTOCOL_VERSION,
+                auth: None,
                 payload: DaemonResponse::Status {
                     ok: true,
                     pid: std::process::id(),
@@ -46,35 +51,77 @@ pub fn handle_connection(
                 },
             },
             ClientCommand::OpenProject { path, disposition } => {
+                if !is_authorized(envelope.auth.as_ref(), required_capability) {
+                    return write_response(
+                        &mut stream,
+                        Envelope {
+                            protocol_version: CURRENT_PROTOCOL_VERSION,
+                            auth: None,
+                            payload: DaemonResponse::Error {
+                                message: "unauthorized IPC command".to_string(),
+                            },
+                        },
+                    );
+                }
                 let pb = PathBuf::from(&path);
-                if !pb.is_absolute() {
-                    Envelope {
+                match enqueue_validated_open_project(open_tx, pb, disposition) {
+                    Ok(canonical) => Envelope {
                         protocol_version: CURRENT_PROTOCOL_VERSION,
-                        payload: DaemonResponse::Error {
-                            message: format!("path must be absolute: {path}"),
+                        auth: None,
+                        payload: DaemonResponse::ProjectOpened {
+                            path: canonical.to_string_lossy().into_owned(),
                         },
-                    }
-                } else if !pb.is_dir() {
-                    Envelope {
-                        protocol_version: CURRENT_PROTOCOL_VERSION,
-                        payload: DaemonResponse::Error {
-                            message: format!("not a directory: {path}"),
-                        },
-                    }
-                } else {
-                    // Unbounded channel - try_send never fails while the receiver is alive.
-                    let _ = open_tx.try_send((pb, disposition));
-                    Envelope {
-                        protocol_version: CURRENT_PROTOCOL_VERSION,
-                        payload: DaemonResponse::ProjectOpened { path },
+                    },
+                    Err(error) => {
+                        let message = match error {
+                            OpenProjectEnqueueError::InvalidPath(message) => message,
+                            OpenProjectEnqueueError::QueueFull => {
+                                "open-project queue is full".to_string()
+                            }
+                            OpenProjectEnqueueError::ReceiverClosed => {
+                                "open-project receiver is closed".to_string()
+                            }
+                        };
+                        Envelope {
+                            protocol_version: CURRENT_PROTOCOL_VERSION,
+                            auth: None,
+                            payload: DaemonResponse::Error { message },
+                        }
                     }
                 }
             }
         }
     };
 
-    let response_json = serde_json::to_string(&response).context("failed to serialize response")?;
-    write_frame(&mut stream, response_json.as_bytes()).context("failed to write response frame")?;
+    write_response(&mut stream, response)
+}
 
+fn is_authorized(
+    auth: Option<&orcashell_protocol::messages::CommandAuth>,
+    required_capability: Option<&str>,
+) -> bool {
+    let Some(expected) = required_capability else {
+        return true;
+    };
+    let Some(provided) = auth.map(|auth| auth.capability.as_str()) else {
+        return false;
+    };
+    constant_time_eq(provided.as_bytes(), expected.as_bytes())
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&left, &right) in left.iter().zip(right) {
+        diff |= left ^ right;
+    }
+    diff == 0
+}
+
+fn write_response(stream: &mut IpcStream, response: Envelope<DaemonResponse>) -> Result<()> {
+    let response_json = serde_json::to_string(&response).context("failed to serialize response")?;
+    write_frame(stream, response_json.as_bytes()).context("failed to write response frame")?;
     Ok(())
 }

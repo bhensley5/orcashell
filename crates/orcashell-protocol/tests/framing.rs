@@ -1,4 +1,4 @@
-use orcashell_protocol::framing::{read_frame, write_frame};
+use orcashell_protocol::framing::{read_frame, write_frame, MAX_FRAME_SIZE};
 use orcashell_protocol::*;
 use std::io::Cursor;
 
@@ -26,7 +26,7 @@ fn frame_empty_payload() {
 
 #[test]
 fn frame_large_payload() {
-    let data = vec![0xABu8; 64 * 1024];
+    let data = vec![0xABu8; MAX_FRAME_SIZE];
     let mut buf = Vec::new();
     write_frame(&mut buf, &data).unwrap();
 
@@ -36,9 +36,21 @@ fn frame_large_payload() {
 }
 
 #[test]
+fn frame_oversized_write_rejected() {
+    let data = vec![0xABu8; MAX_FRAME_SIZE + 1];
+    let mut buf = Vec::new();
+    let result = write_frame(&mut buf, &data);
+
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+    assert!(buf.is_empty());
+}
+
+#[test]
 fn frame_json_envelope_roundtrip() {
     let envelope = Envelope {
         protocol_version: CURRENT_PROTOCOL_VERSION,
+        auth: None,
         payload: ClientCommand::DaemonStatus,
     };
     let json = serde_json::to_string(&envelope).unwrap();
@@ -83,9 +95,9 @@ fn frame_empty_input_returns_error() {
 
 #[test]
 fn frame_oversized_length_rejected() {
-    // Length prefix claims 32 MiB (exceeds 16 MiB limit)
+    // Length prefix exceeds the IPC frame limit.
     let mut buf = Vec::new();
-    buf.extend_from_slice(&(32 * 1024 * 1024u32).to_le_bytes());
+    buf.extend_from_slice(&((MAX_FRAME_SIZE + 1) as u32).to_le_bytes());
 
     let mut cursor = Cursor::new(buf);
     let result = read_frame(&mut cursor);

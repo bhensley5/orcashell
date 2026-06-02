@@ -10,14 +10,16 @@ fn test_endpoint(dir: &std::path::Path, name: &str) -> IpcEndpoint {
     #[cfg(unix)]
     {
         let path = dir.join(format!("{name}.sock"));
+        let token = dir.join(format!("{name}.token"));
         let s = path.to_string_lossy().into_owned();
-        IpcEndpoint::new(s.clone(), s)
+        IpcEndpoint::new_with_capability(s.clone(), s, token)
     }
     #[cfg(windows)]
     {
         let unique = dir.file_name().unwrap().to_string_lossy();
         let pipe = format!(r"\\.\pipe\orcashell-test-{unique}-{name}");
-        IpcEndpoint::new(pipe.clone(), pipe)
+        let token = dir.join(format!("{name}.token"));
+        IpcEndpoint::new_with_capability(pipe.clone(), pipe, token)
     }
 }
 
@@ -62,6 +64,7 @@ fn daemon_status_roundtrip() {
 
     let request = Envelope {
         protocol_version: CURRENT_PROTOCOL_VERSION,
+        auth: None,
         payload: ClientCommand::DaemonStatus,
     };
 
@@ -102,6 +105,7 @@ fn protocol_version_mismatch_returns_error() {
             major: 99,
             minor: 0,
         },
+        auth: None,
         payload: ClientCommand::DaemonStatus,
     };
 
@@ -135,6 +139,7 @@ fn stale_socket_cleanup() {
     // Verify the daemon works
     let request = Envelope {
         protocol_version: CURRENT_PROTOCOL_VERSION,
+        auth: None,
         payload: ClientCommand::DaemonStatus,
     };
 

@@ -35,6 +35,7 @@ fn daemon_response_error_roundtrip() {
 fn envelope_client_command_roundtrip() {
     let envelope = Envelope {
         protocol_version: CURRENT_PROTOCOL_VERSION,
+        auth: None,
         payload: ClientCommand::DaemonStatus,
     };
     let json = serde_json::to_string(&envelope).unwrap();
@@ -46,6 +47,7 @@ fn envelope_client_command_roundtrip() {
 fn envelope_daemon_response_roundtrip() {
     let envelope = Envelope {
         protocol_version: CURRENT_PROTOCOL_VERSION,
+        auth: None,
         payload: DaemonResponse::Status {
             ok: true,
             pid: 42,
